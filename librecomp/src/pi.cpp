@@ -9,6 +9,7 @@
 #include "librecomp/game.hpp"
 #include "librecomp/files.hpp"
 #include "librecomp/overlays.hpp"
+#include "librecomp/ultra_trace.hpp"
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
 
@@ -35,12 +36,15 @@ constexpr uint32_t phys_to_k1(uint32_t addr) {
 }
 
 extern "C" void __osPiGetAccess_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
 }
 
 extern "C" void __osPiRelAccess_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
 }
 
 extern "C" void osCartRomInit_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     OSPiHandle* handle = TO_PTR(OSPiHandle, recomp::cart_handle);
     handle->type = 0; // cart
     handle->baseAddress = phys_to_k1(recomp::rom_base);
@@ -50,6 +54,7 @@ extern "C" void osCartRomInit_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osDriveRomInit_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     OSPiHandle* handle = TO_PTR(OSPiHandle, recomp::drive_handle);
     handle->type = 1; // bulk
     handle->baseAddress = phys_to_k1(recomp::drive_base);
@@ -59,6 +64,7 @@ extern "C" void osDriveRomInit_recomp(uint8_t * rdram, recomp_context * ctx) {
 }
 
 extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
@@ -346,6 +352,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
 }
 
 extern "C" void osPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     uint32_t mb = ctx->r4;
     uint32_t pri = ctx->r5;
     uint32_t direction = ctx->r6;
@@ -363,6 +370,7 @@ extern "C" void osPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
 }
 
 extern "C" void osEPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     OSPiHandle* handle = TO_PTR(OSPiHandle, ctx->r4);
     OSIoMesg* mb = TO_PTR(OSIoMesg, ctx->r5);
     uint32_t direction = ctx->r6;
@@ -380,6 +388,7 @@ extern "C" void osEPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
 }
 
 extern "C" void osEPiReadIo_recomp(RDRAM_ARG recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     OSPiHandle* handle = TO_PTR(OSPiHandle, ctx->r4);
     uint32_t devAddr = handle->baseAddress | ctx->r5;
     gpr dramAddr = ctx->r6;
@@ -421,6 +430,7 @@ extern "C" void osEPiReadIo_recomp(RDRAM_ARG recomp_context * ctx) {
 }
 
 extern "C" void osEPiWriteIo_recomp(RDRAM_ARG recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     // s32 osEPiWriteIo(OSPiHandle* handle, u32 devAddr, u32 data)
     // Single-word PIO write to a PI device. ROM is read-only, so writes
     // there are silently dropped. Writes to 64DD register space
@@ -435,6 +445,7 @@ extern "C" void osEPiWriteIo_recomp(RDRAM_ARG recomp_context * ctx) {
 }
 
 extern "C" void osPiGetStatus_recomp(RDRAM_ARG recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = 0;
 }
 

@@ -16,7 +16,15 @@ enum class RspExitReason {
     UnhandledJumpTarget,
     Unsupported,
     SwapOverlay,
-    UnhandledResumeTarget
+    UnhandledResumeTarget,
+    // Watchdog tripped — the recompiled microcode executed more
+    // basic-block transitions than `RSP_WATCHDOG_THRESHOLD` (set at
+    // emit time, default ~100M, ~1.6s at native RSP speed). The
+    // ucode is almost certainly stuck in an infinite loop. The
+    // last 32 PCs visited are stored in `RspContext::pc_trail`,
+    // newest at `(pc_trail_idx - 1) & 31`. Treat as a fatal exit
+    // and dump diagnostic state.
+    Watchdog
 };
 
 struct RspContext {
@@ -30,6 +38,15 @@ struct RspContext {
     RSP rsp;
     uint32_t resume_address;
     bool resume_delay;
+    // Watchdog state. Per-label emit increments watchdog_count and
+    // appends current PC to pc_trail (ring of 32 entries). If
+    // watchdog_count exceeds RSP_WATCHDOG_THRESHOLD, the ucode
+    // returns RspExitReason::Watchdog. Per-task struct, so the
+    // counter resets across run_task calls (a long-running task
+    // legitimately can have many basic-block transitions).
+    uint64_t watchdog_count;
+    uint32_t pc_trail_idx;
+    uint32_t pc_trail[32];
 };
 
 using RspUcodeFunc = RspExitReason(uint8_t* rdram, uint32_t ucode_addr);

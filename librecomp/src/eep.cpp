@@ -1,5 +1,6 @@
 #include "recomp.h"
 #include "librecomp/game.hpp"
+#include "librecomp/ultra_trace.hpp"
 
 #include "ultramodern/ultra64.h"
 
@@ -9,6 +10,7 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
 constexpr int eeprom_block_size = 8;
 
 extern "C" void osEepromProbe_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     switch (recomp::get_save_type()) {
         case recomp::SaveType::AllowAll:
         case recomp::SaveType::Eep16k:
@@ -24,6 +26,7 @@ extern "C" void osEepromProbe_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osEepromWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::eeprom_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -39,6 +42,7 @@ extern "C" void osEepromWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osEepromLongWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::eeprom_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -56,6 +60,7 @@ extern "C" void osEepromLongWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osEepromRead_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::eeprom_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -71,6 +76,7 @@ extern "C" void osEepromRead_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osEepromLongRead_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::eeprom_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();

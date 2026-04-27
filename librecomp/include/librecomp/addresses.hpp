@@ -6,8 +6,16 @@
 #include "recomp.h"
 
 namespace recomp {
-    // 512GB (kseg0 size)
-    constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+    // 1GB readable region. The first 512MB covers cached RDRAM
+    // (kuseg/kseg0). The next 512MB covers kseg1's mirror of
+    // physical addresses 0x00000000-0x1FFFFFFF, which includes the
+    // MMIO region at 0xA3F00000-0xA4FFFFFF (RI/MI/VI/AI/PI/SI regs)
+    // and the cart at 0xA0000000+. Direct hardware-register polls
+    // (e.g., libleo's LeoDriveExist polling PI_STATUS at 0xA4600010)
+    // map into this region, where the zero-initialized pages give
+    // the correct "no DMA in progress / no device present" semantics
+    // without faulting.
+    constexpr size_t mem_size = 1024ULL * 1024ULL * 1024ULL;
     // 4GB (the full address space)
     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram

@@ -153,9 +153,19 @@ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
 void load_overlay(size_t section_table_index, int32_t ram) {
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
 
+    // Register funcs at BOTH the runtime slot address AND the section's
+    // link-time vram. Pokemon Stadium-style fragments link at unique
+    // vrams (e.g. 0x82000000) but get DMAed into shared runtime slots
+    // (e.g. 0x80114BF0). The kernel's fragment loader calls the freshly
+    // loaded fragment ENTRY at the runtime slot address (jal slot+0).
+    // Cross-fragment / intra-fragment calls captured statically by the
+    // recompiler use link-time vrams. Both must dispatch correctly.
     for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
         const FuncEntry& func = section.funcs[function_index];
         func_map[ram + func.offset] = func.func;
+        if (section.ram_addr != ram) {
+            func_map[section.ram_addr + func.offset] = func.func;
+        }
     }
 
     loaded_sections.emplace_back(ram, section_table_index);
@@ -198,6 +208,16 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
             return addr < entry.size + entry.rom_addr;
         }
     );
+    // When the DMA range falls *inside* a single section (partial read of
+    // an already-loaded section's data — common when libultra DMAs small
+    // chunks for libleo or audio), lower_bound returns the iterator AFTER
+    // the containing section and upper_bound returns the iterator AT the
+    // containing section, so lower > upper and the naive `for (it=lower;
+    // it!=upper; ++it)` walks past the end of the array. Skip when the
+    // range produces no whole-section overlap.
+    if (lower >= upper) {
+        return;
+    }
     // Load the overlays that were found
     for (auto it = lower; it != upper; ++it) {
         load_overlay(std::distance(&sections_info.code_sections[0], it), it->rom_addr - rom + ram_addr);
@@ -211,11 +231,14 @@ extern "C" void unload_overlay_by_id(uint32_t id) {
     auto find_it = std::find_if(loaded_sections.begin(), loaded_sections.end(), [section_table_index](const LoadedSection& s) { return s.section_table_index == section_table_index; });
 
     if (find_it != loaded_sections.end()) {
-        // Determine where each function was loaded to and remove that entry from the function map
+        // Mirror load_overlay: funcs were registered at both the runtime
+        // slot address and the section's link-time vram.
         for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
             const auto& func = section.funcs[func_index];
-            uint32_t func_address = func.offset + find_it->loaded_ram_addr;
-            func_map.erase(func_address);
+            func_map.erase(func.offset + find_it->loaded_ram_addr);
+            if (section.ram_addr != find_it->loaded_ram_addr) {
+                func_map.erase(func.offset + section.ram_addr);
+            }
         }
         // Reset the section's address in the address table
         section_addresses[section.index] = section.ram_addr;
@@ -254,11 +277,14 @@ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
                 assert(false);
                 std::exit(EXIT_FAILURE);
             }
-            // Determine where each function was loaded to and remove that entry from the function map
+            // Mirror load_overlay: funcs were registered at both the
+            // runtime slot address and the section's link-time vram.
             for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
                 const auto& func = section.funcs[func_index];
-                uint32_t func_address = func.offset + it->loaded_ram_addr;
-                func_map.erase(func_address);
+                func_map.erase(func.offset + it->loaded_ram_addr);
+                if (section.ram_addr != it->loaded_ram_addr) {
+                    func_map.erase(func.offset + section.ram_addr);
+                }
             }
             // Reset the section's address in the address table
             section_addresses[section.index] = section.ram_addr;
@@ -361,12 +387,32 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
     return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
 }
 
+// Tolerant-emit companion: when an indirect call lands at an address
+// the recompiler didn't generate a function for, log it (file + stderr)
+// and return a "trampoline" that aborts loudly when called — instead
+// of immediately killing the process. The caller still crashes if it
+// actually invokes the function pointer; but the lookup itself
+// returns, so static initializers / table walks finish cleanly.
+//
+// Per project principles: not a stub. The trampoline doesn't simulate
+// behavior — it surfaces "execution reached unimplemented code" with
+// full address context. Surfaces are richer than std::exit().
+static void unhandled_lookup_trampoline(uint8_t* /*rdram*/, recomp_context* /*ctx*/) {
+    fprintf(stderr, "[recomp] lookup-miss trampoline reached — aborting\n");
+    std::abort();
+}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
-        fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
-        assert(false);
-        std::exit(EXIT_FAILURE);
+        FILE* f = fopen("F:/Projects/PokemonStadiumRecomp/build/last_error.log", "a");
+        if (f) {
+            fprintf(f, "\n=== get_function lookup miss: 0x%08X ===\n", addr);
+            fclose(f);
+        }
+        fprintf(stderr, "[Warn] get_function lookup miss: 0x%08X — returning trampoline\n", addr);
+        fflush(stderr);
+        return unhandled_lookup_trampoline;
     }
     return func_find->second;
 }

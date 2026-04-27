@@ -208,11 +208,20 @@ void vi_thread_func() {
         }
         total_vis = new_total_vis;
 
-        // If the game hasn't started yet, set a dummy VI mode and origin.
-        if (!ultramodern::is_game_started()) {
+        // If the game hasn't started yet, OR has been marked started but
+        // hasn't yet called osViSetMode (mode pointer still null), install
+        // a dummy VI mode. The original guard (only when !is_game_started)
+        // was racy: a runner that sets game_status=Running BEFORE the
+        // game thread reaches its first osViSetMode call would leave
+        // next_state->mode==NULL and crash update_vi() at the
+        // &next_state->mode->comRegs deref.
+        {
             static bool odd = false;
-            set_dummy_vi(odd);
-            odd = !odd;
+            ViState* next_state = events_context.vi.get_next_state();
+            if (!ultramodern::is_game_started() || next_state->mode == nullptr) {
+                set_dummy_vi(odd);
+                odd = !odd;
+            }
         }
 
         // Queue a screen update for the graphics thread with the current VI register state.
@@ -225,7 +234,7 @@ void vi_thread_func() {
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
             remaining_retraces--;
-            
+
             uint8_t* rdram = events_context.rdram;
             std::lock_guard lock{ events_context.message_mutex };
             ViState* cur_state = events_context.vi.get_cur_state();

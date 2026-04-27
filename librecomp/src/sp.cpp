@@ -2,21 +2,18 @@
 #include <fstream>
 #include <ultramodern/ultramodern.hpp>
 #include "recomp.h"
+#include "librecomp/ultra_trace.hpp"
 
 extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     // Nothing to do here
 }
 
 bool dump_frame = false;
 
 extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
-    //printf("[sp] osSpTaskStartGo(0x%08X)\n", (uint32_t)ctx->r4);
+    LIBRECOMP_ULTRA_TRACE(ctx);
     OSTask* task = TO_PTR(OSTask, ctx->r4);
-    if (task->t.type == M_GFXTASK) {
-        //printf("[sp] Gfx task: %08X\n", (uint32_t)ctx->r4);
-    } else if (task->t.type == M_AUDTASK) {
-        //printf("[sp] Audio task: %08X\n", (uint32_t)ctx->r4);
-    }
     // For debugging
     if (dump_frame) {
         char addr_str[32];
@@ -37,14 +34,17 @@ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osSpTaskYield_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     // Ignore yield requests (acts as if the task completed before it received the yield request)
 }
 
 extern "C" void osSpTaskYielded_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     // Task yield requests are ignored, so always return 0 as tasks will never be yielded
     ctx->r2 = 0;
 }
 
 extern "C" void __osSpSetPc_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     assert(false);
 }

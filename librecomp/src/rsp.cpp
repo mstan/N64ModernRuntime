@@ -1,6 +1,8 @@
 #include <cassert>
 #include <cstring>
 #include <cinttypes>
+#include <string>
+#include <unordered_map>
 
 #include "rsp.hpp"
 #include "librecomp/ultra_trace.hpp"
@@ -9,6 +11,46 @@ static recomp::rsp::callbacks_t rsp_callbacks {};
 
 void recomp::rsp::set_callbacks(const callbacks_t& callbacks) {
     rsp_callbacks = callbacks;
+}
+
+namespace {
+// Pre-task hook registry. Keyed by ucode name (== recompiler's
+// output_function_name). Lookup happens once per task-run, so even
+// a hash map is cheap; using std::unordered_map for clarity.
+std::unordered_map<std::string, recomp::rsp::pre_task_hook_t*>& pre_task_hooks() {
+    static std::unordered_map<std::string, recomp::rsp::pre_task_hook_t*> m;
+    return m;
+}
+}
+
+void recomp::rsp::set_pre_task_hook(const char* ucode_name,
+                                    recomp::rsp::pre_task_hook_t* hook) {
+    if (ucode_name == nullptr) return;
+    if (hook == nullptr) {
+        pre_task_hooks().erase(ucode_name);
+    } else {
+        pre_task_hooks()[ucode_name] = hook;
+    }
+}
+
+void recomp::rsp::run_pre_task_hook(uint8_t* rdram, RspContext* ctx,
+                                    const char* ucode_name,
+                                    uint32_t ucode_addr) {
+    if (ucode_name == nullptr) return;
+    auto it = pre_task_hooks().find(ucode_name);
+    if (it == pre_task_hooks().end()) return;
+    it->second(rdram, ctx, ucode_name, ucode_addr);
+}
+
+void recomp::rsp::dma_rdram_to_dmem_external(uint8_t* rdram,
+                                             uint32_t dmem_addr,
+                                             uint32_t dram_addr,
+                                             uint32_t rd_len) {
+    // Forward to the inline DMA helper from rsp.hpp. Exposed because
+    // pre-task hooks live in game code that can't easily inline the
+    // RSP_MEM_B byte-swap macro (it depends on the librecomp `dmem`
+    // global being directly visible).
+    dma_rdram_to_dmem(rdram, dmem_addr, dram_addr, rd_len);
 }
 
 uint8_t dmem[0x1000];

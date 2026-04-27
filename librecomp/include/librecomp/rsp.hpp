@@ -149,6 +149,59 @@ namespace recomp {
         void constants_init();
 
         bool run_task(uint8_t* rdram, const OSTask* task);
+
+        /**
+         * Pre-task hook signature. Called by the recompiled ucode legacy
+         * wrapper after the OSTask has been loaded into DMEM[0xFC0..],
+         * ucode_data has been DMA'd into DMEM[0..0xF7F], and persistent
+         * RspContext is constructed — but BEFORE the ucode entry at
+         * PC 0x1000 begins executing.
+         *
+         * This hook exists to replicate parts of rspboot's behavior that
+         * the HLE doesn't simulate. On real hardware, rspboot does work
+         * before the ucode entry that leaves specific GPRs and DMA-engine
+         * registers in known states, plus may pre-load command data into
+         * DMEM beyond ucode_data. Different ucodes depend on different
+         * subsets of this prep; the hook lets each game register the
+         * setup its specific ucode-version expects.
+         *
+         * Register one hook per ucode (keyed by ucode_name = the
+         * recompiler's output_function_name). Pass nullptr to clear.
+         *
+         * Per the project's "framework-level" rule: this is the
+         * recommended escape hatch when an ucode's static recompilation
+         * happens to compile correctly but its boot path expects state
+         * that only rspboot would have set on real hardware.
+         */
+        using pre_task_hook_t = void(uint8_t* rdram, RspContext* ctx,
+                                     const char* ucode_name,
+                                     uint32_t ucode_addr);
+
+        /**
+         * Register a pre-task hook keyed by ucode name. ucode_name must
+         * match the recompiler's output_function_name. The pointer is
+         * stored as-is; ensure storage outlives any future task run.
+         */
+        void set_pre_task_hook(const char* ucode_name, pre_task_hook_t* hook);
+
+        /**
+         * Called by the recompiled ucode wrapper. Looks up the
+         * registered hook by name and invokes it if present. Returns
+         * silently if no hook is registered — the typical case for
+         * ucodes that don't depend on rspboot residue.
+         */
+        void run_pre_task_hook(uint8_t* rdram, RspContext* ctx,
+                               const char* ucode_name,
+                               uint32_t ucode_addr);
+
+        /**
+         * RDRAM to DMEM DMA helper exposed for use inside pre_task hooks.
+         * Same semantics as the static inline `dma_rdram_to_dmem` above:
+         * `rd_len` is the inclusive byte count - 1 (to match the RSP DMA
+         * register encoding).
+         */
+        void dma_rdram_to_dmem_external(uint8_t* rdram, uint32_t dmem_addr,
+                                        uint32_t dram_addr, uint32_t rd_len);
     }
 }
 

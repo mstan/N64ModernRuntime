@@ -8,6 +8,7 @@
 #include "librecomp/addresses.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/files.hpp"
+#include "librecomp/overlays.hpp"
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
 
@@ -274,17 +275,49 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             // read cart rom
             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
 
+            // Register any recompiled code sections that fall within
+            // this DMA range into func_map.
+            uint32_t rom_offset = physical_addr - recomp::rom_base;
+            fprintf(stderr, "[pi] load_overlays(rom=0x%08X, ram=0x%08X, size=0x%X)\n",
+                rom_offset, (uint32_t)(int32_t)rdram_address, size);
+            fflush(stderr);
+            load_overlays(rom_offset, (int32_t)rdram_address, size);
+            fprintf(stderr, "[pi] load_overlays done\n"); fflush(stderr);
+
             // Send a message to the mq to indicate that the transfer completed
             osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
         } else if (physical_addr >= recomp::sram_base) {
             if (!recomp::sram_allowed()) {
-                ultramodern::error_handling::message_box("Attempted to use SRAM saving with other save type");
-                ULTRAMODERN_QUICK_EXIT();
+                // SRAM region is also used by the 64DD's diagnostic/RAM
+                // areas (~0x08000000-0x0FFFFFFF). When the game configured
+                // EEPROM/Flash but libleo polls this range to detect the
+                // drive, the correct behavior on a system without a
+                // 64DD/SRAM device is "PI bus open — read returns the
+                // open-bus pattern 0xFF". libleo and SRAM-probing init
+                // code interpret all-0xFF as "no device responds";
+                // returning all-zeros leaves it ambiguous (could mean
+                // "blank but valid storage") and games like Pokemon
+                // Stadium then sector-scan the entire region looking
+                // for non-zero data to confirm presence.
+                static thread_local int log_count = 0;
+                if (log_count++ < 16) {
+                    fprintf(stderr, "[pi] Drive/SRAM read 0x%08X size=0x%X — no-device, returning open-bus 0xFF\n",
+                        physical_addr, size);
+                }
+                for (uint32_t i = 0; i < size; i++) {
+                    MEM_B(i, rdram_address) = (int8_t)0xFF;
+                }
+                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            } else {
+                // read sram
+                save_read(rdram, rdram_address, physical_addr - recomp::sram_base, size);
+                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
             }
-            // read sram
-            save_read(rdram, rdram_address, physical_addr - recomp::sram_base, size);
-
-            // Send a message to the mq to indicate that the transfer completed
+        } else if (physical_addr >= recomp::drive_base) {
+            // 64DD region (0x06000000-0x07FFFFFF). No drive attached →
+            // return zeros and complete cleanly so libleo proceeds along
+            // its no-disk path instead of hanging on a missing DMA done.
+            fprintf(stderr, "[pi] Drive read 0x%08X size=0x%X — no drive, returning zeros\n", physical_addr, size);
             osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
         } else {
             fprintf(stderr, "[WARN] PI DMA read from unknown region, phys address 0x%08X\n", physical_addr);
@@ -295,13 +328,16 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             throw std::runtime_error("ROM DMA write unimplemented");
         } else if (physical_addr >= recomp::sram_base) {
             if (!recomp::sram_allowed()) {
-                ultramodern::error_handling::message_box("Attempted to use SRAM saving with other save type");
-                ULTRAMODERN_QUICK_EXIT();
+                // Same reasoning as the read path — drop drive writes
+                // when the configured save type is not SRAM.
+                fprintf(stderr, "[pi] Drive/SRAM write 0x%08X size=0x%X — no-device, dropping\n", physical_addr, size);
+                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            } else {
+                save_write(rdram, rdram_address, physical_addr - recomp::sram_base, size);
+                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
             }
-            // write sram
-            save_write(rdram, rdram_address, physical_addr - recomp::sram_base, size);
-
-            // Send a message to the mq to indicate that the transfer completed
+        } else if (physical_addr >= recomp::drive_base) {
+            fprintf(stderr, "[pi] Drive write 0x%08X size=0x%X — no drive, dropping\n", physical_addr, size);
             osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
         } else {
             fprintf(stderr, "[WARN] PI DMA write to unknown region, phys address 0x%08X\n", physical_addr);
@@ -349,14 +385,52 @@ extern "C" void osEPiReadIo_recomp(RDRAM_ARG recomp_context * ctx) {
     gpr dramAddr = ctx->r6;
     uint32_t physical_addr = k1_to_phys(devAddr);
 
-    if (physical_addr > recomp::rom_base) {
+    if (physical_addr >= recomp::rom_base) {
         // cart rom
         recomp::do_rom_pio(PASS_RDRAM dramAddr, physical_addr);
+    } else if (physical_addr >= 0x05000000 && physical_addr < 0x06000000) {
+        // 64DD ASIC register space. With no drive attached the status
+        // register MUST report "no disk inserted" so libleo's poll loop
+        // bails out instead of scanning the diagnostic RAM forever.
+        // The LEO_STATUS register lives at offset 0x508 inside ASIC
+        // space; bit 0x800000 set = "DISK_NOT_INSERTED" indicator.
+        // We report the no-disk pattern for ALL ASIC reads — libleo
+        // gates on the status bits and treats anything else as
+        // ignored hardware-quirk noise.
+        uint32_t no_disk_status = 0x00800000u;
+        MEM_W(0, dramAddr) = (int32_t)no_disk_status;
+        ctx->r2 = 0;
+        return;
+    } else if (physical_addr >= recomp::sram_base) {
+        // SRAM/64DD diagnostic RAM PIO read. Same reasoning as the DMA
+        // path: when the configured save type is not SRAM, return zeros
+        // (already-zero rdram region; just write 0).
+        MEM_W(0, dramAddr) = 0;
+        ctx->r2 = 0;
+        return;
     } else {
-        // sram
-        assert(false && "SRAM ReadIo unimplemented");
+        // Genuinely unknown address — keep this loud, it's a missing
+        // device handler.
+        fprintf(stderr,
+            "[pi] osEPiReadIo from unknown phys 0x%08X — returning 0\n",
+            physical_addr);
+        MEM_W(0, dramAddr) = 0;
     }
 
+    ctx->r2 = 0;
+}
+
+extern "C" void osEPiWriteIo_recomp(RDRAM_ARG recomp_context * ctx) {
+    // s32 osEPiWriteIo(OSPiHandle* handle, u32 devAddr, u32 data)
+    // Single-word PIO write to a PI device. ROM is read-only, so writes
+    // there are silently dropped. Writes to 64DD register space
+    // (0x05000000+) target a peripheral that isn't present in this
+    // environment — dropping the write models "no device responding,"
+    // which is the behavior libleo expects when polling. Other PI-bus
+    // devices (cart bank switching, flash) would need real handlers.
+    OSPiHandle* handle = TO_PTR(OSPiHandle, ctx->r4);
+    uint32_t devAddr = handle->baseAddress | ctx->r5;
+    (void)devAddr;
     ctx->r2 = 0;
 }
 

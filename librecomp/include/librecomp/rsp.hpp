@@ -202,6 +202,35 @@ namespace recomp {
          */
         void dma_rdram_to_dmem_external(uint8_t* rdram, uint32_t dmem_addr,
                                         uint32_t dram_addr, uint32_t rd_len);
+
+        /**
+         * Snapshot of the watchdog state for the most-recently-launched
+         * ucode. Populated by get_last_pc_trail(). Stable layout —
+         * external diagnostic harnesses (e.g. tools/diff_aspmain.py)
+         * deserialize this. `idx` indexes a ring of 32 PCs; the newest
+         * is at `(idx - 1) & 31`. `valid` is false before any ucode
+         * has been launched in this process.
+         */
+        struct PcTrailSnapshot {
+            uint32_t entries[32];
+            uint32_t idx;
+            uint64_t watchdog_count;
+            bool     valid;
+        };
+
+        /**
+         * Read the live pc_trail of whichever ucode last started.
+         * Returns true if `valid` is set in `*out`. The read is racy
+         * with respect to the ucode thread's writes — callers should
+         * treat the result as a forensic trail (per-entry coherent on
+         * x86_64; whole-trail consistency not guaranteed).
+         *
+         * Survives ucode exit: when a ucode finishes (Broke or
+         * Watchdog), the snapshot still reflects the last-written
+         * pc_trail values, which is the useful state for hang
+         * post-mortems.
+         */
+        bool get_last_pc_trail(PcTrailSnapshot* out);
     }
 }
 

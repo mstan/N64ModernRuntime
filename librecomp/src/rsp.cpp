@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <cinttypes>
@@ -6,6 +7,19 @@
 
 #include "rsp.hpp"
 #include "librecomp/ultra_trace.hpp"
+
+// Last live RspContext pointer. Captured at every run_pre_task_hook
+// call (which runs at the top of every recompiled ucode_func wrapper).
+// While that ucode is running, its pc_trail / watchdog_count fields
+// are being written by the recompiled code on the game thread; readers
+// from other threads (e.g. TCP debug server) snapshot it racily and
+// accept brief tearing — acceptable for diagnostics. Cleared back to
+// nullptr is intentionally NOT done: when a ucode finishes (Broke or
+// Watchdog), the last context's pc_trail still holds the most-recent
+// values, which is exactly what get_last_pc_trail callers want.
+namespace {
+std::atomic<RspContext*> g_last_rsp_context{nullptr};
+}
 
 static recomp::rsp::callbacks_t rsp_callbacks {};
 
@@ -36,10 +50,39 @@ void recomp::rsp::set_pre_task_hook(const char* ucode_name,
 void recomp::rsp::run_pre_task_hook(uint8_t* rdram, RspContext* ctx,
                                     const char* ucode_name,
                                     uint32_t ucode_addr) {
+    // Capture the current ucode's RspContext pointer so external
+    // observers can read pc_trail/watchdog_count via get_last_pc_trail()
+    // even when no hook is registered for this ucode. release-store so
+    // any subsequent acquire-load on g_last_rsp_context sees a fully
+    // valid object.
+    g_last_rsp_context.store(ctx, std::memory_order_release);
+
     if (ucode_name == nullptr) return;
     auto it = pre_task_hooks().find(ucode_name);
     if (it == pre_task_hooks().end()) return;
     it->second(rdram, ctx, ucode_name, ucode_addr);
+}
+
+bool recomp::rsp::get_last_pc_trail(PcTrailSnapshot* out) {
+    if (out == nullptr) return false;
+    *out = {};
+    RspContext* ctx = g_last_rsp_context.load(std::memory_order_acquire);
+    if (ctx == nullptr) {
+        out->valid = false;
+        return false;
+    }
+    // Racy reads — the recompiled ucode may be writing pc_trail and
+    // watchdog_count concurrently on its game thread. Tearing within a
+    // single uint32_t isn't possible on x86_64 for aligned 4-byte
+    // accesses, so per-entry tearing won't occur. The trail as a whole
+    // can be inconsistent across entries (a slightly older slot mixed
+    // with a slightly newer one) but that's acceptable — callers
+    // interpret pc_trail as a forensic trail, not a serialized record.
+    for (int i = 0; i < 32; i++) out->entries[i] = ctx->pc_trail[i];
+    out->idx            = ctx->pc_trail_idx;
+    out->watchdog_count = ctx->watchdog_count;
+    out->valid          = true;
+    return true;
 }
 
 void recomp::rsp::dma_rdram_to_dmem_external(uint8_t* rdram,

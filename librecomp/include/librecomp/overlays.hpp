@@ -45,6 +45,17 @@ namespace recomp {
 
         void add_loaded_function(int32_t ram_addr, recomp_func_t* func);
 
+        // Stadium-style runtime trampoline scan. Called by the PI DMA
+        // path right after a `load_overlays` returns. Looks for the
+        // "header + jump_table + funcs" fragment layout HAL Labs' games
+        // use (see project_chunked_overlays_and_trampolines.md in
+        // memory) and registers a func_map entry for every J/JAL slot
+        // in the textbin region between the header and the first
+        // decompiled function. Targets that reference not-yet-loaded
+        // sections are queued and resolved when the target section
+        // loads. No-op for games that don't use this layout.
+        void scan_loaded_fragment_trampolines(uint8_t* rdram, uint32_t rom, int32_t ram_addr, uint32_t size);
+
         struct BasePatchedFunction {
             size_t patch_section;
             size_t function_index;

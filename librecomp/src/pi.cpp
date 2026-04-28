@@ -288,6 +288,13 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
                 rom_offset, (uint32_t)(int32_t)rdram_address, size);
             fflush(stderr);
             load_overlays(rom_offset, (int32_t)rdram_address, size);
+            // Stadium-style fragment trampoline scan — registers
+            // synthetic func_map entries for the textbin J/nop slots
+            // between fragment headers and their first decompiled C
+            // function. No-op for sections that don't have the
+            // "FRAGMENT" magic (Zelda + most other games).
+            recomp::overlays::scan_loaded_fragment_trampolines(rdram,
+                rom_offset, (int32_t)rdram_address, size);
             fprintf(stderr, "[pi] load_overlays done\n"); fflush(stderr);
 
             // Send a message to the mq to indicate that the transfer completed

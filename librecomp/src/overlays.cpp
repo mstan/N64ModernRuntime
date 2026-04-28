@@ -172,6 +172,166 @@ void load_overlay(size_t section_table_index, int32_t ram) {
     section_addresses[section.index] = ram;
 }
 
+// ── Fragment trampoline registration ─────────────────────────────────
+//
+// Some games (Pokemon Stadium and other HAL Labs N64 titles) use
+// fragments laid out as:
+//
+//   +0x000  J entry / nop                  ← bootstrap
+//   +0x008  "FRAGMENT" magic + sizes       ← 0x18 bytes of metadata
+//   +0x020  J target / nop                 ┐
+//   +0x028  J target / nop                 │ jump table — small
+//           ...                            │ trampolines, opaque
+//   +0x1F8  J target / nop                 ┘ to the recompiler
+//   +0xN00  decompiled C functions begin
+//
+// The middle region is `textbin` in pret/pokestadium's rom.yaml — raw
+// MIPS bytes the recompiler doesn't decompile. Stadium calls into the
+// trampolines (`jal fragment_base + slot_offset`) to dispatch through
+// to functions in *other* fragments. On real hardware the J targets
+// get patched at load time by the game's relocator to point at the
+// runtime addresses where their target fragments ended up.
+//
+// In our static recompile, those trampoline addresses are not in
+// func_map, so the dispatch lookup-misses. Fix: at PI-DMA time,
+// after a section's funcs have been registered, scan the textbin
+// region between the header and the first decompiled function. For
+// each J/JAL slot, decode the link-time target and translate it to a
+// runtime address via `loaded_sections`. Register the trampoline's
+// runtime address in func_map → the same recomp_func as the resolved
+// target. Slots whose target sections haven't loaded yet go on a
+// pending list and are retried after every subsequent section load.
+
+struct PendingTrampoline {
+    int32_t  trampoline_runtime_addr;   // RAM address of the J/nop slot
+    uint32_t link_time_target;          // absolute link-time vram of target
+};
+static std::vector<PendingTrampoline> pending_trampolines;
+
+// Bytewise BE u32 read with the rdram XOR-3 swap convention. RDRAM is
+// stored XOR-3 swapped per the recompiler's internal layout; a logical
+// big-endian word at virtual address V lives in physical bytes
+// rdram[(V & 0x1FFFFFFF) ^ 3] high-to-low.
+static uint32_t read_rdram_u32_be(uint8_t* rdram, int32_t vaddr) {
+    uint32_t paddr = (uint32_t)vaddr & 0x1FFFFFFF;
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        v = (v << 8) | rdram[(paddr + i) ^ 3];
+    }
+    return v;
+}
+
+// Decode a J or JAL absolute target. PC of the delay slot supplies
+// the high 4 bits per MIPS spec. Returns 0 (an invalid target) if
+// the instruction isn't a J/JAL.
+static uint32_t decode_jal_target(uint32_t instr, uint32_t pc_delay_slot) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    if (opcode != 0x02 && opcode != 0x03) return 0;     // 02=J, 03=JAL
+    uint32_t target_field = instr & 0x03FFFFFF;
+    return (pc_delay_slot & 0xF0000000) | (target_field << 2);
+}
+
+// Translate a link-time vram (assigned by the linker when the section
+// was built) to its current runtime RAM address. Returns 0 if no
+// loaded section covers the link-time address.
+static int32_t translate_link_time_to_runtime(uint32_t link_time) {
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+        if (link_time >= sec.ram_addr && link_time < sec.ram_addr + sec.size) {
+            return ls.loaded_ram_addr + (int32_t)(link_time - sec.ram_addr);
+        }
+    }
+    return 0;
+}
+
+// Try to install a trampoline now. Returns true if the link-time
+// target resolves to a runtime address that has a recomp_func
+// registered. False means the target's section isn't loaded yet (or
+// the offset doesn't have a recomp function).
+static bool try_install_trampoline(int32_t trampoline_runtime_addr, uint32_t link_time_target) {
+    int32_t runtime_target = translate_link_time_to_runtime(link_time_target);
+    if (runtime_target == 0) return false;
+    auto it = func_map.find(runtime_target);
+    if (it == func_map.end()) return false;
+    func_map[trampoline_runtime_addr] = it->second;
+    return true;
+}
+
+// Walk the pending list and try to resolve any trampolines whose
+// targets are now loaded. Called after every section load.
+static void retry_pending_trampolines() {
+    auto it = pending_trampolines.begin();
+    while (it != pending_trampolines.end()) {
+        if (try_install_trampoline(it->trampoline_runtime_addr, it->link_time_target)) {
+            it = pending_trampolines.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Scan one fragment-shaped section's trampoline range. `runtime_base`
+// is the section's loaded_ram_addr (where it lives in RAM right now).
+static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_index, int32_t runtime_base) {
+    const SectionTableEntry& section = sections_info.code_sections[section_index];
+
+    // Heuristic: only treat as a fragment if the "FRAGMENT" magic is
+    // at runtime_base+8. Cheap and avoids false positives for
+    // non-fragment sections (boot, the resident kernel, audio data,
+    // patches).
+    if (read_rdram_u32_be(rdram, runtime_base + 8)  != 0x46524147) return; // "FRAG"
+    if (read_rdram_u32_be(rdram, runtime_base + 12) != 0x4D454E54) return; // "MENT"
+
+    // The trampoline range is [0x20, first_real_func_offset). The
+    // section's func table excludes the textbin region — look for the
+    // smallest non-zero offset in the FuncEntry list.
+    uint32_t first_func_offset = section.size;
+    for (size_t i = 0; i < section.num_funcs; i++) {
+        uint32_t off = section.funcs[i].offset;
+        if (off > 0 && off < first_func_offset) first_func_offset = off;
+    }
+    if (first_func_offset <= 0x20) return;  // nothing between header and first func
+
+    // Walk 8-byte slots. Each slot is { instr, nop } per Stadium's
+    // convention. Non-conforming slots (no nop in delay slot) are
+    // skipped — they're probably padding or data, not trampolines.
+    for (uint32_t slot_off = 0x20; slot_off + 8 <= first_func_offset; slot_off += 8) {
+        uint32_t instr = read_rdram_u32_be(rdram, runtime_base + (int32_t)slot_off);
+        uint32_t delay = read_rdram_u32_be(rdram, runtime_base + (int32_t)slot_off + 4);
+        if (delay != 0) continue;
+
+        uint32_t pc_delay = section.ram_addr + slot_off + 4;
+        uint32_t target = decode_jal_target(instr, pc_delay);
+        if (target == 0) continue;
+
+        int32_t tramp_addr = runtime_base + (int32_t)slot_off;
+        if (!try_install_trampoline(tramp_addr, target)) {
+            pending_trampolines.push_back({tramp_addr, target});
+        }
+    }
+}
+
+void recomp::overlays::scan_loaded_fragment_trampolines(uint8_t* rdram, uint32_t rom, int32_t ram_addr, uint32_t size) {
+    // Iterate sections we just loaded as part of this DMA. A section
+    // counts as "just loaded" if its rom_addr falls in [rom, rom+size)
+    // OR if rom falls inside the section (chunked-load case). We're
+    // conservative and walk loaded_sections, picking ones whose
+    // section.rom_addr overlaps.
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+        bool overlaps =
+            (sec.rom_addr < rom + size) && (sec.rom_addr + sec.size > rom);
+        if (!overlaps) continue;
+
+        scan_fragment_section_trampolines(rdram, ls.section_table_index, ls.loaded_ram_addr);
+    }
+
+    // Whether or not any new trampolines were registered, retry any
+    // pending ones — the section that just loaded may have been the
+    // missing target for trampolines registered earlier.
+    retry_pending_trampolines();
+}
+
 static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {
     for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
         const FuncEntry& func = section.funcs[function_index];

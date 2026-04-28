@@ -195,37 +195,102 @@ void recomp::overlays::read_patch_data(uint8_t* rdram, gpr patch_data_address) {
     }
 }
 
+// Forward declaration — definition is below alongside unload_overlay_by_id.
+static void unload_overlay_by_section_index(uint32_t section_table_index);
+
 extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
-    // Search for the first section that's included in the loaded rom range
-    // Sections were sorted by `init_overlays` so we can use the bounds functions
-    auto lower = std::lower_bound(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections], rom,
+    // Two registration patterns coexist here:
+    //
+    //  (a) A single DMA covers an entire section (small fragments, the
+    //      Zelda style — ROM contiguous, runtime address picked by
+    //      libultra at load time, single PI transfer for the whole
+    //      section). Find all sections fully inside [rom, rom+size)
+    //      and register each.
+    //
+    //  (b) A single SECTION is built up by multiple smaller DMAs
+    //      (Pokemon Stadium's 77-fragment system: fragment 17 is
+    //      ~58 KB and gets streamed in 0x1000-byte chunks; each chunk
+    //      falls *inside* the section). Find any section that the
+    //      DMA range overlaps and register it on the first chunk —
+    //      subsequent chunks just write more bytes into the same
+    //      already-registered section's RAM body.
+    //
+    // The previous implementation only handled (a) and silently
+    // returned when the DMA range fell inside a section (lower >=
+    // upper). This worked for libleo / audio chunked reads (they
+    // re-DMA into already-registered space) but not for Stadium's
+    // chunked initial section loads.
+
+    // Helper: register section at the runtime base implied by this
+    // chunk, but only if not already loaded there. Re-registering at
+    // the same base is wasted work; loading at a NEW base is a
+    // re-relocation handled by unload+reload.
+    auto register_if_new = [](size_t section_index, int32_t implied_base) {
+        auto find_it = std::find_if(loaded_sections.begin(), loaded_sections.end(),
+            [section_index](const LoadedSection& s) { return s.section_table_index == section_index; });
+        if (find_it == loaded_sections.end()) {
+            // First time this section is being loaded.
+            load_overlay(section_index, implied_base);
+        } else if (find_it->loaded_ram_addr != implied_base) {
+            // Section is already loaded but at a different runtime
+            // address — game has relocated it. Unregister the old
+            // mapping and re-register at the new base.
+            unload_overlay_by_section_index(section_index);
+            load_overlay(section_index, implied_base);
+        }
+        // else: same section already registered at same base; skip.
+    };
+
+    auto* sections_begin = &sections_info.code_sections[0];
+    auto* sections_end   = &sections_info.code_sections[sections_info.num_code_sections];
+
+    // First handle case (a): sections wholly inside [rom, rom+size).
+    // lower = first section with rom_addr >= rom.
+    auto lower = std::lower_bound(sections_begin, sections_end, rom,
         [](const SectionTableEntry& entry, uint32_t addr) {
             return entry.rom_addr < addr;
-        }
-    );
-    auto upper = std::upper_bound(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections], (uint32_t)(rom + size),
+        });
+    // upper_a = first section with rom_addr > (rom + size). These are
+    // the sections fully contained in [rom, rom+size).
+    auto upper_a = std::upper_bound(sections_begin, sections_end, (uint32_t)(rom + size),
         [](uint32_t addr, const SectionTableEntry& entry) {
-            return addr < entry.size + entry.rom_addr;
-        }
-    );
-    // When the DMA range falls *inside* a single section (partial read of
-    // an already-loaded section's data — common when libultra DMAs small
-    // chunks for libleo or audio), lower_bound returns the iterator AFTER
-    // the containing section and upper_bound returns the iterator AT the
-    // containing section, so lower > upper and the naive `for (it=lower;
-    // it!=upper; ++it)` walks past the end of the array. Skip when the
-    // range produces no whole-section overlap.
-    if (lower >= upper) {
-        return;
+            return addr < entry.rom_addr;
+        });
+    for (auto it = lower; it != upper_a; ++it) {
+        // Skip sections that don't fully fit in this DMA — those are
+        // the chunked-load sections, handled below.
+        if (it->rom_addr + it->size > rom + size) continue;
+        register_if_new(std::distance(sections_begin, it),
+                        it->rom_addr - rom + ram_addr);
     }
-    // Load the overlays that were found
-    for (auto it = lower; it != upper; ++it) {
-        load_overlay(std::distance(&sections_info.code_sections[0], it), it->rom_addr - rom + ram_addr);
+
+    // Now handle case (b): the DMA range may be a chunk of a larger
+    // section. The section containing `rom` is either at `lower`
+    // (when rom == lower->rom_addr exactly) or at `lower - 1` (when
+    // lower advanced past the containing section).
+    if (lower != sections_begin) {
+        auto* candidate = lower - 1;
+        if (rom >= candidate->rom_addr && rom < candidate->rom_addr + candidate->size) {
+            int32_t implied_base = (int32_t)ram_addr - (int32_t)(rom - candidate->rom_addr);
+            register_if_new(std::distance(sections_begin, candidate), implied_base);
+        }
+    }
+    if (lower != sections_end && lower->rom_addr == rom) {
+        // DMA starts exactly at section boundary — but the section
+        // might still be larger than the DMA chunk (case (b) flavor
+        // where the first chunk of a multi-chunk section is being
+        // loaded).
+        if (lower->rom_addr + lower->size > rom + size) {
+            register_if_new(std::distance(sections_begin, lower),
+                            lower->rom_addr - rom + ram_addr);
+        }
     }
 }
 
-extern "C" void unload_overlay_by_id(uint32_t id) {
-    uint32_t section_table_index = overlays_info.table[id];
+// Internal helper — unload a section by its section-table index
+// (not its overlay id). Both unload_overlay_by_id (public) and
+// load_overlays' relocation path (for re-registration) use this.
+static void unload_overlay_by_section_index(uint32_t section_table_index) {
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
 
     auto find_it = std::find_if(loaded_sections.begin(), loaded_sections.end(), [section_table_index](const LoadedSection& s) { return s.section_table_index == section_table_index; });
@@ -245,6 +310,11 @@ extern "C" void unload_overlay_by_id(uint32_t id) {
         // Remove the section from the loaded section map
         loaded_sections.erase(find_it);
     }
+}
+
+extern "C" void unload_overlay_by_id(uint32_t id) {
+    uint32_t section_table_index = overlays_info.table[id];
+    unload_overlay_by_section_index(section_table_index);
 }
 
 extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr) {

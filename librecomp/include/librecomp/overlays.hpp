@@ -56,6 +56,24 @@ namespace recomp {
         // loads. No-op for games that don't use this layout.
         void scan_loaded_fragment_trampolines(uint8_t* rdram, uint32_t rom, int32_t ram_addr, uint32_t size);
 
+        // Stadium-style runtime fragment registration. Called from a
+        // Memmap_RelocateFragment hook (see project memory file
+        // project_runtime_fragment_registration.md). Stadium loads
+        // some fragments via CPU-side yay0 decompression that bypasses
+        // PI DMA, so the load_overlays path never sees them. After the
+        // fragment is in RDRAM and relocated, this function is
+        // responsible for registering all of its FuncEntry rows in
+        // func_map at (fragment_ptr + offset). It also runs the
+        // trampoline scanner over the fragment's textbin region.
+        //
+        // `id` is Stadium's encoded fragment id (matches the bucket
+        // used in Memmap_GetFragmentVaddr: bits 27:20 of the fragment's
+        // link-time vram, minus 0x10). The function looks up the
+        // matching section in the recompiled section_table by
+        // computing the same bucket from each section's link-time
+        // ram_addr.
+        void register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr);
+
         struct BasePatchedFunction {
             size_t patch_section;
             size_t function_index;

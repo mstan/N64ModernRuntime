@@ -332,6 +332,102 @@ void recomp::overlays::scan_loaded_fragment_trampolines(uint8_t* rdram, uint32_t
     retry_pending_trampolines();
 }
 
+// ---- Stadium runtime fragment registration -------------------------------
+//
+// Stadium has two fragment-load paths:
+//   (1) PI DMA → load_overlays() → registers funcs in func_map at the
+//       runtime address each section was DMA'd to. Trampoline scan also
+//       fires here.
+//   (2) CPU-side yay0 decompression → bytes appear in RDRAM by direct
+//       stores from recompiled libultra/main code, never going through
+//       do_dma. The PI-DMA-based hooks above never see these.
+//
+// Both paths converge on Memmap_RelocateFragment(id, fragment_ptr) before
+// the fragment is dispatched. That's the right place to register the
+// runtime address mapping for path (2). For path (1), this is a no-op or
+// re-registers the same mapping — safe.
+//
+// Stadium's `id` is the same encoding Memmap_GetFragmentVaddr uses:
+//   id = ((link_time_vram & 0x0FF00000) >> 0x14) - 0x10
+// To find which section in our static section_table corresponds to this
+// id, we apply the same formula to each section.ram_addr (the link-time
+// vram baked into the recompiled output) and match.
+void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr) {
+    (void)rdram;
+    if (sections_info.code_sections == nullptr) return;
+    if (fragment_ptr == 0) return;
+
+    // Find the section whose link-time vram bucket matches `id`.
+    size_t found_index = (size_t)-1;
+    for (size_t i = 0; i < sections_info.num_code_sections; i++) {
+        const SectionTableEntry& sec = sections_info.code_sections[i];
+        uint32_t bucket = (sec.ram_addr & 0x0FF00000u) >> 0x14;
+        if (bucket < 0x10) continue;
+        uint32_t sec_id = bucket - 0x10;
+        if (sec_id == id) {
+            found_index = i;
+            break;
+        }
+    }
+    if (found_index == (size_t)-1) {
+        // Not one of our recompiled fragments — a HAL fragment present
+        // in ROM that pret hasn't split out as code. Stadium has at
+        // least one such fragment at ROM 0x1206400 (inside the
+        // pokemon_models bin segment, link-vram 0xFF000000), plus
+        // an id=0xC0 buddy. Without recompiled C for the body we have
+        // no good way to dispatch it. A noop stub at fragment_ptr
+        // (return 0 in $v0/$v1) was tried and led to a silent
+        // downstream failure — so we leave the lookup-miss trampoline
+        // as the visible failure mode. Real fix lives upstream in
+        // pret/pokestadium (split this region as a code subsegment).
+        fprintf(stderr, "[reg-frag] unrecompiled fragment id=0x%X (link-vram bucket 0x%X) at runtime 0x%08X — needs pret split\n",
+                id, id + 0x10, (uint32_t)fragment_ptr); fflush(stderr);
+        return;
+    }
+
+    const SectionTableEntry& section = sections_info.code_sections[found_index];
+
+    // Register every FuncEntry at both the runtime address and the
+    // section's link-time vram (mirroring load_overlay). The link-time
+    // alias is what scan_fragment_section_trampolines uses to resolve
+    // J/JAL targets back to a recomp_func — without it the scan can't
+    // install +0x00 dispatch trampolines. The runtime alias is what
+    // dispatch goes through after Stadium hands out a fragment_ptr.
+    for (size_t fi = 0; fi < section.num_funcs; fi++) {
+        const FuncEntry& fe = section.funcs[fi];
+        if (fe.func == nullptr) continue;
+        func_map[fragment_ptr + (int32_t)fe.offset] = fe.func;
+        if ((int32_t)section.ram_addr != fragment_ptr) {
+            func_map[(int32_t)section.ram_addr + (int32_t)fe.offset] = fe.func;
+        }
+    }
+
+    // Update section_addresses so reloc-driven RELOC_HI16/LO16 macros
+    // resolve to the runtime base.
+    if (section_addresses != nullptr) {
+        section_addresses[section.index] = fragment_ptr;
+    }
+
+    // Track in loaded_sections so unload paths (and the diagnostic dump)
+    // see this fragment. Avoid duplicate entries if Memmap_RelocateFragment
+    // is invoked more than once for the same id (rare but possible).
+    auto find_existing = std::find_if(loaded_sections.begin(), loaded_sections.end(),
+        [found_index](const LoadedSection& s) { return s.section_table_index == found_index; });
+    if (find_existing == loaded_sections.end()) {
+        loaded_sections.emplace_back(fragment_ptr, found_index);
+    } else {
+        find_existing->loaded_ram_addr = fragment_ptr;
+    }
+
+    // Run the textbin trampoline scanner on the fragment, same as the
+    // DMA path. Resolves +0x00 J-slot dispatch and any in-header
+    // trampolines that point at sibling fragments.
+    scan_fragment_section_trampolines(rdram, found_index, fragment_ptr);
+
+    // Pending trampolines may now resolve.
+    retry_pending_trampolines();
+}
+
 static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {
     for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
         const FuncEntry& func = section.funcs[function_index];
@@ -630,6 +726,15 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
 static void unhandled_lookup_trampoline(uint8_t* /*rdram*/, recomp_context* /*ctx*/) {
     fprintf(stderr, "[recomp] lookup-miss trampoline reached — aborting\n");
     std::abort();
+}
+
+// C-linkage wrapper for the runtime fragment registrar so it can be
+// invoked from a recompiled-function text hook (game.toml [[patches.hook]]).
+// Hooks run inside the recompiled function with `rdram` and `ctx` in
+// scope; see the Memmap_RelocateFragment hooks in pret/pokestadium's
+// game.toml.
+extern "C" void recomp_register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr) {
+    recomp::overlays::register_runtime_fragment(rdram, id, fragment_ptr);
 }
 
 extern "C" recomp_func_t * get_function(int32_t addr) {

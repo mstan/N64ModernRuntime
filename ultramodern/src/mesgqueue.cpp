@@ -19,11 +19,58 @@ void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
 
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
 
+// Counter for how many external messages have been re-queued after a
+// transient target-queue-full failure. Surfaced via the runner's
+// status command so a sustained nonzero value indicates a target
+// queue is being overrun (receiver thread starved).
+static std::atomic<uint64_t> g_external_requeues{0};
+
 void dequeue_external_messages(RDRAM_ARG1) {
     QueuedMessage to_send;
     while (external_messages.try_dequeue(to_send)) {
-        do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
+        // Try non-blocking send first.
+        bool ok = do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
+        if (!ok) {
+            // Target OSMesgQueue is full. The original code silently
+            // dropped the message here — see git blame on this line.
+            // That is wrong: callers (sp_complete / dp_complete /
+            // ai_complete / etc) treat enqueue_external_message as
+            // reliable delivery, and silent drops produce
+            // hard-to-diagnose softlocks when game-thread receivers
+            // can't keep up with the host-side event burst rate.
+            //
+            // Pokemon Stadium hits this on the gfx scheduler queue
+            // 0x800A6CD0: audio SP DONE + VI ticks generate ~110
+            // events/sec into a cap=16 queue, briefly filling it,
+            // and the gfx RDP DONE for Stadium's third boot-logo
+            // dlist gets dropped — Game_Thread softlocks waiting for
+            // a completion that never propagates.
+            //
+            // Fix: re-queue at the tail and bail out of this drain
+            // pass. We must NOT keep looping (we'd just dequeue and
+            // re-enqueue the same blocking message in a tight loop
+            // with no chance for the receiver to drain). Letting the
+            // caller (the game-thread inside osSendMesg/osRecvMesg)
+            // return and continue executing gives the receiver a
+            // chance to dequeue, freeing space; the next call into
+            // dequeue_external_messages will retry.
+            //
+            // NB: doesn't apply to OS_MESG_BLOCK semantics — sender
+            // explicitly opted-in to blocking, and that path is
+            // direct (skips this external queue). Externals are by
+            // design fire-and-forget posts from host threads, but
+            // "fire-and-forget" must mean "delivered eventually",
+            // not "occasionally lost."
+            external_messages.enqueue(to_send);
+            g_external_requeues.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
     }
+}
+
+// Public accessor surfaced via the runner's debug_server status cmd.
+extern "C" uint64_t ultramodern_external_requeues(void) {
+    return g_external_requeues.load(std::memory_order_relaxed);
 }
 
 void ultramodern::wait_for_external_message(RDRAM_ARG1) {

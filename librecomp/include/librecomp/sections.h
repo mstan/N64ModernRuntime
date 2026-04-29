@@ -43,6 +43,13 @@ typedef struct {
     RelocEntry* relocs;
     size_t num_relocs;
     size_t index;
+    // Content hash for runtime identification. Nonzero only on
+    // pattern-synthesized decompressed sections (multiple sections
+    // share a link vram and need byte-content matching at registration
+    // time to pick the right variant). FNV-1a-64 of the first 0x40
+    // bytes of the decompressed body. Zero for ELF sections (which
+    // get registered uniquely by ram_addr alone).
+    uint64_t content_hash;
 } SectionTableEntry;
 
 typedef struct {

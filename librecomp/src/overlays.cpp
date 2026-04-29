@@ -352,23 +352,81 @@ void recomp::overlays::scan_loaded_fragment_trampolines(uint8_t* rdram, uint32_t
 // To find which section in our static section_table corresponds to this
 // id, we apply the same formula to each section.ram_addr (the link-time
 // vram baked into the recompiled output) and match.
+// FNV-1a 64-bit. Same algorithm the build-time recompiler uses to hash
+// pattern-synthesized section bodies — they MUST match for runtime
+// content-keyed dispatch to find the right section.
+static uint64_t fnv1a_64(const uint8_t* data, size_t len) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < len; i++) {
+        h ^= uint64_t(data[i]);
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
+
 void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr) {
-    (void)rdram;
     if (sections_info.code_sections == nullptr) return;
     if (fragment_ptr == 0) return;
 
-    // Find the section whose link-time vram bucket matches `id`.
-    size_t found_index = (size_t)-1;
+    // Find candidate sections sharing this link-time vram bucket. With
+    // pattern-synthesized sections, multiple sections can share a bucket.
+    // We collect them all and pick by content hash below.
+    std::vector<size_t> candidates;
     for (size_t i = 0; i < sections_info.num_code_sections; i++) {
         const SectionTableEntry& sec = sections_info.code_sections[i];
         uint32_t bucket = (sec.ram_addr & 0x0FF00000u) >> 0x14;
         if (bucket < 0x10) continue;
         uint32_t sec_id = bucket - 0x10;
         if (sec_id == id) {
-            found_index = i;
-            break;
+            candidates.push_back(i);
         }
     }
+
+    size_t found_index = (size_t)-1;
+    if (candidates.size() == 1) {
+        // Common case: exactly one section per bucket (every static
+        // overlay + the single-block decompressed_section path).
+        found_index = candidates.front();
+    } else if (candidates.size() > 1) {
+        // Pattern-synthesized case: hash the bytes Stadium just put
+        // in RDRAM at fragment_ptr, look up the matching section by
+        // content_hash. Window must match the build-time hash window
+        // in N64Recomp's decompressed.cpp (currently 0x100, fnv1a-64).
+        constexpr size_t HASH_WINDOW = 0x100;
+        uint8_t window[HASH_WINDOW];
+        const uint32_t paddr = uint32_t(fragment_ptr) & 0x1FFFFFFFu;
+        // Read with the recompiler's XOR-3 byte-order convention so
+        // we observe the same bytes the build-time hash saw.
+        for (size_t i = 0; i < HASH_WINDOW; i++) {
+            window[i] = rdram[(paddr + i) ^ 3];
+        }
+        uint64_t live_hash = fnv1a_64(window, HASH_WINDOW);
+
+        for (size_t ci : candidates) {
+            const SectionTableEntry& sec = sections_info.code_sections[ci];
+            if (sec.content_hash != 0 && sec.content_hash == live_hash) {
+                found_index = ci;
+                break;
+            }
+        }
+
+        if (found_index == (size_t)-1) {
+            // Hash didn't match any candidate. Fall back to the first
+            // candidate — won't be correct dispatch for this fragment,
+            // but lets the run continue. Log so post-mortem can spot
+            // the residual ~5% the 0x100-byte window misses.
+            fprintf(stderr,
+                "[reg-frag] no content-hash match for id=0x%X "
+                "fragment_ptr=0x%08X live_hash=0x%016llX "
+                "(%zu candidates) — picking first\n",
+                id, (uint32_t)fragment_ptr,
+                (unsigned long long)live_hash,
+                candidates.size());
+            fflush(stderr);
+            found_index = candidates.front();
+        }
+    }
+
     if (found_index == (size_t)-1) {
         // Not one of our recompiled fragments — a HAL fragment present
         // in ROM that pret hasn't split out as code. Stadium has at

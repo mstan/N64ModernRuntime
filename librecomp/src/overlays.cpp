@@ -541,6 +541,59 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         id, id + 0x10, section.ram_addr, (uint32_t)fragment_ptr, section.size);
     fflush(stderr);
 
+    // Stadium reuses the same RDRAM buffer for sequentially-loaded
+    // pattern variants — e.g. five different intro/menu fragments
+    // get decompressed into 0x801D7A30 in turn. Each variant has a
+    // DIFFERENT set of internal func offsets. If we just overwrite
+    // the new variant's offsets without first evicting the previous
+    // variant's, callers that JAL into an offset present in the OLD
+    // variant but absent in the NEW variant will dispatch to the
+    // OLD variant's function — which is no longer in RAM. That
+    // matches the user-visible "Stadium replays the intro instead
+    // of advancing" symptom.
+    //
+    // Evict the previous section's func_map entries (both runtime
+    // alias at this fragment_ptr AND link-time alias) before
+    // registering the new section's. Iterate loaded_sections to
+    // find any prior occupant of this runtime address.
+    for (auto& ls : loaded_sections) {
+        if (ls.loaded_ram_addr != fragment_ptr) continue;
+        if (ls.section_table_index == found_index) continue;  // same section reload
+        const SectionTableEntry& old_section =
+            sections_info.code_sections[ls.section_table_index];
+        for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
+            const FuncEntry& fe = old_section.funcs[fi];
+            if (fe.func == nullptr) continue;
+            func_map.erase(fragment_ptr + (int32_t)fe.offset);
+            // Erase the OLD section's link-time alias too — for
+            // pattern-shared bucket vrams (e.g. 0x8FF00000) this
+            // is critical since multiple sections claim the same
+            // alias, and the freshly-evicted variant's leftover
+            // entries would shadow the new variant if it doesn't
+            // have a func at the same offset.
+            if ((int32_t)old_section.ram_addr != fragment_ptr) {
+                func_map.erase(
+                    (int32_t)old_section.ram_addr + (int32_t)fe.offset);
+            }
+        }
+        // Also drop trampoline-scanner-installed entries (the J-slot
+        // dispatch range from 0x20 up to first real func offset).
+        // The scanner re-runs at the bottom of this function for
+        // the new section.
+        uint32_t first_func_offset = old_section.size;
+        for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
+            uint32_t off = old_section.funcs[fi].offset;
+            if (off > 0 && off < first_func_offset) first_func_offset = off;
+        }
+        for (uint32_t slot_off = 0x20; slot_off + 8 <= first_func_offset; slot_off += 8) {
+            func_map.erase(fragment_ptr + (int32_t)slot_off);
+            if ((int32_t)old_section.ram_addr != fragment_ptr) {
+                func_map.erase((int32_t)old_section.ram_addr + (int32_t)slot_off);
+            }
+        }
+        break;
+    }
+
     // Register every FuncEntry at both the runtime address and the
     // section's link-time vram (mirroring load_overlay). The link-time
     // alias is what scan_fragment_section_trampolines uses to resolve

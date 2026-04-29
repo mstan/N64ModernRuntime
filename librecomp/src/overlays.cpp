@@ -556,11 +556,21 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     // alias at this fragment_ptr AND link-time alias) before
     // registering the new section's. Iterate loaded_sections to
     // find any prior occupant of this runtime address.
-    for (auto& ls : loaded_sections) {
-        if (ls.loaded_ram_addr != fragment_ptr) continue;
-        if (ls.section_table_index == found_index) continue;  // same section reload
+    auto evict_it = loaded_sections.begin();
+    while (evict_it != loaded_sections.end()) {
+        if (evict_it->loaded_ram_addr != fragment_ptr ||
+            evict_it->section_table_index == found_index) {
+            ++evict_it;
+            continue;
+        }
         const SectionTableEntry& old_section =
-            sections_info.code_sections[ls.section_table_index];
+            sections_info.code_sections[evict_it->section_table_index];
+        fprintf(stderr,
+            "[reg-frag] EVICTING old section index=%zu (ram_addr=0x%08X size=0x%X) "
+            "from runtime=0x%08X before installing new section index=%zu\n",
+            evict_it->section_table_index, uint32_t(old_section.ram_addr), old_section.size,
+            (uint32_t)fragment_ptr, found_index);
+        fflush(stderr);
         for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
             const FuncEntry& fe = old_section.funcs[fi];
             if (fe.func == nullptr) continue;
@@ -591,7 +601,13 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                 func_map.erase((int32_t)old_section.ram_addr + (int32_t)slot_off);
             }
         }
-        break;
+        // Remove from loaded_sections so subsequent registrations
+        // don't see this entry as a "ghost" still occupying the
+        // runtime address. Without this, a re-register would attempt
+        // to evict the same already-evicted section repeatedly, and
+        // fresh fragments at this same runtime addr would all leave
+        // ghost entries behind.
+        evict_it = loaded_sections.erase(evict_it);
     }
 
     // Register every FuncEntry at both the runtime address and the

@@ -248,12 +248,38 @@ static int32_t translate_link_time_to_runtime(uint32_t link_time) {
 // target resolves to a runtime address that has a recomp_func
 // registered. False means the target's section isn't loaded yet (or
 // the offset doesn't have a recomp function).
+//
+// Registers BOTH the runtime address AND the trampoline's link-time
+// vram (computed from the trampoline's host section). Stadium's
+// recompiled call sites can dispatch through either, depending on
+// whether the caller is using a relocated or link-time pointer.
 static bool try_install_trampoline(int32_t trampoline_runtime_addr, uint32_t link_time_target) {
     int32_t runtime_target = translate_link_time_to_runtime(link_time_target);
     if (runtime_target == 0) return false;
     auto it = func_map.find(runtime_target);
     if (it == func_map.end()) return false;
     func_map[trampoline_runtime_addr] = it->second;
+
+    // Also register the trampoline's link-time vram alias. Find the
+    // section that owns trampoline_runtime_addr by walking
+    // loaded_sections; compute its link_time_vram = section.ram_addr
+    // + (trampoline_runtime_addr - section.runtime_addr); and store
+    // a func_map entry there too. Without this, callers that resolve
+    // the trampoline by link-time vram (e.g. statically-recompiled
+    // dispatches) hit a runtime LOOKUP_FUNC miss.
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+        int32_t sec_runtime_end = ls.loaded_ram_addr + (int32_t)sec.size;
+        if (trampoline_runtime_addr >= ls.loaded_ram_addr &&
+            trampoline_runtime_addr < sec_runtime_end) {
+            int32_t off = trampoline_runtime_addr - ls.loaded_ram_addr;
+            int32_t link_time_vram = (int32_t)sec.ram_addr + off;
+            if (link_time_vram != trampoline_runtime_addr) {
+                func_map[link_time_vram] = it->second;
+            }
+            break;
+        }
+    }
     return true;
 }
 

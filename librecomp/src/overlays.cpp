@@ -387,6 +387,14 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
 
     const SectionTableEntry& section = sections_info.code_sections[found_index];
 
+    // Diagnostic: log every successful registration so we can correlate
+    // load order with crash post-mortem. Single line per fragment, includes
+    // the link-time vram bucket so it's clear which pret fragment.
+    fprintf(stderr,
+        "[reg-frag] id=0x%X bucket=0x%X link=0x%08X runtime=0x%08X size=0x%X\n",
+        id, id + 0x10, section.ram_addr, (uint32_t)fragment_ptr, section.size);
+    fflush(stderr);
+
     // Register every FuncEntry at both the runtime address and the
     // section's link-time vram (mirroring load_overlay). The link-time
     // alias is what scan_fragment_section_trampolines uses to resolve

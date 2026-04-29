@@ -453,19 +453,81 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         }
     }
 
+    // J-trampoline fallback: when id-based lookup misses, decode the
+    // FRAGMENT header at fragment_ptr to recover the link-time vram
+    // and try matching by sec.ram_addr instead. Stadium uses different
+    // id encodings on different code paths (e.g. relocate-existing
+    // vs load-fresh), so even a fragment we successfully recompiled
+    // can come in with an "id" we don't recognize. The +0x00 J
+    // trampoline + +0x10 entryOffset are the canonical way to find
+    // where this fragment expects to live.
     if (found_index == (size_t)-1) {
-        // Not one of our recompiled fragments — a HAL fragment present
-        // in ROM that pret hasn't split out as code. Stadium has at
-        // least one such fragment at ROM 0x1206400 (inside the
-        // pokemon_models bin segment, link-vram 0xFF000000), plus
-        // an id=0xC0 buddy. Without recompiled C for the body we have
-        // no good way to dispatch it. A noop stub at fragment_ptr
-        // (return 0 in $v0/$v1) was tried and led to a silent
-        // downstream failure — so we leave the lookup-miss trampoline
-        // as the visible failure mode. Real fix lives upstream in
-        // pret/pokestadium (split this region as a code subsegment).
-        fprintf(stderr, "[reg-frag] unrecompiled fragment id=0x%X (link-vram bucket 0x%X) at runtime 0x%08X — needs pret split\n",
-                id, id + 0x10, (uint32_t)fragment_ptr); fflush(stderr);
+        const uint32_t paddr = uint32_t(fragment_ptr) & 0x1FFFFFFFu;
+        if (paddr + 0x14 <= (8u * 1024u * 1024u)) {
+            auto rd_be32 = [&](uint32_t off) -> uint32_t {
+                uint8_t b0 = rdram[(paddr + off + 0) ^ 3];
+                uint8_t b1 = rdram[(paddr + off + 1) ^ 3];
+                uint8_t b2 = rdram[(paddr + off + 2) ^ 3];
+                uint8_t b3 = rdram[(paddr + off + 3) ^ 3];
+                return (uint32_t(b0) << 24) | (uint32_t(b1) << 16) | (uint32_t(b2) << 8) | uint32_t(b3);
+            };
+            uint32_t j_instr = rd_be32(0x00);
+            uint32_t magic_a = rd_be32(0x08);
+            uint32_t magic_b = rd_be32(0x0C);
+            uint32_t entry_off = rd_be32(0x10);
+            // FRAGMENT magic + J opcode (top 6 bits == 0x02 << 26).
+            if (magic_a == 0x46524147u && magic_b == 0x4D454E54u &&
+                ((j_instr >> 26) & 0x3Fu) == 0x02u) {
+                uint32_t j_target = ((j_instr & 0x03FFFFFFu) << 2) | 0x80000000u;
+                uint32_t link_vram = j_target - entry_off;
+                for (size_t i = 0; i < sections_info.num_code_sections; i++) {
+                    const SectionTableEntry& sec = sections_info.code_sections[i];
+                    if (uint32_t(sec.ram_addr) == link_vram) {
+                        found_index = i;
+                        fprintf(stderr,
+                            "[reg-frag] J-trampoline fallback rescued id=0x%X (signed=%d): "
+                            "link_vram=0x%08X -> section index %zu (ram_addr=0x%08X size=0x%X)\n",
+                            id, (int32_t)id, link_vram, i,
+                            uint32_t(sec.ram_addr), sec.size);
+                        fflush(stderr);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (found_index == (size_t)-1) {
+        // Not one of our recompiled fragments. Dump the FRAGMENT
+        // header so the caller can identify the source ROM fragment
+        // and add the appropriate decompressed_section / split.
+        // Layout: +0x00 J trampoline, +0x04 nop, +0x08 "FRAGMENT" magic,
+        // +0x14 relocOffset, +0x1C sizeInRam.
+        char magic[9] = {};
+        uint32_t hdr[8] = {};
+        const uint32_t paddr = uint32_t(fragment_ptr) & 0x1FFFFFFFu;
+        if (paddr + 0x20 <= (8u * 1024u * 1024u)) {
+            for (int i = 0; i < 8; i++) {
+                uint8_t b0 = rdram[(paddr + i*4 + 0) ^ 3];
+                uint8_t b1 = rdram[(paddr + i*4 + 1) ^ 3];
+                uint8_t b2 = rdram[(paddr + i*4 + 2) ^ 3];
+                uint8_t b3 = rdram[(paddr + i*4 + 3) ^ 3];
+                hdr[i] = (uint32_t(b0) << 24) | (uint32_t(b1) << 16) | (uint32_t(b2) << 8) | uint32_t(b3);
+            }
+            for (int i = 0; i < 8; i++) magic[i] = (char)rdram[(paddr + 8 + i) ^ 3];
+            magic[8] = 0;
+            // Sanitize non-printable bytes for stderr.
+            for (int i = 0; i < 8; i++) {
+                if ((unsigned char)magic[i] < 0x20 || (unsigned char)magic[i] > 0x7E) magic[i] = '.';
+            }
+        }
+        fprintf(stderr,
+            "[reg-frag] UNRECOMPILED id=0x%X (signed=%d, bucket=0x%X) at runtime=0x%08X "
+            "magic='%s' hdr=[%08X %08X %08X %08X %08X %08X %08X %08X] relocOff=0x%X sizeInRam=0x%X\n",
+            id, (int32_t)id, id + 0x10, (uint32_t)fragment_ptr,
+            magic, hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7],
+            hdr[5], hdr[7]);
+        fflush(stderr);
         return;
     }
 

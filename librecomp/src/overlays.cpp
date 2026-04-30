@@ -1443,6 +1443,191 @@ extern "C" int32_t recomp_resolve_synthetic_fragment(uint32_t addr) {
     return int32_t(resolved);
 }
 
+// Geo-layout command size table for Pokemon Stadium (from
+// disasm/src/geo_layout.h). Indexed by cmd byte; each entry is the
+// number of bytes that command consumes from the stream. Used by the
+// structural-parse probe below to walk N commands forward through a
+// candidate variant's bytes and confirm they parse as coherent geo
+// data, not random bytes.
+//
+// Stadium-specific. Lives here only as diagnostic infrastructure for
+// the build-time binding-table generation pass. Do NOT bake "parse
+// Pokemon Stadium geo commands" into the generic recompiler core.
+static const uint8_t kStadiumGeoCmdSize[0x27] = {
+    /*0x00 branch_and_link*/ 0x08, /*0x01 end*/ 0x04,
+    /*0x02 jump*/            0x08, /*0x03 branch*/           0x08,
+    /*0x04 return*/          0x04, /*0x05 open_node*/        0x04,
+    /*0x06 close_node*/      0x04, /*0x07*/                  0x08,
+    /*0x08*/                 0x0C, /*0x09*/                  0x04,
+    /*0x0A*/                 0x08, /*0x0B*/                  0x18,
+    /*0x0C*/                 0x04, /*0x0D*/                  0x04,
+    /*0x0E*/                 0x04, /*0x0F*/                  0x04,
+    /*0x10*/                 0x04, /*0x11*/                  0x04,
+    /*0x12*/                 0x04, /*0x13*/                  0x08,
+    /*0x14*/                 0x0C, /*0x15*/                  0x0C,
+    /*0x16*/                 0x04, /*0x17*/                  0x14,
+    /*0x18*/                 0x08, /*0x19*/                  0x08,
+    /*0x1A*/                 0x04, /*0x1B*/                  0x10,
+    /*0x1C*/                 0x10, /*0x1D*/                  0x1C,
+    /*0x1E*/                 0x08, /*0x1F*/                  0x18,
+    /*0x20*/                 0x14, /*0x21*/                  0x10,
+    /*0x22*/                 0x08, /*0x23*/                  0x10,
+    /*0x24*/                 0x04, /*0x25*/                  0x04,
+    /*0x26*/                 0x14,
+};
+
+// Walk up to `max_steps` geo commands forward starting at variant's
+// (runtime_base + offset). Returns the number of commands successfully
+// parsed. A "successful parse" requires:
+//   - cmd byte < 0x27 (in jumptable range)
+//   - body+offset+cmd_size remains within the variant's [base, +size)
+//   - cmd 0x01 (end) terminates the walk and counts as success
+// Returns 0 if even the first byte isn't a valid opcode.
+static uint32_t walk_geo_commands(uint8_t* rdram,
+                                  uint32_t runtime_base,
+                                  uint32_t variant_size,
+                                  uint32_t offset,
+                                  uint32_t max_steps)
+{
+    uint32_t cur = offset;
+    uint32_t steps = 0;
+    while (steps < max_steps && cur < variant_size) {
+        const uint32_t paddr = (runtime_base + cur) & 0x1FFFFFFFu;
+        if (paddr >= 8u * 1024u * 1024u) break;
+        const uint8_t cmd = rdram[paddr ^ 3];
+        if (cmd >= 0x27) break;
+        const uint8_t sz = kStadiumGeoCmdSize[cmd];
+        if (sz == 0) break;
+        if (cur + sz > variant_size) break;
+        steps++;
+        if (cmd == 0x01) break;  // end terminates
+        cur += sz;
+    }
+    return steps;
+}
+
+// Diagnostic-only: dump every loaded pattern variant whose size > offset,
+// peek 16 bytes at runtime_base + offset, parse N=8 geo commands
+// forward to validate structural shape, and flag the variant where
+// parsing stays consistent. Used to answer "which variant does
+// fragment62 actually want for offset 0xABFC?" with high confidence.
+//
+// Caller is responsible for passing the canonical pattern bucket
+// (e.g. 0x8FF00000) — we don't require it to come from a synthetic
+// addr. Fires fully every call (not rate-limited) — caller should
+// gate to one-shot externally.
+extern "C" void recomp_diag_dump_variant_candidates_for_offset(
+    uint8_t* rdram,
+    uint32_t pattern_id,
+    uint32_t offset)
+{
+    if (sections_info.code_sections == nullptr) return;
+    constexpr uint32_t kStructSteps = 8;
+    fprintf(stderr,
+        "[variant-probe] pattern_id=0x%X offset=0x%X — variants whose "
+        "size covers offset, with structural parse N=%u:\n",
+        pattern_id, offset, kStructSteps);
+    uint32_t shown = 0;
+    uint32_t winners = 0;
+    size_t winner_section_idx = size_t(-1);
+    uint32_t winner_link = 0;
+    uint32_t winner_runtime = 0;
+    uint32_t winner_steps = 0;
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec =
+            sections_info.code_sections[ls.section_table_index];
+        if (sec.original_pattern_id != pattern_id) continue;
+        if (offset >= sec.size) continue;
+        const uint32_t base = uint32_t(ls.loaded_ram_addr);
+        const uint32_t paddr = (base + offset) & 0x1FFFFFFFu;
+        if (paddr + 16 > 8u * 1024u * 1024u) continue;
+        uint8_t bytes[16];
+        for (size_t i = 0; i < 16; i++) {
+            bytes[i] = rdram[(paddr + i) ^ 3];
+        }
+        const uint8_t cmd_byte = bytes[0];
+        const uint32_t parsed = walk_geo_commands(
+            rdram, base, sec.size, offset, kStructSteps);
+        const bool full_parse = (parsed >= kStructSteps);
+        const bool any_parse  = (parsed > 0);
+        const char* tag = full_parse ? "WINNER"
+                        : any_parse  ? "partial"
+                        :              "noise";
+        fprintf(stderr,
+            "  section_idx=%zu link=0x%08X runtime=0x%08X size=0x%X "
+            "hash=0x%016llX cmd=0x%02X parsed=%u/%u %s "
+            "bytes=%02X%02X%02X%02X %02X%02X%02X%02X "
+            "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+            sec.index, uint32_t(sec.ram_addr), base, sec.size,
+            (unsigned long long)sec.content_hash,
+            cmd_byte, parsed, kStructSteps, tag,
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]);
+        shown++;
+        if (full_parse) {
+            winners++;
+            winner_section_idx = sec.index;
+            winner_link = uint32_t(sec.ram_addr);
+            winner_runtime = base;
+            winner_steps = parsed;
+        }
+    }
+    if (winners == 1) {
+        fprintf(stderr,
+            "[variant-probe] CENSUS pattern=0x%X offset=0x%X winner=section_idx=%zu "
+            "link=0x%08X runtime=0x%08X parsed=%u/%u (single)\n",
+            pattern_id, offset, winner_section_idx,
+            winner_link, winner_runtime, winner_steps, kStructSteps);
+    } else if (winners == 0) {
+        fprintf(stderr,
+            "[variant-probe] CENSUS pattern=0x%X offset=0x%X NONE "
+            "(%u variants checked, none parsed full %u steps — "
+            "literal probably isn't geo data)\n",
+            pattern_id, offset, shown, kStructSteps);
+    } else {
+        fprintf(stderr,
+            "[variant-probe] CENSUS pattern=0x%X offset=0x%X AMBIGUOUS "
+            "(%u variants checked, %u parsed full %u steps)\n",
+            pattern_id, offset, shown, winners, kStructSteps);
+    }
+    fflush(stderr);
+}
+
+// Diagnostic-only iterator over registered variants of a pattern_id.
+// Used by Option-C probes that need to ask "of all currently-resident
+// variants of stadium_models, which one provides valid geo data at
+// the offset fragment62 wants?" Walks loaded_sections, filters to
+// sections whose original_pattern_id matches, and returns the i-th
+// match's runtime metadata. Returns 1 on success, 0 if no i-th
+// match exists.
+extern "C" int recomp_get_pattern_variant_info(
+    uint32_t pattern_id,
+    uint32_t idx,
+    uint32_t* out_runtime_base,
+    uint32_t* out_size,
+    uint32_t* out_synthetic_link,
+    uint32_t* out_section_index)
+{
+    if (sections_info.code_sections == nullptr) return 0;
+    uint32_t seen = 0;
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec =
+            sections_info.code_sections[ls.section_table_index];
+        if (sec.original_pattern_id != pattern_id) continue;
+        if (seen == idx) {
+            if (out_runtime_base) *out_runtime_base = uint32_t(ls.loaded_ram_addr);
+            if (out_size)         *out_size         = sec.size;
+            if (out_synthetic_link) *out_synthetic_link = uint32_t(sec.ram_addr);
+            if (out_section_index) *out_section_index = uint32_t(sec.index);
+            return 1;
+        }
+        seen++;
+    }
+    return 0;
+}
+
 extern "C" int32_t recomp_resolve_via_data_context(
     uint32_t link_vaddr, uint32_t data_ctx_addr)
 {

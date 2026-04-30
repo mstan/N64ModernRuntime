@@ -488,6 +488,51 @@ static uint64_t fnv1a_64(const uint8_t* data, size_t len) {
     return h;
 }
 
+// Synthetic-vram pool for per-variant pattern-fragment link identities.
+// Pattern variants that participate in Path 2 get a unique link-time
+// ram_addr from this range (assigned at build time in N64Recomp's
+// decompressed_section_pattern handler). The ram_addr's only purposes
+// are: (a) to make section_addresses[N] uniquely identify the variant
+// at runtime so RELOC_HI16/LO16 macros emit per-variant literals, and
+// (b) to look up the variant's runtime buffer in the parallel
+// recomp_synthetic_fragments[] table when the game asks
+// Memmap_GetFragmentVaddr to resolve a 0xCXXXXXXX literal.
+//
+// Pool placement: 0xC0000000-0xDFFFFFFF (KSEG2/KSEG3). KSEG0 (0x80)
+// and KSEG1 (0xA0) are both used by N64 hardware regions — RSP at
+// 0xA4000000, DP at 0xA4100000, etc. — so any sentinel that overlaps
+// them risks polluting registration of those engine sections. KSEG2
+// and KSEG3 are unused by N64 software, making them the safest
+// "obviously invalid in N64-land but valid recomp-side sentinel"
+// choice.
+//
+// Stride 0x100000 = 1 MB per variant — comfortably above the largest
+// observed variant size (~286 KB, Stadium's 0x473E0 stadium-models
+// fragment). Pool 0xC0000000..0xE0000000 = 512 MB / 512 buckets,
+// fitting Stadium's ~279 unique pattern variants with headroom for
+// future games.
+static constexpr uint32_t kSyntheticPoolBase  = 0xC0000000u;
+static constexpr uint32_t kSyntheticPoolEnd   = 0xE0000000u;
+static constexpr uint32_t kSyntheticPoolStride = 0x00100000u;
+static constexpr size_t   kSyntheticBucketCount =
+    (kSyntheticPoolEnd - kSyntheticPoolBase) / kSyntheticPoolStride; // 512
+
+struct SyntheticFragmentSlot {
+    uint32_t runtime_base;   // RDRAM addr where the variant currently lives
+    uint32_t size;           // variant size
+    size_t   section_index;  // index into sections_info.code_sections
+    bool     registered;
+};
+static SyntheticFragmentSlot recomp_synthetic_fragments[kSyntheticBucketCount] = {};
+
+static inline bool is_synthetic_addr(uint32_t addr) {
+    return addr >= kSyntheticPoolBase && addr < kSyntheticPoolEnd;
+}
+
+static inline size_t synthetic_bucket_idx(uint32_t addr) {
+    return size_t((addr - kSyntheticPoolBase) / kSyntheticPoolStride);
+}
+
 void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr) {
     if (sections_info.code_sections == nullptr) return;
     if (fragment_ptr == 0) return;
@@ -495,9 +540,25 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     // Find candidate sections sharing this link-time vram bucket. With
     // pattern-synthesized sections, multiple sections can share a bucket.
     // We collect them all and pick by content hash below.
+    //
+    // Per-variant synthetic-link-vram sections (ram_addr in the
+    // synthetic pool) are added as candidates ONLY when their stored
+    // original_pattern_id matches the game-supplied id. Without this
+    // filter, every synthetic candidate would be considered for every
+    // game-id registration, and a coincidental content-hash match
+    // (e.g. live fragment_ptr bytes happening to hash-equal a
+    // synthetic variant's hash) would misregister the wrong section
+    // for an unrelated game id. The original_pattern_id field is
+    // populated at build time from the pattern's canonical bucket.
     std::vector<size_t> candidates;
     for (size_t i = 0; i < sections_info.num_code_sections; i++) {
         const SectionTableEntry& sec = sections_info.code_sections[i];
+        if (is_synthetic_addr(uint32_t(sec.ram_addr))) {
+            if (sec.original_pattern_id == id && sec.content_hash != 0) {
+                candidates.push_back(i);
+            }
+            continue;
+        }
         uint32_t bucket = (sec.ram_addr & 0x0FF00000u) >> 0x14;
         if (bucket < 0x10) continue;
         uint32_t sec_id = bucket - 0x10;
@@ -730,6 +791,42 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     // resolve to the runtime base.
     if (section_addresses != nullptr) {
         section_addresses[section.index] = fragment_ptr;
+    }
+
+    // Per-variant synthetic-vram registration: if this section has a
+    // synthetic link identity (ram_addr in the synthetic pool), populate
+    // the parallel table so recomp_resolve_synthetic_fragment() can
+    // translate 0xA0XXXXXX literals back to the runtime buffer. This is
+    // separate from section_addresses[] above — section_addresses gets
+    // set to fragment_ptr (so post-register code emits real RDRAM
+    // literals directly), while the synthetic table is the lookup path
+    // for any literals that ESCAPE that (pre-register code paths, or
+    // any 0xA0XXXXXX baked literal that wasn't routed through
+    // section_addresses). Slot is keyed by synthetic bucket index.
+    if (is_synthetic_addr(uint32_t(section.ram_addr))) {
+        const size_t slot_idx = synthetic_bucket_idx(uint32_t(section.ram_addr));
+        if (slot_idx < kSyntheticBucketCount) {
+            recomp_synthetic_fragments[slot_idx] = SyntheticFragmentSlot{
+                /*runtime_base*/ uint32_t(fragment_ptr),
+                /*size*/         section.size,
+                /*section_index*/found_index,
+                /*registered*/   true,
+            };
+            fprintf(stderr,
+                "[synth-frag] registered slot %zu (link 0x%08X) → "
+                "runtime 0x%08X size 0x%X (section index %zu)\n",
+                slot_idx, uint32_t(section.ram_addr),
+                uint32_t(fragment_ptr), section.size, found_index);
+            fflush(stderr);
+        } else {
+            fprintf(stderr,
+                "[synth-frag] FATAL: section ram_addr 0x%08X yields slot "
+                "index %zu beyond table capacity %zu — synthetic pool "
+                "exhausted, can't register variant\n",
+                uint32_t(section.ram_addr), slot_idx, kSyntheticBucketCount);
+            fflush(stderr);
+            std::abort();
+        }
     }
 
     // Track in loaded_sections so unload paths (and the diagnostic dump)
@@ -1278,6 +1375,74 @@ extern "C" int32_t recomp_lookup_fragment_offset(uint32_t link_vaddr) {
 // Returns the resolved runtime address, or 0 if no variant whose
 // link-time bucket matches and whose size covers `offset` contains
 // `data_ctx_addr` (caller falls back to game's native answer).
+// Synthetic-fragment resolver. Translates a synthetic-pool address
+// (0xA0000000..0xC0000000) to its current runtime buffer + offset.
+//
+// Diagnostic policy: if the synthetic address is in-range but the
+// table slot is empty, this is a hard error — the variant's code
+// emitted a synthetic literal but the variant has not been registered
+// at runtime yet. Logs loudly and aborts deterministically. This
+// surfaces (a) ordering bugs where a variant's code runs before the
+// game decompresses + registers it, and (b) variants whose
+// content-hash failed to match at registration so the synthetic slot
+// never got populated. Both are bugs we want surfaced, not masked.
+//
+// Returns 0 if `addr` is not in the synthetic range. Otherwise either
+// returns the resolved RDRAM address (slot registered) or aborts
+// (slot empty).
+extern "C" int32_t recomp_resolve_synthetic_fragment(uint32_t addr) {
+    if (!is_synthetic_addr(addr)) return 0;
+
+    const size_t slot_idx = synthetic_bucket_idx(addr);
+    const uint32_t offset = addr & 0x000FFFFFu;
+
+    if (slot_idx >= kSyntheticBucketCount) {
+        fprintf(stderr,
+            "[synth-frag] FATAL: addr 0x%08X synthetic-bucket index %zu "
+            "exceeds table size %zu\n",
+            addr, slot_idx, kSyntheticBucketCount);
+        fflush(stderr);
+        std::abort();
+    }
+
+    const SyntheticFragmentSlot& slot = recomp_synthetic_fragments[slot_idx];
+
+    static volatile int s_n_logged = 0;
+    int log_idx = __atomic_fetch_add(&s_n_logged, 1, __ATOMIC_RELAXED);
+
+    if (!slot.registered) {
+        fprintf(stderr,
+            "[synth-frag] FATAL: addr 0x%08X (slot %zu, offset 0x%X) — "
+            "table slot is empty (variant not yet registered or content-"
+            "hash mismatch). Aborting deterministically per the no-stubs "
+            "policy: a synthetic literal escaping resolution means the "
+            "variant's code ran before its register or registration "
+            "failed silently.\n",
+            addr, slot_idx, offset);
+        fflush(stderr);
+        std::abort();
+    }
+
+    if (offset >= slot.size) {
+        fprintf(stderr,
+            "[synth-frag] FATAL: addr 0x%08X offset 0x%X >= variant "
+            "size 0x%X (slot %zu, runtime_base 0x%08X)\n",
+            addr, offset, slot.size, slot_idx, slot.runtime_base);
+        fflush(stderr);
+        std::abort();
+    }
+
+    const uint32_t resolved = slot.runtime_base + offset;
+    if (log_idx < 16) {
+        fprintf(stderr,
+            "[synth-frag] resolve in=0x%08X slot=%zu runtime_base=0x%08X "
+            "offset=0x%X → 0x%08X\n",
+            addr, slot_idx, slot.runtime_base, offset, resolved);
+        fflush(stderr);
+    }
+    return int32_t(resolved);
+}
+
 extern "C" int32_t recomp_resolve_via_data_context(
     uint32_t link_vaddr, uint32_t data_ctx_addr)
 {

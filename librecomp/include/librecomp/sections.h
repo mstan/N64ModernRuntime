@@ -50,6 +50,13 @@ typedef struct {
     // bytes of the decompressed body. Zero for ELF sections (which
     // get registered uniquely by ram_addr alone).
     uint64_t content_hash;
+    // Original game-side fragment id for pattern variants whose
+    // ram_addr was reassigned to a synthetic per-variant identity.
+    // Lets the runtime candidate filter know which game id should
+    // include this synthetic section as a candidate. 0xFFFFFFFF
+    // means "not a synthetic-link pattern variant" (the section is
+    // matched the normal way via ram_addr-derived id).
+    uint32_t original_pattern_id;
 } SectionTableEntry;
 
 typedef struct {

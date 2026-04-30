@@ -1255,6 +1255,54 @@ extern "C" int32_t recomp_lookup_fragment_offset(uint32_t link_vaddr) {
     return best_addr;
 }
 
+// Data-context-driven fragment-vaddr resolution.
+//
+// `link_vaddr` is a fragment-space address (e.g. 0x8FF0ABFC) the game
+// is asking to convert to a runtime address. `data_ctx_addr` is an
+// RDRAM pointer into whatever data the GAME is currently walking
+// (e.g. process_geo_layout's gGeoLayoutCommand) at the moment of
+// the call.
+//
+// Why this is the right resolution rule for pattern-fragment buckets:
+// in the original game, the geo walker only ever walks the variant
+// pointed to by gFragments[id]. Embedded 0x8FF0XXXX literals in that
+// variant's command stream are intended to refer back into the same
+// variant. The recompiler breaks this implicit invariant by keeping
+// multiple variants host-resident concurrently with the same id, so
+// gFragments[id] becomes ambiguous — but the data the walker is
+// CURRENTLY reading is unambiguous: data_ctx_addr lies in exactly
+// one variant's [loaded_ram_addr, +size) range. Using THAT variant
+// as the resolution context restores the original game's semantics
+// without any heuristics.
+//
+// Returns the resolved runtime address, or 0 if no variant whose
+// link-time bucket matches and whose size covers `offset` contains
+// `data_ctx_addr` (caller falls back to game's native answer).
+extern "C" int32_t recomp_resolve_via_data_context(
+    uint32_t link_vaddr, uint32_t data_ctx_addr)
+{
+    if (link_vaddr < 0x81000000u || link_vaddr >= 0x90000000u) return 0;
+    if (data_ctx_addr == 0) return 0;
+    const uint32_t bucket = link_vaddr & 0xFFF00000u;
+    const uint32_t offset = link_vaddr & 0x000FFFFFu;
+    if (sections_info.code_sections == nullptr) return 0;
+
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec =
+            sections_info.code_sections[ls.section_table_index];
+        const uint32_t base = (uint32_t)ls.loaded_ram_addr;
+        if (data_ctx_addr < base || data_ctx_addr >= base + sec.size) {
+            continue;
+        }
+        // Walker is inside this variant. Only useful if the variant
+        // covers the requested bucket+offset.
+        if (uint32_t(sec.ram_addr) != bucket) return 0;
+        if (offset >= sec.size) return 0;
+        return ls.loaded_ram_addr + int32_t(offset);
+    }
+    return 0;
+}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {

@@ -43,6 +43,10 @@ static std::unordered_map<uint32_t, uint16_t> code_sections_by_rom{};
 static std::unordered_map<uint32_t, uint16_t> patch_code_sections_by_rom{};
 static std::vector<LoadedSection> loaded_sections{};
 static std::unordered_map<int32_t, recomp_func_t*> func_map{};
+
+// Forward declarations — definitions live further down with the rest
+// of the host-PC index machinery.
+static void pc_index_register(recomp_func_t* func, size_t section_index);
 static std::unordered_map<std::string, recomp_func_t*> base_exports{};
 static std::unordered_map<std::string, recomp_func_ext_t*> ext_base_exports{};
 static std::unordered_map<std::string, size_t> base_events;
@@ -55,6 +59,20 @@ int32_t* section_addresses = nullptr;
 void recomp::overlays::register_overlays(const overlay_section_table_data_t& sections, const overlays_by_index_t& overlays) {
     sections_info = sections;
     overlays_info = overlays;
+
+    // Populate pc_index with EVERY recompiled function across every
+    // section, so caller-context resolution can map a host return PC
+    // back to the section that hosts it. Statically-loaded base
+    // sections never go through load_overlay/register_runtime_fragment,
+    // so we'd otherwise miss them entirely. Section_table_index is a
+    // valid identifier for static sections too — they just lack a
+    // load_order entry, but pc_index_lookup doesn't need that.
+    for (size_t si = 0; si < sections.num_code_sections; si++) {
+        const SectionTableEntry& sec = sections.code_sections[si];
+        for (size_t fi = 0; fi < sec.num_funcs; fi++) {
+            pc_index_register(sec.funcs[fi].func, si);
+        }
+    }
 }
 
 void recomp::overlays::register_patches(const char* patch, std::size_t size, SectionTableEntry* sections, size_t num_sections) {
@@ -156,6 +174,78 @@ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
     func_map[ram] = func;
 }
 
+// ── Host-PC → section_table_index index ──────────────────────────────
+//
+// Lets a host-side stack walker map a return PC inside a recompiled
+// MIPS function back to the section that hosts that function. Used
+// by recomp_resolve_fragment_via_caller_pc to disambiguate which
+// pattern variant a Memmap_GetFragmentVaddr call is coming from
+// when the same fragment id has multiple registered variants.
+//
+// Stored as a flat sorted vector of (host_pc, section_index) so we
+// can binary-search by PC. Rebuilt lazily on next lookup after any
+// new registration; sort cost amortizes over the steady-state where
+// registrations are rare relative to lookups.
+struct PcRange {
+    uintptr_t host_pc;
+    size_t    section_index;
+};
+static std::vector<PcRange> pc_to_section_sorted{};
+static bool pc_index_dirty = false;
+
+static void pc_index_register(recomp_func_t* func, size_t section_index) {
+    if (func == nullptr) return;
+    pc_to_section_sorted.push_back({(uintptr_t)func, section_index});
+    pc_index_dirty = true;
+}
+
+static void pc_index_rebuild_if_dirty() {
+    if (!pc_index_dirty) return;
+    std::sort(pc_to_section_sorted.begin(), pc_to_section_sorted.end(),
+        [](const PcRange& a, const PcRange& b) { return a.host_pc < b.host_pc; });
+    pc_index_dirty = false;
+}
+
+// Given a host return PC, find the section it lives in. Returns
+// section_table_index or size_t(-1) if no fragment function contains
+// this PC. Uses upper_bound to find the largest function start ≤ pc;
+// since we don't track function size, we accept any function within
+// a heuristic 64 KiB window (recompiled MIPS functions are well
+// below this — typical max is a few KiB of host code per MIPS func).
+static size_t pc_index_lookup(uintptr_t pc) {
+    pc_index_rebuild_if_dirty();
+    if (pc_to_section_sorted.empty()) return size_t(-1);
+    auto it = std::upper_bound(pc_to_section_sorted.begin(),
+                               pc_to_section_sorted.end(), pc,
+        [](uintptr_t lhs, const PcRange& rhs) { return lhs < rhs.host_pc; });
+    if (it == pc_to_section_sorted.begin()) return size_t(-1);
+    --it;
+    if (pc - it->host_pc > 0x10000) return size_t(-1);
+    return it->section_index;
+}
+
+// Per-section load-order timestamps. Incremented on each successful
+// register_runtime_fragment / load_overlay. Used so that when a
+// non-bucket caller (e.g. fragment62 at 0x84300000) asks for a
+// 0x8FF00000 fragment-vaddr, we can pick the bucket variant that
+// was most recently registered BEFORE the caller — i.e., the
+// variant that was "live" at the caller's load time and whose
+// data layout the caller's R_MIPS_32 relocs were resolved against.
+static std::vector<uint64_t> section_load_order{};
+static uint64_t next_load_order = 1;
+
+static void record_load_order(size_t section_index) {
+    if (section_load_order.size() <= section_index) {
+        section_load_order.resize(section_index + 1, 0);
+    }
+    section_load_order[section_index] = next_load_order++;
+}
+
+static uint64_t get_load_order(size_t section_index) {
+    if (section_index >= section_load_order.size()) return 0;
+    return section_load_order[section_index];
+}
+
 void load_overlay(size_t section_table_index, int32_t ram) {
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
 
@@ -172,10 +262,12 @@ void load_overlay(size_t section_table_index, int32_t ram) {
         if (section.ram_addr != ram) {
             func_map[section.ram_addr + func.offset] = func.func;
         }
+        pc_index_register(func.func, section_table_index);
     }
 
     loaded_sections.emplace_back(ram, section_table_index);
     section_addresses[section.index] = ram;
+    record_load_order(section_table_index);
 }
 
 // ── Fragment trampoline registration ─────────────────────────────────
@@ -629,6 +721,9 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         if ((int32_t)section.ram_addr != fragment_ptr) {
             func_map[(int32_t)section.ram_addr + (int32_t)fe.offset] = fe.func;
         }
+        // Track host PC → section_index so caller-context disambiguation
+        // can map a return PC back to the variant that hosts it.
+        pc_index_register(fe.func, found_index);
     }
 
     // Update section_addresses so reloc-driven RELOC_HI16/LO16 macros
@@ -647,6 +742,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     } else {
         find_existing->loaded_ram_addr = fragment_ptr;
     }
+    record_load_order(found_index);
 
     // Run the textbin trampoline scanner on the fragment, same as the
     // DMA path. Resolves +0x00 J-slot dispatch and any in-header
@@ -1030,6 +1126,67 @@ static void unhandled_lookup_trampoline(uint8_t* /*rdram*/, recomp_context* /*ct
 // game.toml.
 extern "C" void recomp_register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr) {
     recomp::overlays::register_runtime_fragment(rdram, id, fragment_ptr);
+}
+
+// Given a fragment-space link vaddr AND the host PC of the caller,
+// resolve the link vaddr against an appropriate variant. Strategy:
+//
+//   1. If the caller's section is itself a variant in this bucket
+//      AND covers the offset → resolve against caller. Best case;
+//      "the variant the calling code lives in."
+//
+//   2. Otherwise, find the bucket variant most recently registered
+//      BEFORE the caller's section. Idea: that's the variant that
+//      was "live" when the caller was loaded, and the caller's
+//      embedded fragment-vaddr literals were resolved against it
+//      at fragment relocation time.
+//
+//   3. If neither finds a variant whose size covers the offset,
+//      return 0 (let the game's native resolution stand).
+//
+// Returns the resolved runtime address, or 0 if no variant found.
+extern "C" int32_t recomp_resolve_fragment_via_caller_pc(
+    uint32_t link_vaddr, uintptr_t caller_pc)
+{
+    if (link_vaddr < 0x81000000u || link_vaddr >= 0x90000000u) return 0;
+    const uint32_t bucket = link_vaddr & 0xFFF00000u;
+    const uint32_t offset = link_vaddr & 0x000FFFFFu;
+    if (sections_info.code_sections == nullptr) return 0;
+
+    const size_t caller_idx = pc_index_lookup(caller_pc);
+    if (caller_idx == size_t(-1)) return 0;
+    const SectionTableEntry& caller_sec =
+        sections_info.code_sections[caller_idx];
+
+    // Strategy 1: caller is a variant of this bucket.
+    if (uint32_t(caller_sec.ram_addr) == bucket && offset < caller_sec.size) {
+        for (const auto& ls : loaded_sections) {
+            if (ls.section_table_index == caller_idx) {
+                return ls.loaded_ram_addr + int32_t(offset);
+            }
+        }
+    }
+
+    // Strategy 2: caller is NOT a bucket variant. Find the bucket
+    // variant most-recently registered BEFORE the caller, whose
+    // size covers the offset.
+    const uint64_t caller_order = get_load_order(caller_idx);
+    if (caller_order == 0) return 0;
+    int32_t  best_addr = 0;
+    uint64_t best_order = 0;
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec =
+            sections_info.code_sections[ls.section_table_index];
+        if (uint32_t(sec.ram_addr) != bucket) continue;
+        if (offset >= sec.size) continue;
+        const uint64_t order = get_load_order(ls.section_table_index);
+        if (order == 0 || order >= caller_order) continue;
+        if (order > best_order) {
+            best_order = order;
+            best_addr  = ls.loaded_ram_addr + int32_t(offset);
+        }
+    }
+    return best_addr;
 }
 
 // Offset-aware fragment-vaddr lookup. Given a fragment-space link

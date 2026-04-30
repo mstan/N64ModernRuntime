@@ -5,6 +5,12 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+
 #include "ultramodern/ultramodern.hpp"
 
 #include "recomp.h"
@@ -946,8 +952,74 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
 // Per project principles: not a stub. The trampoline doesn't simulate
 // behavior — it surfaces "execution reached unimplemented code" with
 // full address context. Surfaces are richer than std::exit().
+// Set by get_function on a lookup miss; consumed by the trampoline
+// when the bogus pointer is actually invoked.
+static int32_t g_last_lookup_miss_addr = 0;
+
+// Trace-ring queries (defined in extras.c — game-side instrumentation).
+extern "C" {
+    uint64_t pkmnstadium_trace_write_idx(void);
+    const char* pkmnstadium_trace_at(uint64_t idx);
+    uint32_t pkmnstadium_trace_capacity(void);
+}
+
 static void unhandled_lookup_trampoline(uint8_t* /*rdram*/, recomp_context* /*ctx*/) {
-    fprintf(stderr, "[recomp] lookup-miss trampoline reached — aborting\n");
+    fprintf(stderr,
+        "[recomp] lookup-miss trampoline reached — aborting\n"
+        "  bad function pointer: 0x%08X\n",
+        g_last_lookup_miss_addr);
+    FILE* f = fopen("F:/Projects/PokemonStadiumRecomp/build/last_error.log", "a");
+    if (f) {
+        fprintf(f,
+            "\n=== lookup-miss trampoline reached (post-call) ===\n"
+            "  bad function pointer: 0x%08X\n",
+            g_last_lookup_miss_addr);
+#ifdef _WIN32
+        // Host stack backtrace — the immediate caller of the trampoline
+        // is the recompiled function that invoked the bad pointer.
+        // Symbol resolution gives source-file + line of that caller, so
+        // we can identify which recompiled MIPS instruction was the
+        // indirect call site.
+        HANDLE proc = GetCurrentProcess();
+        SymInitialize(proc, NULL, TRUE);
+        void* frames[24];
+        USHORT n = CaptureStackBackTrace(0, 24, frames, NULL);
+        char symbuf[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO* sym = (SYMBOL_INFO*)symbuf;
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        IMAGEHLP_LINE64 line{}; line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+        fprintf(f, "  host backtrace (caller of trampoline = bad-call site):\n");
+        for (USHORT i = 0; i < n; i++) {
+            DWORD64 disp64 = 0;
+            DWORD disp32 = 0;
+            const char* name = "?";
+            if (SymFromAddr(proc, (DWORD64)frames[i], &disp64, sym)) name = sym->Name;
+            const char* file = "?"; DWORD lineno = 0;
+            if (SymGetLineFromAddr64(proc, (DWORD64)frames[i], &disp32, &line)) {
+                file = line.FileName; lineno = line.LineNumber;
+            }
+            fprintf(f, "    #%02u 0x%016llX %s (%s:%lu)\n",
+                i, (unsigned long long)(uintptr_t)frames[i], name, file, lineno);
+        }
+#endif
+        // Dump last 64 trace ring entries so we can see who called
+        // into the bogus function pointer.
+        uint64_t cap  = (uint64_t)pkmnstadium_trace_capacity();
+        uint64_t widx = pkmnstadium_trace_write_idx();
+        fprintf(f, "  trace ring (write_idx=%llu, capacity=%llu):\n",
+            (unsigned long long)widx, (unsigned long long)cap);
+        if (cap > 0) {
+            uint64_t n = (widx < 64) ? widx : 64;
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t slot = (widx - n + i) % cap;
+                const char* name = pkmnstadium_trace_at(slot);
+                fprintf(f, "    %4llu: %s\n",
+                    (unsigned long long)slot, name ? name : "(null)");
+            }
+        }
+        fclose(f);
+    }
     std::abort();
 }
 
@@ -970,6 +1042,9 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         }
         fprintf(stderr, "[Warn] get_function lookup miss: 0x%08X — returning trampoline\n", addr);
         fflush(stderr);
+        // Stash for the trampoline so post-call diagnostics print
+        // *which* address was missing, not just "something bad happened".
+        g_last_lookup_miss_addr = addr;
         return unhandled_lookup_trampoline;
     }
     return func_find->second;

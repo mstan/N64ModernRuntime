@@ -1145,6 +1145,22 @@ extern "C" void recomp_register_runtime_fragment(uint8_t* rdram, uint32_t id, in
 //      return 0 (let the game's native resolution stand).
 //
 // Returns the resolved runtime address, or 0 if no variant found.
+// Test whether `addr` lies inside ANY currently-loaded variant of the
+// given link-time bucket (= section.ram_addr & 0xFFF00000 high bits).
+// Returns 1 if some loaded section L has L.ram_addr == bucket and
+// addr ∈ [L.loaded_ram_addr, L.loaded_ram_addr + L.size); 0 otherwise.
+extern "C" int recomp_addr_in_loaded_variant(uint32_t bucket, uint32_t addr) {
+    if (sections_info.code_sections == nullptr) return 0;
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec =
+            sections_info.code_sections[ls.section_table_index];
+        if (uint32_t(sec.ram_addr) != bucket) continue;
+        uint32_t base = (uint32_t)ls.loaded_ram_addr;
+        if (addr >= base && addr < base + sec.size) return 1;
+    }
+    return 0;
+}
+
 extern "C" int32_t recomp_resolve_fragment_via_caller_pc(
     uint32_t link_vaddr, uintptr_t caller_pc)
 {

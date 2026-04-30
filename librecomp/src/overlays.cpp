@@ -1032,6 +1032,56 @@ extern "C" void recomp_register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     recomp::overlays::register_runtime_fragment(rdram, id, fragment_ptr);
 }
 
+// Offset-aware fragment-vaddr lookup. Given a fragment-space link
+// vaddr (e.g. 0x8FF0ABFC), find the loaded variant whose link-time
+// ram_addr matches the high bits AND whose size covers the offset.
+// Returns the runtime address (loaded_ram_addr + offset) if a match
+// is found; returns 0 if no variant covers this offset.
+//
+// Why this exists: when multiple decompressed_section_pattern
+// variants share a single link-time vram bucket (e.g. all stadium-
+// models pattern fragments at 0x8FF00000), the game's gFragments
+// table holds a single pointer per id — so it's clobbered on every
+// new registration. A consumer asking for offset 0xABFC of fragment
+// 0xEF gets resolved against whichever variant happened to be
+// registered last, ignoring whether that variant actually contains
+// data at offset 0xABFC. This function lets game-side hooks do the
+// "find a variant whose [base, base+size) actually contains the
+// requested offset" walk that the game's single-pointer dispatch
+// can't.
+//
+// Tiebreak: prefer the SMALLEST variant whose size strictly contains
+// the requested offset. Empirical observation in Pokemon Stadium:
+// pattern-fragment variants registered for vram 0x8FF00000 each
+// correspond to a specific stadium-models sub-asset, and consumers
+// (e.g. fragment62's process_geo_layout calls) target the smallest
+// variant that covers their offset. Larger variants are stale
+// leftovers from previous loads that haven't been evicted.
+//
+// If multiple variants tie on size (rare), pick the most recently
+// registered (back-to-front in loaded_sections).
+extern "C" int32_t recomp_lookup_fragment_offset(uint32_t link_vaddr) {
+    if (link_vaddr < 0x81000000u || link_vaddr >= 0x90000000u) return 0;
+    const uint32_t bucket = link_vaddr & 0xFFF00000u;
+    const uint32_t offset = link_vaddr & 0x000FFFFFu;
+    if (sections_info.code_sections == nullptr) return 0;
+
+    int32_t best_addr = 0;
+    uint32_t best_size = ~0u;
+    for (auto it = loaded_sections.rbegin();
+         it != loaded_sections.rend(); ++it) {
+        const SectionTableEntry& sec =
+            sections_info.code_sections[it->section_table_index];
+        if (uint32_t(sec.ram_addr) != bucket) continue;
+        if (offset >= sec.size) continue;
+        if (sec.size < best_size) {
+            best_size = sec.size;
+            best_addr = it->loaded_ram_addr + int32_t(offset);
+        }
+    }
+    return best_addr;
+}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {

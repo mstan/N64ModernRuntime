@@ -555,15 +555,30 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
     return events_context.vi.get_cur_state()->framebuffer;
 }
 
+// Counters: total submit_rsp_task calls by task type. Surfaced via
+// status command so a frozen game can be characterized as
+// "gfx tasks not being submitted by game thread" vs "submitted but
+// stuck somewhere downstream of action_queue".
+static std::atomic<uint64_t> g_submit_gfx{0};
+static std::atomic<uint64_t> g_submit_audio{0};
+static std::atomic<uint64_t> g_submit_other{0};
+
+extern "C" uint64_t ultramodern_submit_gfx_count(void) { return g_submit_gfx.load(); }
+extern "C" uint64_t ultramodern_submit_audio_count(void) { return g_submit_audio.load(); }
+extern "C" uint64_t ultramodern_submit_other_count(void) { return g_submit_other.load(); }
+
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
     // Send gfx tasks to the graphics action queue
     if (task->t.type == M_GFXTASK) {
+        g_submit_gfx.fetch_add(1, std::memory_order_relaxed);
         events_context.action_queue.enqueue(SpTaskAction{ *task });
     }
     // Set all other tasks as the RSP task
     else {
+        if (task->t.type == M_AUDTASK) g_submit_audio.fetch_add(1, std::memory_order_relaxed);
+        else g_submit_other.fetch_add(1, std::memory_order_relaxed);
         events_context.sp_task_queue.enqueue(task);
     }
 }

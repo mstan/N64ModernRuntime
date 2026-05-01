@@ -1,9 +1,100 @@
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <thread>
 
 #include "blockingconcurrentqueue.h"
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
+
+// ── Queue-event ring buffer ───────────────────────────────────────────
+//
+// Always-on ring of recent osSendMesg/osRecvMesg/external-enqueue
+// events. Used to diagnose softlocks where the game thread blocks on
+// a queue and we need to know exactly what was sent/received around
+// the freeze. Probes query the ring post-fact via the runner's
+// debug_server (`mesg_recent` cmd) — never arm/capture/dump.
+namespace mesg_log {
+    enum Op : uint8_t {
+        OP_SEND_GAME       = 1,  // osSendMesg from game thread
+        OP_SEND_EXTERNAL   = 2,  // osSendMesg from non-game thread (queued externally)
+        OP_RECV_ENTER      = 3,  // osRecvMesg called
+        OP_RECV_BLOCK      = 4,  // osRecvMesg blocked (queue empty + OS_MESG_BLOCK)
+        OP_RECV_RETURN_OK  = 5,  // osRecvMesg returned with a message
+        OP_EXT_DEQ_OK      = 6,  // dequeue_external_messages drained one
+        OP_EXT_DEQ_FULL    = 7,  // dequeue tried to send but target full → re-queued
+        OP_DO_SEND_BLOCK   = 8,  // do_send blocked sender on queue-full
+    };
+
+    struct Event {
+        uint64_t seq;
+        uint64_t ms;
+        uint32_t mq;          // OSMesgQueue pointer (gpr-style)
+        uint32_t msg;         // message value (often pointer)
+        uint16_t valid_before;
+        uint16_t valid_after;
+        uint8_t  op;
+        uint8_t  block;       // 1 = OS_MESG_BLOCK, 0 = OS_MESG_NOBLOCK
+        uint8_t  game_thread; // 1 = sender/receiver was game thread
+        uint8_t  pad;
+    };
+
+    constexpr size_t RING_CAP = 1024;
+    static Event ring[RING_CAP];
+    static std::atomic<uint64_t> next_seq{0};
+    static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+
+    static inline uint64_t now_ms() {
+        return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+    }
+
+    inline void record(uint8_t op, uint32_t mq, uint32_t msg,
+                       uint16_t vb, uint16_t va,
+                       bool block, bool game_thread) {
+        const uint64_t s = next_seq.fetch_add(1, std::memory_order_relaxed);
+        Event& e = ring[s % RING_CAP];
+        e.seq = s;
+        e.ms = now_ms();
+        e.mq = mq;
+        e.msg = msg;
+        e.valid_before = vb;
+        e.valid_after = va;
+        e.op = op;
+        e.block = block ? 1 : 0;
+        e.game_thread = game_thread ? 1 : 0;
+        e.pad = 0;
+    }
+}
+
+// Public dump: copies up to `cap` most-recent events (chronological)
+// into `out`. Returns count written via `*n_written` and the global
+// write_idx via `*next_seq_out`.
+extern "C" void ultramodern_mesg_recent_copy(
+    void* out_void, size_t cap, size_t* n_written, uint64_t* next_seq_out)
+{
+    using namespace mesg_log;
+    const uint64_t s = next_seq.load(std::memory_order_relaxed);
+    if (next_seq_out) *next_seq_out = s;
+    if (cap == 0 || out_void == nullptr) {
+        if (n_written) *n_written = 0;
+        return;
+    }
+    const size_t available = std::min<size_t>(s, RING_CAP);
+    const size_t want = std::min(cap, available);
+    Event* out = static_cast<Event*>(out_void);
+    // Copy oldest first: starting index = (s - want) % RING_CAP.
+    const size_t start = (s - want) % RING_CAP;
+    for (size_t i = 0; i < want; i++) {
+        out[i] = ring[(start + i) % RING_CAP];
+    }
+    if (n_written) *n_written = want;
+}
+
+extern "C" size_t ultramodern_mesg_event_size(void) {
+    return sizeof(mesg_log::Event);
+}
 
 struct QueuedMessage {
     PTR(OSMesgQueue) mq;
@@ -15,6 +106,9 @@ static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
 
 void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
     external_messages.enqueue({mq, msg, jam});
+    mesg_log::record(mesg_log::OP_SEND_EXTERNAL,
+                     uint32_t(mq), uint32_t(uintptr_t(msg)),
+                     0, 0, false, false);
 }
 
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
@@ -28,9 +122,15 @@ static std::atomic<uint64_t> g_external_requeues{0};
 void dequeue_external_messages(RDRAM_ARG1) {
     QueuedMessage to_send;
     while (external_messages.try_dequeue(to_send)) {
+        OSMesgQueue* mq_pre = TO_PTR(OSMesgQueue, to_send.mq);
+        const uint16_t vb = uint16_t(mq_pre ? mq_pre->validCount : 0);
         // Try non-blocking send first.
         bool ok = do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
         if (!ok) {
+            mesg_log::record(mesg_log::OP_EXT_DEQ_FULL,
+                             uint32_t(to_send.mq),
+                             uint32_t(uintptr_t(to_send.mesg)),
+                             vb, vb, false, true);
             // Target OSMesgQueue is full. The original code silently
             // dropped the message here — see git blame on this line.
             // That is wrong: callers (sp_complete / dp_complete /
@@ -64,6 +164,13 @@ void dequeue_external_messages(RDRAM_ARG1) {
             external_messages.enqueue(to_send);
             g_external_requeues.fetch_add(1, std::memory_order_relaxed);
             break;
+        } else {
+            OSMesgQueue* mq_post = TO_PTR(OSMesgQueue, to_send.mq);
+            const uint16_t va = uint16_t(mq_post ? mq_post->validCount : 0);
+            mesg_log::record(mesg_log::OP_EXT_DEQ_OK,
+                             uint32_t(to_send.mq),
+                             uint32_t(uintptr_t(to_send.mesg)),
+                             vb, va, false, true);
         }
     }
 }
@@ -119,6 +226,10 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
     else {
         // Otherwise, yield this thread until the queue has room.
         while (MQ_IS_FULL(mq)) {
+            mesg_log::record(mesg_log::OP_DO_SEND_BLOCK,
+                             uint32_t(mq_), uint32_t(uintptr_t(msg)),
+                             uint16_t(mq->validCount), uint16_t(mq->validCount),
+                             true, true);
             debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
@@ -157,6 +268,10 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     } else {
         // Otherwise, yield this thread in a loop until the queue is no longer full
         while (MQ_IS_EMPTY(mq)) {
+            mesg_log::record(mesg_log::OP_RECV_BLOCK,
+                             uint32_t(mq_), 0,
+                             uint16_t(mq->validCount), uint16_t(mq->validCount),
+                             true, true);
             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
@@ -182,19 +297,24 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
 extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     bool jam = false;
-    
+
     // Don't directly send to the message queue if this isn't a game thread to avoid contention.
     if (!ultramodern::is_game_thread()) {
         enqueue_external_message(mq_, msg, jam);
         return 0;
     }
-    
+
     // Handle any messages that have been received from an external thread.
     dequeue_external_messages(PASS_RDRAM1);
 
+    const uint16_t vb = uint16_t(mq ? mq->validCount : 0);
     // Try to send the message.
     bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
-    
+    const uint16_t va = uint16_t(mq ? mq->validCount : 0);
+    mesg_log::record(mesg_log::OP_SEND_GAME,
+                     uint32_t(mq_), uint32_t(uintptr_t(msg)),
+                     vb, va, flags == OS_MESG_BLOCK, true);
+
     // Check the queue to see if this thread should swap execution to another.
     ultramodern::check_running_queue(PASS_RDRAM1);
 
@@ -225,15 +345,30 @@ extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) 
 
 extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 flags) {
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
-    
+
     assert(ultramodern::is_game_thread() && "RecvMesg not allowed outside of game threads.");
-    
+
+    const uint16_t vb_enter = uint16_t(mq ? mq->validCount : 0);
+    mesg_log::record(mesg_log::OP_RECV_ENTER,
+                     uint32_t(mq_), 0, vb_enter, vb_enter,
+                     flags == OS_MESG_BLOCK, true);
+
     // Handle any messages that have been received from an external thread.
     dequeue_external_messages(PASS_RDRAM1);
 
     // Try to receive a message.
     bool received = do_recv(PASS_RDRAM mq_, msg_, flags == OS_MESG_BLOCK);
-    
+    const uint16_t va = uint16_t(mq ? mq->validCount : 0);
+    if (received) {
+        uint32_t got = 0;
+        if (msg_ != NULLPTR) {
+            got = uint32_t(uintptr_t(*TO_PTR(OSMesg, msg_)));
+        }
+        mesg_log::record(mesg_log::OP_RECV_RETURN_OK,
+                         uint32_t(mq_), got, vb_enter, va,
+                         flags == OS_MESG_BLOCK, true);
+    }
+
     // Check the queue to see if this thread should swap execution to another.
     ultramodern::check_running_queue(PASS_RDRAM1);
 

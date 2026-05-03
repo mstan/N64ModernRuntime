@@ -259,16 +259,28 @@ void vi_thread_func() {
     }
 }
 
+// Counters at the renderer-thread side, paired with the submit_gfx
+// counter at the recomp side. Stadium gates its gfx slot state
+// machine on RDP-complete (unk_1E -> 2). If dp_complete_count <
+// submit_gfx_count after a freeze, the renderer never finished a
+// queued gfx task — i.e., RT64 stalled inside processDisplayLists.
+static std::atomic<uint64_t> g_sp_complete_count{0};
+static std::atomic<uint64_t> g_dp_complete_count{0};
+extern "C" uint64_t ultramodern_sp_complete_count(void) { return g_sp_complete_count.load(); }
+extern "C" uint64_t ultramodern_dp_complete_count(void) { return g_dp_complete_count.load(); }
+
 void sp_complete() {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
     osSendMesg(PASS_RDRAM events_context.sp.mq, events_context.sp.msg, OS_MESG_NOBLOCK);
+    g_sp_complete_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void dp_complete() {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
     osSendMesg(PASS_RDRAM events_context.dp.mq, events_context.dp.msg, OS_MESG_NOBLOCK);
+    g_dp_complete_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
@@ -566,6 +578,8 @@ static std::atomic<uint64_t> g_submit_other{0};
 extern "C" uint64_t ultramodern_submit_gfx_count(void) { return g_submit_gfx.load(); }
 extern "C" uint64_t ultramodern_submit_audio_count(void) { return g_submit_audio.load(); }
 extern "C" uint64_t ultramodern_submit_other_count(void) { return g_submit_other.load(); }
+extern "C" uint64_t ultramodern_sp_complete_count(void);
+extern "C" uint64_t ultramodern_dp_complete_count(void);
 
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);

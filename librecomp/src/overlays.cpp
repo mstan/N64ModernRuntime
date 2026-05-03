@@ -374,6 +374,22 @@ static bool try_install_trampoline(int32_t trampoline_runtime_addr, uint32_t lin
             int32_t link_time_vram = (int32_t)sec.ram_addr + off;
             if (link_time_vram != trampoline_runtime_addr) {
                 func_map[link_time_vram] = it->second;
+                // Diagnostic — narrate every link-time alias install
+                // when the env var probe is targeting this address.
+                static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
+                if (probe_s) {
+                    uint32_t probe_a = (uint32_t)std::strtoul(probe_s, nullptr, 0);
+                    if ((uint32_t)link_time_vram == probe_a) {
+                        fprintf(stderr,
+                            "[probe] try_install_trampoline INSTALLED func_map[0x%08X] "
+                            "(runtime=0x%08X) from section %zu (link=0x%08X)\n",
+                            (uint32_t)link_time_vram,
+                            (uint32_t)trampoline_runtime_addr,
+                            ls.section_table_index,
+                            (uint32_t)sec.ram_addr);
+                        fflush(stderr);
+                    }
+                }
             }
             break;
         }
@@ -394,17 +410,60 @@ static void retry_pending_trampolines() {
     }
 }
 
+// Diagnostic probe — logs whether func_map[probe_addr] is currently
+// populated. Used to track when a specific link-time alias is set or
+// cleared across the load/eviction lifecycle of multiple fragments.
+// Driven by environment variable PSR_FUNC_MAP_PROBE (set to a hex
+// vaddr like "0x81000030"). Disabled when the env var is unset.
+static void probe_func_map_entry(const char* phase) {
+    static int initialized = 0;
+    static uint32_t probe_addr = 0;
+    if (!initialized) {
+        initialized = 1;
+        const char* s = std::getenv("PSR_FUNC_MAP_PROBE");
+        if (s) {
+            probe_addr = (uint32_t)std::strtoul(s, nullptr, 0);
+        }
+    }
+    if (probe_addr == 0) return;
+    auto it = func_map.find((int32_t)probe_addr);
+    fprintf(stderr,
+        "[probe] func_map[0x%08X] %s after %s (size=%zu)\n",
+        probe_addr,
+        (it == func_map.end()) ? "MISSING" : "PRESENT",
+        phase,
+        func_map.size());
+    fflush(stderr);
+}
+
 // Scan one fragment-shaped section's trampoline range. `runtime_base`
 // is the section's loaded_ram_addr (where it lives in RAM right now).
 static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_index, int32_t runtime_base) {
     const SectionTableEntry& section = sections_info.code_sections[section_index];
 
+    static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
+    uint32_t probe_a = probe_s ? (uint32_t)std::strtoul(probe_s, nullptr, 0) : 0;
+    bool probe_this = (probe_a != 0) &&
+        (probe_a >= (uint32_t)section.ram_addr) &&
+        (probe_a < (uint32_t)section.ram_addr + section.size);
+
     // Heuristic: only treat as a fragment if the "FRAGMENT" magic is
     // at runtime_base+8. Cheap and avoids false positives for
     // non-fragment sections (boot, the resident kernel, audio data,
     // patches).
-    if (read_rdram_u32_be(rdram, runtime_base + 8)  != 0x46524147) return; // "FRAG"
-    if (read_rdram_u32_be(rdram, runtime_base + 12) != 0x4D454E54) return; // "MENT"
+    uint32_t mag_a = read_rdram_u32_be(rdram, runtime_base + 8);
+    uint32_t mag_b = read_rdram_u32_be(rdram, runtime_base + 12);
+    if (mag_a != 0x46524147 || mag_b != 0x4D454E54) {
+        if (probe_this) {
+            fprintf(stderr,
+                "[probe] scan SKIPPED section %zu (link=0x%08X runtime=0x%08X) — "
+                "magic at runtime+8 = 0x%08X 0x%08X (expected 0x46524147 0x4D454E54)\n",
+                section_index, (uint32_t)section.ram_addr, (uint32_t)runtime_base,
+                mag_a, mag_b);
+            fflush(stderr);
+        }
+        return;
+    }
 
     // The trampoline range is [0x20, first_real_func_offset). The
     // section's func table excludes the textbin region — look for the
@@ -422,14 +481,45 @@ static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_ind
     for (uint32_t slot_off = 0x20; slot_off + 8 <= first_func_offset; slot_off += 8) {
         uint32_t instr = read_rdram_u32_be(rdram, runtime_base + (int32_t)slot_off);
         uint32_t delay = read_rdram_u32_be(rdram, runtime_base + (int32_t)slot_off + 4);
-        if (delay != 0) continue;
+        bool probe_slot = probe_this &&
+            (uint32_t)(section.ram_addr + slot_off) == probe_a;
+        if (delay != 0) {
+            if (probe_slot) {
+                fprintf(stderr,
+                    "[probe] scan slot 0x%X SKIPPED — delay=0x%08X (expected 0)\n",
+                    slot_off, delay);
+                fflush(stderr);
+            }
+            continue;
+        }
 
         uint32_t pc_delay = section.ram_addr + slot_off + 4;
         uint32_t target = decode_jal_target(instr, pc_delay);
-        if (target == 0) continue;
+        if (target == 0) {
+            if (probe_slot) {
+                fprintf(stderr,
+                    "[probe] scan slot 0x%X SKIPPED — instr=0x%08X is not J/JAL\n",
+                    slot_off, instr);
+                fflush(stderr);
+            }
+            continue;
+        }
 
         int32_t tramp_addr = runtime_base + (int32_t)slot_off;
-        if (!try_install_trampoline(tramp_addr, target)) {
+        if (probe_slot) {
+            fprintf(stderr,
+                "[probe] scan slot 0x%X: instr=0x%08X target=0x%08X tramp_runtime=0x%08X\n",
+                slot_off, instr, target, (uint32_t)tramp_addr);
+            fflush(stderr);
+        }
+        bool installed = try_install_trampoline(tramp_addr, target);
+        if (probe_slot) {
+            fprintf(stderr,
+                "[probe] scan slot 0x%X try_install_trampoline returned %s\n",
+                slot_off, installed ? "true (installed)" : "false (added to pending)");
+            fflush(stderr);
+        }
+        if (!installed) {
             pending_trampolines.push_back({tramp_addr, target});
         }
     }
@@ -741,8 +831,23 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
             // entries would shadow the new variant if it doesn't
             // have a func at the same offset.
             if ((int32_t)old_section.ram_addr != fragment_ptr) {
-                func_map.erase(
-                    (int32_t)old_section.ram_addr + (int32_t)fe.offset);
+                int32_t link_alias = (int32_t)old_section.ram_addr + (int32_t)fe.offset;
+                static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
+                if (probe_s) {
+                    uint32_t probe_a = (uint32_t)std::strtoul(probe_s, nullptr, 0);
+                    if ((uint32_t)link_alias == probe_a) {
+                        fprintf(stderr,
+                            "[probe] EVICT erasing func_map[0x%08X] "
+                            "(old_section=%zu link=0x%08X runtime=0x%08X fe.offset=0x%X)\n",
+                            (uint32_t)link_alias,
+                            evict_it->section_table_index,
+                            (uint32_t)old_section.ram_addr,
+                            (uint32_t)fragment_ptr,
+                            (uint32_t)fe.offset);
+                        fflush(stderr);
+                    }
+                }
+                func_map.erase(link_alias);
             }
         }
         // Also drop trampoline-scanner-installed entries (the J-slot
@@ -757,7 +862,23 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         for (uint32_t slot_off = 0x20; slot_off + 8 <= first_func_offset; slot_off += 8) {
             func_map.erase(fragment_ptr + (int32_t)slot_off);
             if ((int32_t)old_section.ram_addr != fragment_ptr) {
-                func_map.erase((int32_t)old_section.ram_addr + (int32_t)slot_off);
+                int32_t link_slot = (int32_t)old_section.ram_addr + (int32_t)slot_off;
+                static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
+                if (probe_s) {
+                    uint32_t probe_a = (uint32_t)std::strtoul(probe_s, nullptr, 0);
+                    if ((uint32_t)link_slot == probe_a) {
+                        fprintf(stderr,
+                            "[probe] EVICT erasing trampoline-slot func_map[0x%08X] "
+                            "(old_section=%zu link=0x%08X runtime=0x%08X slot=0x%X)\n",
+                            (uint32_t)link_slot,
+                            evict_it->section_table_index,
+                            (uint32_t)old_section.ram_addr,
+                            (uint32_t)fragment_ptr,
+                            slot_off);
+                        fflush(stderr);
+                    }
+                }
+                func_map.erase(link_slot);
             }
         }
         // Remove from loaded_sections so subsequent registrations
@@ -845,9 +966,17 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     // DMA path. Resolves +0x00 J-slot dispatch and any in-header
     // trampolines that point at sibling fragments.
     scan_fragment_section_trampolines(rdram, found_index, fragment_ptr);
+    {
+        char phase[96];
+        std::snprintf(phase, sizeof(phase),
+            "scan section %zu (link=0x%08X runtime=0x%08X)",
+            found_index, (uint32_t)section.ram_addr, (uint32_t)fragment_ptr);
+        probe_func_map_entry(phase);
+    }
 
     // Pending trampolines may now resolve.
     retry_pending_trampolines();
+    probe_func_map_entry("retry_pending");
 }
 
 static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {

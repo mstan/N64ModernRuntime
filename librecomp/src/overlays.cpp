@@ -2,6 +2,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -43,6 +45,46 @@ static std::unordered_map<uint32_t, uint16_t> code_sections_by_rom{};
 static std::unordered_map<uint32_t, uint16_t> patch_code_sections_by_rom{};
 static std::vector<LoadedSection> loaded_sections{};
 static std::unordered_map<int32_t, recomp_func_t*> func_map{};
+// Single-writer / multi-reader lock for func_map. get_function() runs
+// on every recompiled-function indirect call (audio thread, gfx thread,
+// game thread, all of them, very hot). Mutators are overlay loaders /
+// runtime-fragment registrars on the PI thread and (on the game thread
+// at frame boundaries). Without this lock, std::unordered_map's rehash
+// during insert can return junk to a concurrent find() — observed on
+// 2026-05-03 as Stadium quick-battle audio dispatch returning 0 / 0xB8
+// from n_alFxPull (handler resolved to wrong host pointer mid-rehash).
+// Likely also explains a class of intermittent boot-time aspMain_impl
+// SEGV crashes during heavy overlay loading.
+static std::shared_mutex func_map_mutex;
+
+// Recursive helper: writer entry points like register_runtime_fragment
+// call internal helpers (scan_fragment_section_trampolines,
+// retry_pending_trampolines, try_install_trampoline) that ALSO touch
+// func_map. std::shared_mutex isn't recursive, so guard each via this
+// scope helper which only acquires the underlying lock at the
+// outermost depth on a given thread. Inner scopes are no-ops.
+namespace {
+class FuncMapWriteLock {
+    bool acquired_ = false;
+public:
+    FuncMapWriteLock() {
+        if (s_write_depth == 0) {
+            func_map_mutex.lock();
+            acquired_ = true;
+        }
+        s_write_depth++;
+    }
+    ~FuncMapWriteLock() {
+        s_write_depth--;
+        if (acquired_) {
+            func_map_mutex.unlock();
+        }
+    }
+private:
+    static thread_local int s_write_depth;
+};
+thread_local int FuncMapWriteLock::s_write_depth = 0;
+}  // anon namespace
 
 // Forward declarations — definitions live further down with the rest
 // of the host-PC index machinery.
@@ -57,6 +99,7 @@ int32_t* section_addresses = nullptr;
 }
 
 void recomp::overlays::register_overlays(const overlay_section_table_data_t& sections, const overlays_by_index_t& overlays) {
+    FuncMapWriteLock _fml;
     sections_info = sections;
     overlays_info = overlays;
 
@@ -76,6 +119,7 @@ void recomp::overlays::register_overlays(const overlay_section_table_data_t& sec
 }
 
 void recomp::overlays::register_patches(const char* patch, std::size_t size, SectionTableEntry* sections, size_t num_sections) {
+    FuncMapWriteLock _fml;
     patch_code_sections = sections;
     num_patch_code_sections = num_sections;
 
@@ -171,6 +215,7 @@ std::span<const RelocEntry> recomp::overlays::get_section_relocs(uint16_t code_s
 }
 
 void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
+    FuncMapWriteLock _fml;
     func_map[ram] = func;
 }
 
@@ -247,6 +292,7 @@ static uint64_t get_load_order(size_t section_index) {
 }
 
 void load_overlay(size_t section_table_index, int32_t ram) {
+    FuncMapWriteLock _fml;
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
 
     // Register funcs at BOTH the runtime slot address AND the section's
@@ -352,6 +398,7 @@ static int32_t translate_link_time_to_runtime(uint32_t link_time) {
 // recompiled call sites can dispatch through either, depending on
 // whether the caller is using a relocated or link-time pointer.
 static bool try_install_trampoline(int32_t trampoline_runtime_addr, uint32_t link_time_target) {
+    FuncMapWriteLock _fml;
     int32_t runtime_target = translate_link_time_to_runtime(link_time_target);
     if (runtime_target == 0) return false;
     auto it = func_map.find(runtime_target);
@@ -400,6 +447,7 @@ static bool try_install_trampoline(int32_t trampoline_runtime_addr, uint32_t lin
 // Walk the pending list and try to resolve any trampolines whose
 // targets are now loaded. Called after every section load.
 static void retry_pending_trampolines() {
+    FuncMapWriteLock _fml;
     auto it = pending_trampolines.begin();
     while (it != pending_trampolines.end()) {
         if (try_install_trampoline(it->trampoline_runtime_addr, it->link_time_target)) {
@@ -426,6 +474,11 @@ static void probe_func_map_entry(const char* phase) {
         }
     }
     if (probe_addr == 0) return;
+    // Diagnostic probe — called from inside writer scopes (e.g.
+    // retry_pending_trampolines) which already hold the exclusive
+    // lock. Use the recursive write helper rather than shared_lock to
+    // avoid same-thread deadlock against the held exclusive lock.
+    FuncMapWriteLock _fml;
     auto it = func_map.find((int32_t)probe_addr);
     fprintf(stderr,
         "[probe] func_map[0x%08X] %s after %s (size=%zu)\n",
@@ -439,6 +492,7 @@ static void probe_func_map_entry(const char* phase) {
 // Scan one fragment-shaped section's trampoline range. `runtime_base`
 // is the section's loaded_ram_addr (where it lives in RAM right now).
 static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_index, int32_t runtime_base) {
+    FuncMapWriteLock _fml;
     const SectionTableEntry& section = sections_info.code_sections[section_index];
 
     static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
@@ -526,6 +580,7 @@ static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_ind
 }
 
 void recomp::overlays::scan_loaded_fragment_trampolines(uint8_t* rdram, uint32_t rom, int32_t ram_addr, uint32_t size) {
+    FuncMapWriteLock _fml;
     // Iterate sections we just loaded as part of this DMA. A section
     // counts as "just loaded" if its rom_addr falls in [rom, rom+size)
     // OR if rom falls inside the section (chunked-load case). We're
@@ -624,6 +679,7 @@ static inline size_t synthetic_bucket_idx(uint32_t addr) {
 }
 
 void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr) {
+    FuncMapWriteLock _fml;
     if (sections_info.code_sections == nullptr) return;
     if (fragment_ptr == 0) return;
 
@@ -980,6 +1036,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
 }
 
 static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {
+    FuncMapWriteLock _fml;
     for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
         const FuncEntry& func = section.funcs[function_index];
         func_map[ram + func.offset] = func.func;
@@ -987,6 +1044,7 @@ static void load_special_overlay(const SectionTableEntry& section, int32_t ram) 
 }
 
 static void load_patch_functions() {
+    FuncMapWriteLock _fml;
     if (patch_code_sections == nullptr) {
         debug_printf("[Patch] No patch section was registered\n");
         return;
@@ -997,6 +1055,7 @@ static void load_patch_functions() {
 }
 
 void recomp::overlays::read_patch_data(uint8_t* rdram, gpr patch_data_address) {
+    FuncMapWriteLock _fml;
     for (size_t i = 0; i < patch_data.size(); i++) {
         MEM_B(i, patch_data_address) = patch_data[i];
     }
@@ -1006,6 +1065,7 @@ void recomp::overlays::read_patch_data(uint8_t* rdram, gpr patch_data_address) {
 static void unload_overlay_by_section_index(uint32_t section_table_index);
 
 extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
+    FuncMapWriteLock _fml;
     // Two registration patterns coexist here:
     //
     //  (a) A single DMA covers an entire section (small fragments, the
@@ -1098,6 +1158,7 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
 // (not its overlay id). Both unload_overlay_by_id (public) and
 // load_overlays' relocation path (for re-registration) use this.
 static void unload_overlay_by_section_index(uint32_t section_table_index) {
+    FuncMapWriteLock _fml;
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
 
     auto find_it = std::find_if(loaded_sections.begin(), loaded_sections.end(), [section_table_index](const LoadedSection& s) { return s.section_table_index == section_table_index; });
@@ -1120,11 +1181,13 @@ static void unload_overlay_by_section_index(uint32_t section_table_index) {
 }
 
 extern "C" void unload_overlay_by_id(uint32_t id) {
+    FuncMapWriteLock _fml;
     uint32_t section_table_index = overlays_info.table[id];
     unload_overlay_by_section_index(section_table_index);
 }
 
 extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr) {
+    FuncMapWriteLock _fml;
     uint32_t section_table_index = overlays_info.table[id];
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
     int32_t prev_address = section_addresses[section.index];
@@ -1139,6 +1202,7 @@ extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr) {
 }
 
 extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
+    FuncMapWriteLock _fml;
     for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
         const auto& section = sections_info.code_sections[it->section_table_index];
 
@@ -1175,6 +1239,7 @@ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
 }
 
 void recomp::overlays::init_overlays() {
+    FuncMapWriteLock _fml;
     func_map.clear();
     section_addresses = (int32_t *)calloc(sections_info.total_num_sections, sizeof(int32_t));
 
@@ -1283,6 +1348,11 @@ extern "C" {
     uint64_t pkmnstadium_trace_write_idx(void);
     const char* pkmnstadium_trace_at(uint64_t idx);
     uint32_t pkmnstadium_trace_capacity(void);
+    // Unified post-mortem dump (src/main/post_mortem.cpp). Called on
+    // controlled aborts (lookup-miss trampoline) so we get the same
+    // last_run_report.json + last_run_input_history.json + RDRAM dump
+    // that SEH crashes get.
+    void psr_post_mortem_dump(const char* reason, void* fault_info);
 }
 
 static void unhandled_lookup_trampoline(uint8_t* /*rdram*/, recomp_context* /*ctx*/) {
@@ -1342,6 +1412,12 @@ static void unhandled_lookup_trampoline(uint8_t* /*rdram*/, recomp_context* /*ct
         }
         fclose(f);
     }
+    // Trigger the unified post-mortem so build/last_run_report.json +
+    // build/last_run_input_history.json + RDRAM dump capture context
+    // for this controlled abort, the same way SEH crashes do. Without
+    // this the lookup-miss path is invisible to the diagnostic tools
+    // and we lose the input history needed to replay-repro.
+    psr_post_mortem_dump("lookup-miss-trampoline", nullptr);
     std::abort();
 }
 
@@ -1783,6 +1859,7 @@ extern "C" int32_t recomp_resolve_via_data_context(
 }
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
+    std::shared_lock<std::shared_mutex> lock(func_map_mutex);
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
         FILE* f = fopen("F:/Projects/PokemonStadiumRecomp/build/last_error.log", "a");

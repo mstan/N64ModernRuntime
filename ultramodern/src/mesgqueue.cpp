@@ -2,11 +2,17 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#include <cstdio>
 
 #include "blockingconcurrentqueue.h"
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
+
+// Unified post-mortem dump (src/main/post_mortem.cpp) — called from
+// the do_send corruption guard so we capture full state when a
+// corrupted OSMesgQueue ptr arrives.
+extern "C" void psr_post_mortem_dump(const char* reason, void* fault_info);
 
 // ── Queue-event ring buffer ───────────────────────────────────────────
 //
@@ -216,7 +222,56 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
 }
 
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
+    // Defensive boundary check: do_send writes through mq->msg[last]
+    // which produces a host-pointer SEGV if mq is corrupted (we've
+    // observed thread20_rsp / OSScTask scenarios where the task
+    // struct's msgQ field at +0x28 reads back garbage). Without this
+    // guard the trace just shows "do_send wrote to host 0x65b075d8"
+    // which is hard to backtrack. Guard:
+    //   1. mq_ vaddr must be in kseg0 RDRAM range.
+    //   2. mq->msg buffer pointer must be in kseg0 RDRAM range.
+    //   3. mq->msgCount must be > 0 (else mod-by-zero on `last`).
+    //   4. mq->first / validCount must be sane (< msgCount).
+    // On failure: log to stderr, dump post-mortem, return false. The
+    // caller treats this as "send failed" (same as a full queue) which
+    // is recoverable; better than SEGV-and-die. The accompanying
+    // post-mortem records who held the bad mq_ at the time so we can
+    // chase the upstream corruption next iteration.
+    auto fail = [&](const char* why, uint32_t a, uint32_t b, uint32_t c) -> bool {
+        fprintf(stderr,
+            "[do_send] BAD mq_=0x%08X reason=%s a=0x%08X b=0x%08X c=0x%08X "
+            "msg=0x%08X jam=%d block=%d — skipping send\n",
+            uint32_t(mq_), why, a, b, c,
+            uint32_t(uintptr_t(msg)), int(jam), int(block));
+        fflush(stderr);
+        // Trigger unified post-mortem so we get host-stack + rings +
+        // hardware state dumped to last_run_report.json. Use a one-shot
+        // guard so a stuck audio thread can't spam dumps.
+        static std::atomic<int> dumped{0};
+        int prior = dumped.fetch_add(1);
+        if (prior == 0) {
+            psr_post_mortem_dump("do_send-bad-mq", nullptr);
+        }
+        return false;
+    };
+    if (uint32_t(mq_) < 0x80000000u || uint32_t(mq_) >= 0x80800000u) {
+        return fail("mq_-not-kseg0", 0, 0, 0);
+    }
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+    if (uint32_t(mq->msg) < 0x80000000u || uint32_t(mq->msg) >= 0x80800000u) {
+        return fail("mq.msg-not-kseg0",
+                    uint32_t(mq->msg), uint32_t(mq->msgCount), 0);
+    }
+    if (mq->msgCount <= 0 || mq->msgCount > 0x10000) {
+        return fail("mq.msgCount-insane",
+                    uint32_t(mq->msg), uint32_t(mq->msgCount), 0);
+    }
+    if (mq->first < 0 || mq->first >= mq->msgCount
+        || mq->validCount < 0 || mq->validCount > mq->msgCount) {
+        return fail("mq.first/validCount-insane",
+                    uint32_t(mq->first), uint32_t(mq->validCount),
+                    uint32_t(mq->msgCount));
+    }
     if (!block) {
         // If non-blocking, fail if the queue is full.
         if (MQ_IS_FULL(mq)) {

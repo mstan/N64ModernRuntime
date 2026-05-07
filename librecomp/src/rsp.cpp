@@ -149,6 +149,86 @@ bool recomp::rsp::run_task(uint8_t* rdram, const OSTask* task) {
     // Run the ucode
     RspExitReason exit_reason = ucode_func(rdram, task->t.ucode);
 
+    // Audio dispatch-table integrity check. After every audio task we
+    // expect DMEM[0..0x1F] to still hold Stadium's aspMain dispatch
+    // halfword table. Handlers writing to DMEM via mis-computed offsets
+    // (e.g. an envelope/resampler write whose dest wraps past 0x1000)
+    // will silently overwrite the table. Once overwritten, subsequent
+    // cmd dispatches read garbage and route to wrong handlers, which
+    // sounds like the post-title clicking. Catch the FIRST corrupting
+    // task: dump its full cmd list to a file so we can simulate the
+    // handlers offline and identify the culprit.
+    {
+        // M_AUDTASK = 2 (libultra OSTask::type for aspMain).
+        if (task->t.type == 2) {
+            static const uint16_t kExpectedTable[16] = {
+                0x10EC, 0x139C, 0x119C, 0x1A64, 0x11C8, 0x17EC, 0x1208, 0x0000,
+                0x0000, 0x127C, 0x1348, 0x1248, 0x1C84, 0x12D4, 0x02B0, 0x1384,
+            };
+            // RSP halfword reads use XOR-3 byte order: byte at addr
+            // (idx & ~3) | ((idx & 3) ^ 3). For halfword at byte
+            // offset 2*i, the high byte sits at (2*i)^3 in the
+            // host-side dmem array, low at (2*i+1)^3.
+            // Triage: skip slots 7 and 8. Empirically, L_1384 (handler
+            // for opcode 0x0F) writes 4 bytes to DMEM[0x0E..0x11] via
+            // `sw $1, 0xE($zero)` on every 0x0F cmd; this overlaps
+            // dispatch slots 7 and 8 (which Stadium's table populates
+            // with 0x0000). The chunk streams we've sampled do not
+            // contain opcodes 0x07 or 0x08, so dispatch never reads
+            // those slots and the write is asymptomatic. Whether that's
+            // by design or an accident in the microcode is unverified
+            // — we skip the slots here only to surface OTHER, unknown
+            // corruption sources. If a path is ever observed sending
+            // opcode 0x07 or 0x08, the L_1384 write becomes a real bug
+            // and this skip should be removed.
+            int first_bad_slot = -1;
+            uint16_t first_bad_actual = 0;
+            for (int i = 0; i < 16; i++) {
+                if (i == 7 || i == 8) continue;
+                uint8_t hi = dmem[(2*i)     ^ 3];
+                uint8_t lo = dmem[(2*i + 1) ^ 3];
+                uint16_t actual = (uint16_t)((hi << 8) | lo);
+                if (actual != kExpectedTable[i]) {
+                    first_bad_slot = i;
+                    first_bad_actual = actual;
+                    break;
+                }
+            }
+            static bool s_dumped = false;
+            if (first_bad_slot >= 0 && !s_dumped) {
+                fprintf(stderr,
+                    "[dispatch-corrupt] task corrupted dispatch table: "
+                    "first_bad slot[%d] actual=0x%04X expected=0x%04X "
+                    "data_ptr=0x%08X data_size=0x%X\n",
+                    first_bad_slot, first_bad_actual,
+                    kExpectedTable[first_bad_slot],
+                    (uint32_t)task->t.data_ptr,
+                    (uint32_t)task->t.data_size);
+                // Also dump entire DMEM[0..0x1F] for context.
+                fprintf(stderr, "[dispatch-corrupt] DMEM[0..0x1F]: ");
+                for (int j = 0; j < 32; j++) {
+                    fprintf(stderr, "%02X%s", dmem[j ^ 3], (j & 1) ? " " : "");
+                }
+                fprintf(stderr, "\n");
+                // Save the cmd list to a file for offline simulation.
+                FILE* f = fopen("audio_task_corrupt.bin", "wb");
+                if (f) {
+                    uint32_t paddr = (uint32_t)task->t.data_ptr & 0xFFFFFF;
+                    uint32_t size  = (uint32_t)task->t.data_size;
+                    if (paddr + size <= 0x800000) {
+                        fwrite(rdram + paddr, 1, size, f);
+                        fprintf(stderr,
+                            "[dispatch-corrupt] cmd list (%u bytes) saved to "
+                            "audio_task_corrupt.bin\n", size);
+                    }
+                    fclose(f);
+                }
+                fflush(stderr);
+                s_dumped = true;  // only dump the first corrupting task
+            }
+        }
+    }
+
     // Pair the entry record with an exit record. If exit doesn't
     // appear in the ring for a recorded entry, ucode_func hung.
     recomp_ultra_trace_record(

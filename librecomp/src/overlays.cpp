@@ -742,19 +742,98 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         }
 
         if (found_index == (size_t)-1) {
-            // Hash didn't match any candidate. Fall back to the first
-            // candidate — won't be correct dispatch for this fragment,
-            // but lets the run continue. Log so post-mortem can spot
-            // the residual ~5% the 0x100-byte window misses.
-            fprintf(stderr,
-                "[reg-frag] no content-hash match for id=0x%X "
-                "fragment_ptr=0x%08X live_hash=0x%016llX "
-                "(%zu candidates) — picking first\n",
-                id, (uint32_t)fragment_ptr,
-                (unsigned long long)live_hash,
-                candidates.size());
-            fflush(stderr);
-            found_index = candidates.front();
+            // Hash didn't match any candidate. Before falling back to
+            // first-candidate, try to disambiguate via the live
+            // fragment's J-trampoline header: if the embedded link_vram
+            // falls within a candidate's [ram_addr, ram_addr+size)
+            // range, that candidate is the correct one. This rescues
+            // the case where multiple candidates share the same
+            // bucket-derived id (e.g. fragment58 at 0x84000000 and
+            // some other section at 0xA4000040 both map to id=0x30)
+            // and content_hash is unset on both (= 0).
+            uint32_t hdr_link_vram = 0;
+            bool hdr_valid = false;
+            if (paddr + 0x14 <= (8u * 1024u * 1024u)) {
+                auto rd_be32_p = [&](uint32_t off) -> uint32_t {
+                    uint8_t b0 = rdram[(paddr + off + 0) ^ 3];
+                    uint8_t b1 = rdram[(paddr + off + 1) ^ 3];
+                    uint8_t b2 = rdram[(paddr + off + 2) ^ 3];
+                    uint8_t b3 = rdram[(paddr + off + 3) ^ 3];
+                    return (uint32_t(b0) << 24) | (uint32_t(b1) << 16) | (uint32_t(b2) << 8) | uint32_t(b3);
+                };
+                uint32_t j_instr  = rd_be32_p(0x00);
+                uint32_t magic_a  = rd_be32_p(0x08);
+                uint32_t magic_b  = rd_be32_p(0x0C);
+                uint32_t entry_off = rd_be32_p(0x10);
+                if (magic_a == 0x46524147u && magic_b == 0x4D454E54u &&
+                    ((j_instr >> 26) & 0x3Fu) == 0x02u) {
+                    uint32_t j_target = ((j_instr & 0x03FFFFFFu) << 2) | 0x80000000u;
+                    hdr_link_vram = j_target - entry_off;
+                    hdr_valid = true;
+                }
+            }
+            if (hdr_valid) {
+                for (size_t ci : candidates) {
+                    const SectionTableEntry& sec = sections_info.code_sections[ci];
+                    uint32_t base = uint32_t(sec.ram_addr);
+                    uint32_t end  = base + sec.size;
+                    if (hdr_link_vram >= base && hdr_link_vram < end) {
+                        found_index = ci;
+                        fprintf(stderr,
+                            "[reg-frag] J-trampoline rescue: live link_vram=0x%08X "
+                            "in candidate %zu range [0x%08X..0x%08X) — picked it\n",
+                            hdr_link_vram, ci, base, end);
+                        fflush(stderr);
+                        break;
+                    }
+                }
+            }
+
+            if (found_index == (size_t)-1) {
+                // Still no match. Fall back to first-candidate; log
+                // diagnostics + dump live bytes for offline ID.
+                fprintf(stderr,
+                    "[reg-frag] no content-hash match for id=0x%X "
+                    "fragment_ptr=0x%08X live_hash=0x%016llX "
+                    "(%zu candidates) — picking first\n",
+                    id, (uint32_t)fragment_ptr,
+                    (unsigned long long)live_hash,
+                    candidates.size());
+                for (size_t ci : candidates) {
+                    const SectionTableEntry& sec = sections_info.code_sections[ci];
+                    fprintf(stderr,
+                        "  cand[%zu] ram_addr=0x%08X size=0x%X "
+                        "content_hash=0x%016llX synthetic=%d\n",
+                        ci, uint32_t(sec.ram_addr), sec.size,
+                        (unsigned long long)sec.content_hash,
+                        is_synthetic_addr(uint32_t(sec.ram_addr)) ? 1 : 0);
+                }
+                if (hdr_valid) {
+                    fprintf(stderr,
+                        "  live header link_vram=0x%08X (no candidate range matched)\n",
+                        hdr_link_vram);
+                }
+                fflush(stderr);
+                size_t dump_size = sections_info.code_sections[candidates.front()].size;
+                char path[128];
+                snprintf(path, sizeof(path),
+                    "F:/Projects/PokemonStadiumRecomp/build/hash_miss_id_%X.bin", id);
+                FILE* f = fopen(path, "wb");
+                if (f) {
+                    if (paddr + dump_size <= (8u * 1024u * 1024u)) {
+                        for (size_t i = 0; i < dump_size; i++) {
+                            uint8_t b = rdram[(paddr + i) ^ 3];
+                            fwrite(&b, 1, 1, f);
+                        }
+                        fprintf(stderr,
+                            "[reg-frag] dumped %zu live bytes to %s for offline ID\n",
+                            dump_size, path);
+                        fflush(stderr);
+                    }
+                    fclose(f);
+                }
+                found_index = candidates.front();
+            }
         }
     }
 

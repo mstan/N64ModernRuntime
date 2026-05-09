@@ -11,12 +11,6 @@
 //     (see commit bbd3f79).
 //   - Queue-event ring buffer (always-on) + ultramodern_mesg_recent_copy
 //     accessor for runner-side diagnostics (commit dd8137d).
-//   - Queue-ops mutex + external-pump host thread (Option C). Drains
-//     external_messages into target queues on a host timer, regardless
-//     of whether any game thread is currently in a libultra primitive.
-//     Resolves the cooperative-scheduler softlock class where a game
-//     thread tight-loops on a predicate that depends on a completion
-//     message that nobody dequeues.
 //
 // Copyright (c) 2026 Matthew Stanley
 //
@@ -24,9 +18,7 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <thread>
 #include <cstdio>
 
@@ -140,42 +132,11 @@ struct QueuedMessage {
 
 static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
 
-// Pump-thread wake-signal state (Option C) — defined at file scope so
-// enqueue paths can poke the condition variable to keep external-
-// message delivery latency sub-millisecond when the pump is idle.
-// Definitions are below.
-static std::thread g_pump_thread;
-static std::atomic<bool> g_pump_shutdown{false};
-static std::atomic<bool> g_pump_started{false};
-static std::mutex g_pump_wake_mutex;
-static std::condition_variable g_pump_wake_cv;
-
-// ── Queue-ops mutex (Option C) ────────────────────────────────────────
-//
-// Serializes mutations of OSMesgQueue state and the per-queue
-// blocked-thread queues + running_queue when they're touched from
-// inside do_send / do_recv. Held by:
-//   - Game-thread libultra paths (do_send / do_recv) during their
-//     critical sections; released across pause-and-wait so other
-//     game threads can run.
-//   - The external-pump host thread while draining externals into
-//     target queues.
-// Recursive because do_send is called both directly (from game-thread
-// osSendMesg) and indirectly via dequeue_external_messages on the same
-// thread; nested locking on the same thread must succeed.
-static std::recursive_mutex g_msg_queue_mutex;
-
 void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
     external_messages.enqueue({mq, msg, jam});
     mesg_log::record(mesg_log::OP_SEND_EXTERNAL,
                      uint32_t(mq), uint32_t(uintptr_t(msg)),
                      0, 0, false, false);
-    // Wake the external-pump thread so the message is delivered with
-    // sub-millisecond latency rather than waiting for the 2 ms timer.
-    // Cheap when the pump isn't running yet (notify_all on an idle CV).
-    if (g_pump_started.load(std::memory_order_acquire)) {
-        g_pump_wake_cv.notify_one();
-    }
 }
 
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
@@ -187,7 +148,6 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
 static std::atomic<uint64_t> g_external_requeues{0};
 
 void dequeue_external_messages(RDRAM_ARG1) {
-    std::lock_guard<std::recursive_mutex> lk(g_msg_queue_mutex);
     QueuedMessage to_send;
     while (external_messages.try_dequeue(to_send)) {
         OSMesgQueue* mq_pre = TO_PTR(OSMesgQueue, to_send.mq);
@@ -334,12 +294,6 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
                     uint32_t(mq->first), uint32_t(mq->validCount),
                     uint32_t(mq->msgCount));
     }
-    // Mutex held across the queue-state critical section. For the
-    // blocking path we release it across run_next_thread_and_wait so
-    // other game threads (and the pump) can make progress, then
-    // re-acquire and re-check the queue state on wake.
-    std::unique_lock<std::recursive_mutex> lk(g_msg_queue_mutex);
-
     if (!block) {
         // If non-blocking, fail if the queue is full.
         if (MQ_IS_FULL(mq)) {
@@ -355,12 +309,10 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
                              true, true);
             debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
-            lk.unlock();
             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
-            lk.lock();
         }
     }
-
+    
     if (jam) {
         // Jams insert at the head of the message queue's buffer.
         mq->first = (mq->first + mq->msgCount - 1) % mq->msgCount;
@@ -379,20 +331,19 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
     if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
         ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
     }
-
+    
     return true;
 }
 
 bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
-    std::unique_lock<std::recursive_mutex> lk(g_msg_queue_mutex);
     if (!block) {
         // If non-blocking, fail if the queue is empty
         if (MQ_IS_EMPTY(mq)) {
             return false;
         }
     } else {
-        // Otherwise, yield this thread in a loop until the queue is no longer empty
+        // Otherwise, yield this thread in a loop until the queue is no longer full
         while (MQ_IS_EMPTY(mq)) {
             mesg_log::record(mesg_log::OP_RECV_BLOCK,
                              uint32_t(mq_), 0,
@@ -400,16 +351,14 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
                              true, true);
             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
-            lk.unlock();
             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
-            lk.lock();
         }
     }
 
     if (msg_ != NULLPTR) {
         *TO_PTR(OSMesg, msg_) = TO_PTR(OSMesg, mq->msg)[mq->first];
     }
-
+    
     mq->first = (mq->first + 1) % mq->msgCount;
     mq->validCount--;
 
@@ -502,59 +451,3 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 
 
     return received ? 0 : -1;
 }
-
-// ── External-pump host thread (Option C) ──────────────────────────────
-//
-// Runs continuously after preinit. Wakes on either a 2 ms timer or as
-// soon as enqueue_external_message signals the wake-event, then drains
-// external_messages into target queues by calling
-// dequeue_external_messages (which acquires g_msg_queue_mutex
-// internally).
-//
-// Why this is needed: ultramodern is a cooperative scheduler — a game
-// thread that tight-loops on a memory predicate (e.g. polling
-// validCount on a queue waiting for a DP-complete) never returns to
-// the scheduler, so dequeue_external_messages from within
-// osSendMesg/osRecvMesg never gets called. The completion is stuck in
-// external_messages forever; the predicate never flips. The pump
-// thread breaks the deadlock by delivering externals from a host
-// context independent of game-thread cooperation.
-//
-// 2 ms tick is a balance: the busy-wait fix needs sub-frame latency
-// (the game polls 60+ times per second), but waking too aggressively
-// burns CPU. 2 ms gives ~500 wakes/sec — well below frame cadence,
-// well below Win32 timer resolution waste.
-static void external_pump_thread_func(uint8_t* rdram) {
-    using namespace std::chrono_literals;
-    while (!g_pump_shutdown.load(std::memory_order_acquire)) {
-        // Wait either for a wake-signal (new external posted) or
-        // for the 2 ms timer, whichever comes first. Coalescing
-        // wakes is fine — the drain loop pulls everything currently
-        // queued each pass.
-        {
-            std::unique_lock<std::mutex> lk(g_pump_wake_mutex);
-            g_pump_wake_cv.wait_for(lk, 2ms);
-        }
-        if (g_pump_shutdown.load(std::memory_order_acquire)) break;
-        dequeue_external_messages(PASS_RDRAM1);
-    }
-}
-
-namespace ultramodern {
-    void init_external_pump(RDRAM_ARG1) {
-        bool expected = false;
-        if (!g_pump_started.compare_exchange_strong(expected, true)) {
-            return;  // already started
-        }
-        g_pump_shutdown.store(false, std::memory_order_release);
-        g_pump_thread = std::thread(external_pump_thread_func, rdram);
-    }
-
-    void join_external_pump() {
-        if (!g_pump_started.load(std::memory_order_acquire)) return;
-        g_pump_shutdown.store(true, std::memory_order_release);
-        g_pump_wake_cv.notify_all();
-        if (g_pump_thread.joinable()) g_pump_thread.join();
-        g_pump_started.store(false, std::memory_order_release);
-    }
-}  // namespace ultramodern

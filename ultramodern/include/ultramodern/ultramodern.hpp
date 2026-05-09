@@ -126,15 +126,6 @@ void join_event_threads();
 void join_thread_cleaner_thread();
 void join_saving_thread();
 
-// External-message pump (Option C). Spawned by preinit, joined on
-// shutdown. Delivers messages from external_messages into target
-// OSMesgQueues from a host thread, independent of game-thread
-// cooperation — avoids cooperative-scheduler softlocks where a game
-// thread tight-loops waiting on a completion message that nobody
-// dequeues.
-void init_external_pump(RDRAM_ARG1);
-void join_external_pump();
-
 void set_audio_callbacks(const audio_callbacks_t& callbacks);
 
 /**

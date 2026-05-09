@@ -1,17 +1,3 @@
-// Modifications in this file are part of N64ModernRuntime (GPL-3.0;
-// see COPYING). The notices below describe the changes and their
-// authorship, as required by GPL-3.0 §5(a). Original file copyright
-// remains with the upstream N64ModernRuntime authors.
-//
-// Modified 2026 by Matthew Stanley:
-//   - Spawn ultramodern::init_external_pump in preinit (Option C
-//     external-message pump for cooperative-scheduler busy-wait
-//     deadlocks).
-//
-// Copyright (c) 2026 Matthew Stanley
-//
-// ---------------------------------------------------------------------
-
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
 
@@ -41,11 +27,6 @@ void ultramodern::preinit(RDRAM_ARG ultramodern::renderer::WindowHandle window_h
     ultramodern::init_timers(PASS_RDRAM1);
     ultramodern::init_audio();
     ultramodern::init_thread_cleanup();
-    // Option C — external-message pump. Must come after init_events
-    // because host threads (VI/SP/DP/AI/SI) start posting externals
-    // via osSendMesg as soon as they're alive; the pump delivers them
-    // even when the game thread is busy-waiting on a memory predicate.
-    ultramodern::init_external_pump(PASS_RDRAM1);
 }
 
 extern "C" void osInitialize() {

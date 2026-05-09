@@ -1,3 +1,15 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Address-region constants for the kseg1 ROM mirror and the
+//     framework-level libultra ring.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #ifndef __RECOMP_ADDRESSES_HPP__
 #define __RECOMP_ADDRESSES_HPP__
 

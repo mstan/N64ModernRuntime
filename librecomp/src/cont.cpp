@@ -1,3 +1,16 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Framework-level libultra-call ring instrumentation
+//     (LIBRECOMP_ULTRA_TRACE) at osCont entry points for runner-side
+//     boot sequencing diagnostics.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #include "ultramodern/ultramodern.hpp"
 
 #include "helpers.hpp"

@@ -1,3 +1,17 @@
+// N64ModernRuntime — this file (and the libultra-call ring it
+// implements) was added by Matthew Stanley (mstan fork). Per GPL-3.0
+// §5(a), authorship of the file is recorded below; the file is
+// distributed under the same GPL-3.0 license as the rest of the
+// project (see COPYING).
+//
+// Added 2026 by Matthew Stanley:
+//   - Lock-free fixed-size ring of recent libultra calls + accessor
+//     APIs for runner-side diagnostics.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 /*
  * ultra_trace.cpp — implementation of the libultra-call ring.
  *

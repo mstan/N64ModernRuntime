@@ -1,3 +1,18 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Auto-increment RSP DMA addresses after each transfer (matches
+//     real-N64 RSP-DMA HLE semantics).
+//   - get_last_pc_trail API for live RSP hang inspection.
+//   - Pre-task hook registry + DMA helper export.
+//   - Framework-level libultra-call ring + RSP watchdog hooks.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #ifndef __RSP_H__
 #define __RSP_H__
 

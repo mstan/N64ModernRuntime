@@ -1,3 +1,34 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - register_runtime_fragment for CPU-decompressed fragments and
+//     for sections DMA-loaded in chunks; HAL-fragment trampoline
+//     synthesis at load time.
+//   - Content-hash dispatch in register_runtime_fragment (Shape A
+//     runtime side); link-time vram alias registration; J-trampoline
+//     fallback.
+//   - Synthetic-fragment resolver + per-pattern-id candidate filter;
+//     recomp_resolve_via_data_context for data-context fragment-vaddr
+//     resolution; recomp_addr_in_loaded_variant for variant-presence
+//     check; caller-context fragment-vaddr resolution.
+//   - func_map shared_mutex (paired with do_send corruption guard
+//     in ultramodern); env-driven func_map probe; variant-candidate
+//     probe for pattern-bucket addresses.
+//   - Eviction fixes (remove old loaded_sections entry, evict prior
+//     section's func_map entries before re-registration).
+//   - J-trampoline range-match tiebreaker for hash-miss dispatch
+//     (resolves Free Battle entry blocker).
+//   - Lookup-miss trampoline enriched with addr + trace ring + host
+//     backtrace; per-frag relocation logging.
+//   - Framework-level libultra ring + RSP watchdog + boot fixes for
+//     PokemonStadium boot sequencing.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #include <algorithm>
 #include <cassert>
 #include <cstdio>

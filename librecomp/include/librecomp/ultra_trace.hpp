@@ -1,3 +1,16 @@
+// N64ModernRuntime — this file (and the libultra-call ring it
+// declares) was added by Matthew Stanley (mstan fork). Per GPL-3.0
+// §5(a), authorship is recorded below; the file is distributed under
+// the same GPL-3.0 license as the rest of the project (see COPYING).
+//
+// Added 2026 by Matthew Stanley:
+//   - Always-on ring buffer event struct + LIBRECOMP_ULTRA_TRACE
+//     macro + ultramodern_ultra_recent_copy accessor.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 /*
  * ultra_trace.hpp — Always-on ring buffer of libultra-call events.
  *

@@ -1,3 +1,15 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Section descriptor extensions for synthetic-fragment resolution
+//     and content-hash dispatch in register_runtime_fragment.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #ifndef __SECTIONS_H__
 #define __SECTIONS_H__
 

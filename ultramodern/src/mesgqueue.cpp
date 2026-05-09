@@ -1,3 +1,21 @@
+// Modifications in this file are part of N64ModernRuntime (GPL-3.0; see
+// COPYING). The notices below describe the changes and their authorship,
+// as required by GPL-3.0 §5(a). Original file copyright remains with the
+// upstream N64ModernRuntime authors.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Re-queue externals on full target OSMesgQueue (replaces silent drop
+//     in dequeue_external_messages; see commit a14270c).
+//   - Defensive boundary check + post-mortem dump in do_send to surface
+//     corrupted OSMesgQueue pointers cleanly instead of host-side SEGV
+//     (see commit bbd3f79).
+//   - Queue-event ring buffer (always-on) + ultramodern_mesg_recent_copy
+//     accessor for runner-side diagnostics (commit dd8137d).
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -46,7 +64,11 @@ namespace mesg_log {
         uint8_t  pad;
     };
 
-    constexpr size_t RING_CAP = 1024;
+    // Bumped from 1024 to 65536 to span ~18 minutes of VI ticks at 60Hz —
+    // 1024 was getting saturated by VI retraces (60/sec) within ~17 seconds,
+    // burying any non-VI events from menu transitions before we could query.
+    // 65536 events × 40 bytes ≈ 2.5 MB, acceptable for diagnostics.
+    constexpr size_t RING_CAP = 65536;
     static Event ring[RING_CAP];
     static std::atomic<uint64_t> next_seq{0};
     static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();

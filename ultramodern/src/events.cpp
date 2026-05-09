@@ -1,3 +1,19 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - osSpTaskStartGo ring + sp/dp_complete counters for runner-side
+//     diagnostics (commit 4e0c9fe).
+//   - Submit-task counters surfaced via ultramodern_submit_*_count
+//     (commit dd8137d).
+//   - Framework-level libultra ring + RSP watchdog + boot fixes for
+//     PokemonStadium boot sequencing.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #include <thread>
 #include <atomic>
 #include <chrono>

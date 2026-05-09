@@ -1,3 +1,20 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Bounds-check do_rom_read; zero-fill on out-of-range DMA.
+//   - Host backtrace on OOB ROM read for diagnostics.
+//   - Mirror ROM into kseg1 region of rdram (PokemonStadium copy
+//     protection reads cart vaddrs directly).
+//   - HLE-correct PI bus modeling for absent devices.
+//   - HAL fragment trampoline synthesis hooks at load time.
+//   - Framework-level libultra ring integration.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #include <memory>
 #include <fstream>
 #include <array>

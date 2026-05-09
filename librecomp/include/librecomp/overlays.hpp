@@ -1,3 +1,15 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Public surface for register_runtime_fragment (CPU-decompressed
+//     fragments) and HAL-fragment trampoline synthesis at load time.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #ifndef __RECOMP_OVERLAYS_H__
 #define __RECOMP_OVERLAYS_H__
 

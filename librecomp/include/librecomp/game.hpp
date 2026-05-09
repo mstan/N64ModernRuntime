@@ -1,3 +1,14 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Hooks for ROM-into-kseg1 mirroring (paired with recomp.cpp).
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #ifndef __RECOMP_GAME__
 #define __RECOMP_GAME__
 

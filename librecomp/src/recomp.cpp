@@ -1,3 +1,16 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Mirror ROM into kseg1 region of rdram so direct cart-vaddr
+//     reads (e.g. PokemonStadium copy-protection check at 0xB0000E38)
+//     return correct values.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

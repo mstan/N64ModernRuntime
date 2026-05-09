@@ -1,3 +1,17 @@
+// N64ModernRuntime — modifications in this file by Matthew Stanley
+// (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
+// file copyright remains with upstream authors. See COPYING.
+//
+// Modified 2026 by Matthew Stanley:
+//   - Always-on osSpTaskStartGo ring (sp_task_log) for runner-side
+//     diagnostics — captures task type, ucode, data_ptr, sizes per
+//     submission so post-mortem can identify the last gfx/audio task.
+//   - Framework-level libultra-call ring + boot-sequence fixes.
+//
+// Copyright (c) 2026 Matthew Stanley
+//
+// ---------------------------------------------------------------------
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>

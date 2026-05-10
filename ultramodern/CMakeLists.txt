@@ -14,7 +14,6 @@ add_library(ultramodern STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/misc_ultra.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/renderer_context.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/rsp.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/scheduler_tick.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/scheduling.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/task_win32.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/threadqueue.cpp"

@@ -19,7 +19,6 @@
 #include "ultramodern/input.hpp"
 #include "ultramodern/renderer_context.hpp"
 #include "ultramodern/rsp.hpp"
-#include "ultramodern/scheduler_tick.hpp"
 #include "ultramodern/threads.hpp"
 
 struct UltraThreadContext {

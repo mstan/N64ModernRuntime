@@ -1,16 +1,3 @@
-// Modifications in this file are part of N64ModernRuntime (GPL-3.0; see
-// COPYING). Original file copyright remains with the upstream
-// N64ModernRuntime authors.
-//
-// Modified 2026 by Matthew Stanley:
-//   - Spawn ultramodern::init_scheduler_tick at end of preinit so the
-//     no-arg ultramodern_scheduler_tick() called from generated code at
-//     function entry can pass rdram through to ultramodern primitives.
-//
-// Copyright (c) 2026 Matthew Stanley
-//
-// ---------------------------------------------------------------------
-
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
 
@@ -40,7 +27,6 @@ void ultramodern::preinit(RDRAM_ARG ultramodern::renderer::WindowHandle window_h
     ultramodern::init_timers(PASS_RDRAM1);
     ultramodern::init_audio();
     ultramodern::init_thread_cleanup();
-    ultramodern::init_scheduler_tick(PASS_RDRAM1);
 }
 
 extern "C" void osInitialize() {

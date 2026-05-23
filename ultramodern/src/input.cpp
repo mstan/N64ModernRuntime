@@ -10,6 +10,14 @@ void ultramodern::input::set_callbacks(const callbacks_t& callbacks) {
     input_callbacks = callbacks;
 }
 
+ultramodern::input::connected_device_info_t
+ultramodern::input::get_connected_device_info(int controller_num) {
+    if (input_callbacks.get_connected_device_info == nullptr) {
+        return {};
+    }
+    return input_callbacks.get_connected_device_info(controller_num);
+}
+
 static std::chrono::high_resolution_clock::time_point input_poll_time;
 
 static void update_poll_time() {
@@ -58,11 +66,8 @@ static void __osContGetInitData(u8* pattern, OSContStatus *data) {
     *pattern = 0x00;
 
     for (int controller = 0; controller < max_controllers; controller++) {
-        ultramodern::input::connected_device_info_t device_info{};
-
-        if (input_callbacks.get_connected_device_info != nullptr) {
-            device_info = input_callbacks.get_connected_device_info(controller);
-        }
+        const ultramodern::input::connected_device_info_t device_info =
+            ultramodern::input::get_connected_device_info(controller);
 
         if (device_info.connected_device != ultramodern::input::Device::None) {
             // Mark controller as present

@@ -75,6 +75,54 @@ namespace librecomp::audio_uaf {
 
     // Whether a layout has been registered.
     bool layout_registered();
+
+    // Secondary voice-table layout: array-style voice tables held by
+    // game-side code on top of libnaudio. Distinct from VoiceLayout
+    // (which describes libnaudio's intrusive ALLink lists). Some games
+    // route audio through a high-level synth that maintains its own
+    // per-voice struct array, in addition to the libnaudio synth.
+    // Those high-level structs can also hold pointers into pool memory
+    // that gets freed, so a UAF on the game-side path is possible
+    // independently of libnaudio.
+    //
+    // Walk strategy: array of fixed-stride voice structs at a
+    // game-known vaddr/count. For each voice, follow a deref chain
+    // (sequence of u32 loads at offsets from the prior step's
+    // address) to land on a wavetable / pool pointer. If that pointer
+    // falls in the freed range, write silence_value at silence_field
+    // within the voice struct to make the game's per-voice processor
+    // skip the voice on the next frame.
+    //
+    // Chain semantics: cur = voice_base; for each step s in 0..N-1:
+    //   addr = cur + chain_offsets[s]
+    //   cur = *(u32*)addr           // load u32 from rdram[addr]
+    // After all steps, `cur` is the final pointer to range-check.
+    // chain_step_count = 0 means treat voice_base itself as the
+    // pointer (uncommon; included for symmetry).
+    struct SecondaryVoiceTableLayout {
+        // Where the voice count lives (read as u32).
+        uint32_t count_vaddr;
+        // Where the array pointer lives (read as u32 to get array base vaddr).
+        uint32_t array_ptr_vaddr;
+        // Bytes per voice.
+        uint16_t voice_size;
+        // Safety cap on iteration (defends against count corruption).
+        uint16_t max_voice_count;
+        // Deref chain — up to 4 steps; chain_step_count must be <= 4.
+        uint8_t  chain_step_count;
+        uint8_t  chain_offsets[4];
+        // Field within the voice to write silence_value to.
+        uint16_t silence_field_offset;
+        // Value to write to silence (typically 0).
+        uint32_t silence_value;
+    };
+
+    // Register a secondary voice-table layout. Independent of the
+    // libnaudio layout; both can be registered.
+    void register_secondary_voice_table(const SecondaryVoiceTableLayout& layout);
+
+    // Whether a secondary table has been registered.
+    bool secondary_table_registered();
 }
 
 extern "C" {
@@ -93,6 +141,14 @@ extern "C" {
     // Silence ALL libaudio voices regardless of dc_table location.
     // For total-scene-cleanup hooks where every voice should stop.
     int librecomp_audio_uaf_silence_all_voices(uint8_t* rdram);
+
+    // Silence game-side secondary voices (e.g. high-level synth voice
+    // arrays) whose chained wavetable / pool pointer falls in
+    // [start_vaddr, end_vaddr). Returns the number of voices silenced,
+    // 0 if no secondary table is registered or none matched, or a
+    // negative error code on layout-resolution failure.
+    int librecomp_audio_uaf_silence_secondary_in_range(
+        uint8_t* rdram, uint32_t start_vaddr, uint32_t end_vaddr);
 }
 
 #endif

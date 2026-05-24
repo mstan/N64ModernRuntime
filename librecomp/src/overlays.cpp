@@ -1968,6 +1968,107 @@ extern "C" int32_t recomp_resolve_via_data_context(
     return 0;
 }
 
+// ── Fragment-vaddr resolution helpers ─────────────────────────────
+//
+// Games that ship variant-aware fragments (Pokemon Stadium pattern-bucket
+// fragments at the 0x8FF00000 link-vram, etc.) need a runtime resolver
+// to disambiguate a single game-side fragment id between multiple
+// concurrently-loaded variants. The original game maintained an implicit
+// invariant: while walking variant X's data, gFragments[X.id] points to
+// X's buffer, and embedded link-vaddr literals resolve against X. In the
+// recompiler, multiple variants are host-resident concurrently, so the
+// single-pointer-per-id model becomes ambiguous.
+//
+// The three helpers above (recomp_addr_in_loaded_variant,
+// recomp_resolve_synthetic_fragment, recomp_resolve_via_data_context)
+// each handle one piece of that disambiguation. recomp_resolve_fragment_vaddr
+// below orchestrates them in priority order so a game-side hook on the
+// fragment-vaddr-resolver function is a one-liner.
+//
+// Pairs with librecomp_fragment_input_push / _pop for the typical
+// entry-hook-saves-input / exit-hook-uses-input pattern. The TLS stack
+// handles recursive calls.
+
+namespace {
+    constexpr int kFragmentInputStackDepth = 16;
+    thread_local uint32_t s_fragment_input_stack[kFragmentInputStackDepth];
+    thread_local int      s_fragment_input_sp = 0;
+}
+
+extern "C" void librecomp_fragment_input_push(uint32_t input) {
+    if (s_fragment_input_sp < kFragmentInputStackDepth) {
+        s_fragment_input_stack[s_fragment_input_sp] = input;
+    }
+    s_fragment_input_sp++;
+}
+
+extern "C" uint32_t librecomp_fragment_input_pop(void) {
+    s_fragment_input_sp--;
+    int idx = (s_fragment_input_sp >= 0 && s_fragment_input_sp < kFragmentInputStackDepth)
+        ? s_fragment_input_sp : 0;
+    return s_fragment_input_stack[idx];
+}
+
+// Unified fragment-vaddr resolver. Pops the matching push_input from
+// the TLS stack, runs the 3-step orchestration, returns the resolved
+// vaddr (or game_result if no override applies).
+//
+// Game-side hook usage (toml):
+//   [[patches.hook]]              # entry
+//   func = "<game's resolver>"
+//   before_vram = <entry>
+//   text = "librecomp_fragment_input_push((uint32_t)ctx->r4);"
+//
+//   [[patches.hook]]              # exit
+//   func = "<game's resolver>"
+//   before_vram = <exit>
+//   text = "ctx->r4 = librecomp_fragment_resolve_exit(
+//             (uint32_t)ctx->r4, (uint32_t)MEM_W(0, <walker_state_vaddr>));"
+extern "C" uint32_t librecomp_fragment_resolve_exit(
+    uint32_t game_result, uint32_t data_ctx_addr)
+{
+    const uint32_t input = librecomp_fragment_input_pop();
+
+    // Step 1: synthetic-fragment pool (highest priority). For inputs in
+    // the per-variant synthetic-vram range, resolve via the parallel
+    // recomp_synthetic_fragments[] table, bypassing the game's native
+    // gFragments[id]. The native game path returned the input unchanged
+    // here because the input is outside the range the game recognizes
+    // — we substitute our resolution.
+    {
+        int32_t synth = recomp_resolve_synthetic_fragment(input);
+        if (synth != 0) {
+            return (uint32_t)synth;
+        }
+    }
+
+    // Bounded scope: only the known-ambiguous 0x8FF00000 bucket (the
+    // pattern-bucket family). Other inputs use the game's native answer
+    // untouched — single-variant fragments need no disambiguation.
+    if ((input & 0xFFF00000u) != 0x8FF00000u) return game_result;
+    if (input < 0x81000000u || input >= 0x90000000u) return game_result;
+
+    // Step 2: trust the game's answer when it lands inside a registered
+    // variant of this bucket. Steady-state walks where gFragments[id]
+    // happens to point to the correct variant.
+    if (recomp_addr_in_loaded_variant(input & 0xFFF00000u, game_result)) {
+        return game_result;
+    }
+
+    // Step 3: data-context resolution. The walker's current data
+    // pointer lives in exactly one variant's RDRAM buffer — resolve
+    // against that variant.
+    int32_t resolved = recomp_resolve_via_data_context(input, data_ctx_addr);
+    if (resolved != 0) return (uint32_t)resolved;
+
+    // Step 4: fall back to the game's answer. Deliberately do NOT pick
+    // a variant by heuristic — the underlying issue would be a missing
+    // variant load in the game-state orchestration, and a heuristic
+    // pick would silently mask it. The lookup-miss in callers IS the
+    // diagnostic.
+    return game_result;
+}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     std::shared_lock<std::shared_mutex> lock(func_map_mutex);
     auto func_find = func_map.find(addr);

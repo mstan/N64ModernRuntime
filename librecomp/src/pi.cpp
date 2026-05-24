@@ -390,9 +390,14 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             // Register any recompiled code sections that fall within
             // this DMA range into func_map.
             uint32_t rom_offset = physical_addr - recomp::rom_base;
-            fprintf(stderr, "[pi] load_overlays(rom=0x%08X, ram=0x%08X, size=0x%X)\n",
-                rom_offset, (uint32_t)(int32_t)rdram_address, size);
-            fflush(stderr);
+            // Per-DMA trace is opt-in via N64MR_PI_DEBUG; without it
+            // this fires for every overlay load and floods stderr.
+            static const bool s_pi_debug = getenv("N64MR_PI_DEBUG") != nullptr;
+            if (s_pi_debug) {
+                fprintf(stderr, "[pi] load_overlays(rom=0x%08X, ram=0x%08X, size=0x%X)\n",
+                    rom_offset, (uint32_t)(int32_t)rdram_address, size);
+                fflush(stderr);
+            }
             load_overlays(rom_offset, (int32_t)rdram_address, size);
             // Stadium-style fragment trampoline scan — registers
             // synthetic func_map entries for the textbin J/nop slots
@@ -401,7 +406,9 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             // "FRAGMENT" magic (Zelda + most other games).
             recomp::overlays::scan_loaded_fragment_trampolines(rdram,
                 rom_offset, (int32_t)rdram_address, size);
-            fprintf(stderr, "[pi] load_overlays done\n"); fflush(stderr);
+            if (s_pi_debug) {
+                fprintf(stderr, "[pi] load_overlays done\n"); fflush(stderr);
+            }
 
             // Send a message to the mq to indicate that the transfer completed
             osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);

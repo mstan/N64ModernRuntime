@@ -8,6 +8,7 @@
 #include "blockingconcurrentqueue.h"
 
 #include "ultramodern/threads.hpp"
+#include "ultramodern/scheduler_tick.hpp"
 
 // Native APIs only used to set thread names for easier debugging
 #ifdef _WIN32
@@ -153,6 +154,10 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
         osDestroyThread(PASS_RDRAM NULLPTR);
     }
+    // Stamp the "last context switch into a game thread" timestamp.
+    // The scheduler_tick monitor compares now() against this to decide
+    // whether the currently-running game thread is hogging the CPU.
+    ultramodern::record_context_switch();
 }
 
 void resume_thread(OSThread* t) {

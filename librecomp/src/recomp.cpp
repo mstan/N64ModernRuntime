@@ -33,6 +33,7 @@
 #include "librecomp/game.hpp"
 #include "xxHash/xxh3.h"
 #include "ultramodern/ultramodern.hpp"
+#include "ultramodern/scheduler_tick.hpp"
 #include "ultramodern/error_handling.hpp"
 #include "librecomp/addresses.hpp"
 #include "librecomp/mods.hpp"
@@ -851,6 +852,7 @@ void recomp::start(
     ultramodern::join_event_threads();
     ultramodern::join_thread_cleaner_thread();
     ultramodern::join_saving_thread();
+    ultramodern::join_scheduler_tick();
     
     // Free rdram.
     bool free_failed;

@@ -21,6 +21,7 @@
 #include <ultramodern/ultramodern.hpp>
 #include "recomp.h"
 #include "librecomp/ultra_trace.hpp"
+#include "librecomp/audio_uaf_protect.hpp"
 
 // External counters from debug_server (frame, send_dl) so we can
 // timestamp each task submission with the runner's view of progress.
@@ -119,6 +120,17 @@ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
     OSTask* task = TO_PTR(OSTask, ctx->r4);
     sp_task_log::record(task, uint32_t(ctx->r4), uint32_t(ctx->r31));
+
+    // Always-on voice-event ring (music-rate click investigation):
+    // sample the libnaudio voice list once per audio frame, on the
+    // M_AUDTASK submit, and diff for key-on / key-off / sample-change.
+    // Self-gates on PSR_DISABLE_VOICE_RING and on layout registration.
+    // M_AUDTASK == 2 (libultra rsp task type).
+    if (task && task->t.type == 2) {
+        // data_ptr/data_size = the Acmd command list for this audio frame.
+        librecomp_audio_voice_ring_sample(rdram, task->t.data_ptr,
+                                          task->t.data_size);
+    }
     // For debugging
     if (dump_frame) {
         char addr_str[32];

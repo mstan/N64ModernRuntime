@@ -86,6 +86,15 @@ namespace recomp {
         // ram_addr.
         void register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr);
 
+        // Symmetric counterpart to register_runtime_fragment, called from
+        // a Memmap_ClearFragmentMemmap hook. Releases the section last
+        // registered for this fragment id and resets its
+        // section_addresses[] entry to the link-time literal, so
+        // reloc-driven RELOC_HI16/LO16 stop resolving to the stale
+        // runtime base once the fragment is no longer resident (matching
+        // Memmap_GetFragmentVaddr's NULL-fallback behaviour).
+        void unregister_runtime_fragment(uint32_t id);
+
         struct BasePatchedFunction {
             size_t patch_section;
             size_t function_index;

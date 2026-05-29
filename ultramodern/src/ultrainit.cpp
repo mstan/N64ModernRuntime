@@ -1,5 +1,6 @@
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
+#include "ultramodern/scheduler_tick.hpp"
 
 void ultramodern::set_callbacks(
     const rsp::callbacks_t& rsp_callbacks,
@@ -27,6 +28,7 @@ void ultramodern::preinit(RDRAM_ARG ultramodern::renderer::WindowHandle window_h
     ultramodern::init_timers(PASS_RDRAM1);
     ultramodern::init_audio();
     ultramodern::init_thread_cleanup();
+    ultramodern::init_scheduler_tick(PASS_RDRAM1);
 }
 
 extern "C" void osInitialize() {

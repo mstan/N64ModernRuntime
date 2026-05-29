@@ -57,6 +57,7 @@ namespace ultramodern {
         };
 
         void set_callbacks(const callbacks_t& callbacks);
+        connected_device_info_t get_connected_device_info(int controller_num);
     }
 }
 

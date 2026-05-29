@@ -77,14 +77,21 @@ extern "C" void osPfsRepairId_recomp(uint8_t * rdram, recomp_context * ctx) {
 extern "C" void osPfsIsPlug_recomp(uint8_t * rdram, recomp_context * ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
     // s32 osPfsIsPlug(OSMesgQueue* mq, u8* pattern_out)
-    // Reports which controller ports have a memory pak attached, as a
-    // bitmap in *pattern_out. With no controller paks emulated, every
-    // port reports "no pak" (pattern = 0). Return 0 for success, which
-    // is what libultra reports when the SI poll completed cleanly even
-    // though no paks were detected.
-    u8* pattern_out = _arg<1, u8*>(rdram, ctx);
-    if (pattern_out != nullptr) {
-        *pattern_out = 0;
+    // Reports which controller ports have an accessory attached, as a
+    // bitmap in *pattern_out. Controller and Transfer Paks share this
+    // libultra presence scan; the project callback identifies the pak
+    // type before raw accessory I/O handles the device protocol.
+    PTR(u8) pattern_out = _arg<1, PTR(u8)>(rdram, ctx);
+    if (pattern_out != NULLPTR) {
+        u8 pattern = 0;
+        for (int controller = 0; controller < 4; controller++) {
+            const ultramodern::input::connected_device_info_t device_info =
+                ultramodern::input::get_connected_device_info(controller);
+            if (device_info.connected_pak != ultramodern::input::Pak::None) {
+                pattern |= static_cast<u8>(1 << controller);
+            }
+        }
+        MEM_B(0, pattern_out) = pattern;
     }
     _return<s32>(ctx, 0);
 }

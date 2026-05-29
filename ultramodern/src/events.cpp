@@ -285,6 +285,39 @@ static std::atomic<uint64_t> g_dp_complete_count{0};
 extern "C" uint64_t ultramodern_sp_complete_count(void) { return g_sp_complete_count.load(); }
 extern "C" uint64_t ultramodern_dp_complete_count(void) { return g_dp_complete_count.load(); }
 
+// Gfx-DL in-flight tracker. Stamped before/after the BLOCKING call to
+// renderer_context->send_dl() in the gfx event thread. If a DL hangs
+// inside the renderer (RT64's processDisplayLists), g_current_dl_entry_seq
+// > g_current_dl_exit_seq, and the stamped data_ptr/data_size identify
+// exactly which DL is stuck — without needing to scrape the SP task ring
+// (which can be overwhelmed by audio task submissions during a long hang).
+//
+// All atomics for lock-free read from the debug-server thread. data_ptr
+// and data_size are stamped under the gfx-thread-only invariant that
+// only ONE send_dl runs at a time, so there is no torn-read concern.
+static std::atomic<uint64_t> g_current_dl_entry_seq{0};
+static std::atomic<uint64_t> g_current_dl_exit_seq{0};
+static std::atomic<uint64_t> g_current_dl_entry_ms{0};
+static std::atomic<uint64_t> g_current_dl_exit_ms{0};
+static std::atomic<uint32_t> g_current_dl_data_ptr{0};
+static std::atomic<uint32_t> g_current_dl_data_size{0};
+static std::atomic<uint32_t> g_current_dl_ucode_ptr{0};
+
+extern "C" void ultramodern_get_current_dl_state(
+    uint64_t* entry_seq, uint64_t* exit_seq,
+    uint64_t* entry_ms,  uint64_t* exit_ms,
+    uint32_t* data_ptr,  uint32_t* data_size,
+    uint32_t* ucode_ptr)
+{
+    if (entry_seq) *entry_seq = g_current_dl_entry_seq.load();
+    if (exit_seq)  *exit_seq  = g_current_dl_exit_seq.load();
+    if (entry_ms)  *entry_ms  = g_current_dl_entry_ms.load();
+    if (exit_ms)   *exit_ms   = g_current_dl_exit_ms.load();
+    if (data_ptr)  *data_ptr  = g_current_dl_data_ptr.load();
+    if (data_size) *data_size = g_current_dl_data_size.load();
+    if (ucode_ptr) *ucode_ptr = g_current_dl_ucode_ptr.load();
+}
+
 void sp_complete() {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
@@ -404,7 +437,35 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 ultramodern::measure_input_latency();
 
                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+                // Stamp the in-flight DL tracker before entering the
+                // BLOCKING send_dl. If RT64 hangs inside, debug-server's
+                // current_dl cmd can read these atomics to identify the
+                // exact DL that's stuck (data_ptr + data_size locate the
+                // raw bytes in rdram for offline analysis).
+                {
+                    using namespace std::chrono;
+                    uint64_t ms = duration_cast<milliseconds>(
+                        steady_clock::now().time_since_epoch()).count();
+                    g_current_dl_entry_ms.store(ms, std::memory_order_relaxed);
+                    g_current_dl_data_ptr.store(
+                        (uint32_t)(uintptr_t)task_action->task.t.data_ptr,
+                        std::memory_order_relaxed);
+                    g_current_dl_data_size.store(
+                        task_action->task.t.data_size,
+                        std::memory_order_relaxed);
+                    g_current_dl_ucode_ptr.store(
+                        (uint32_t)(uintptr_t)task_action->task.t.ucode,
+                        std::memory_order_relaxed);
+                    g_current_dl_entry_seq.fetch_add(1, std::memory_order_release);
+                }
                 renderer_context->send_dl(&task_action->task);
+                {
+                    using namespace std::chrono;
+                    uint64_t ms = duration_cast<milliseconds>(
+                        steady_clock::now().time_since_epoch()).count();
+                    g_current_dl_exit_ms.store(ms, std::memory_order_relaxed);
+                    g_current_dl_exit_seq.fetch_add(1, std::memory_order_release);
+                }
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
                 dp_complete();
                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));

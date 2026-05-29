@@ -20,6 +20,42 @@
 
 #define VI_NTSC_CLOCK 48681812
 
+// ── AI_LEN_REG emulation (audio pacing back-pressure) ───────────────
+// The N64 Audio Interface length register (kseg1 0xA4500004) reports how
+// many bytes are still queued for playback. libultra audio managers read
+// it directly via HW_REG(AI_LEN_REG) to pace generation: when it shows
+// the AI buffer is full they emit a SHORTER audio frame; when it's low,
+// a full frame. That feedback loop is what keeps the game producing
+// audio at exactly the playback rate on hardware.
+//
+// This runtime maps the MMIO region to zero-initialized pages (see
+// librecomp/addresses.hpp), so absent emulation AI_LEN_REG always reads
+// 0. The game then believes the AI buffer is perpetually empty, ALWAYS
+// generates full frames, and over-produces audio relative to real-time
+// output. Downstream that manifested as the music-rate periodic click:
+// the host SDL queue creeps up and main.cpp's queue_samples() decimation
+// valve drops samples mid-chunk to drain the overflow — a discontinuity
+// (click) at every drop, ~4/s.
+//
+// Fix: publish the live remaining-byte count into the register after each
+// buffer submission so the game's own hardware-designed feedback loop
+// works. The queue then self-stabilizes at a low, bounded depth and no
+// samples are ever dropped. This is generic across every libultra audio
+// game, not Stadium-specific.
+//
+// Address note: kseg1 0xA4500004 sign-extends to the 64-bit gpr
+// 0xFFFFFFFFA4500004; MEM_W reduces that to the same host offset
+// (0x24500004 within the mapped region) that the recompiled HW_REG read
+// resolves to, so the write and the read alias the same byte.
+static constexpr uint64_t AI_LEN_REG_ADDR = 0xFFFFFFFFA4500004ull;
+
+static inline void publish_ai_len(uint8_t* rdram) {
+    // get_remaining_audio_bytes() returns the queued byte count already
+    // lag-adjusted (it subtracts a fractional refresh); the game does
+    // HW_REG(AI_LEN_REG) >> 2 to recover stereo frames.
+    MEM_W(0, AI_LEN_REG_ADDR) = (int32_t)ultramodern::get_remaining_audio_bytes();
+}
+
 extern "C" void osAiSetFrequency_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
     uint32_t freq = ctx->r4;
@@ -33,11 +69,17 @@ extern "C" void osAiSetFrequency_recomp(uint8_t* rdram, recomp_context* ctx) {
 extern "C" void osAiSetNextBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
     ultramodern::queue_audio_buffer(rdram, ctx->r4, ctx->r5);
+    // Refresh AI_LEN_REG so the next audio-frame's HW_REG read sees the
+    // real remaining-byte count and paces generation accordingly.
+    publish_ai_len(rdram);
     ctx->r2 = 0;
 }
 
 extern "C" void osAiGetLength_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
+    // Keep the register consistent for games that mix the API and the
+    // raw register read.
+    publish_ai_len(rdram);
     ctx->r2 = ultramodern::get_remaining_audio_bytes();
 }
 

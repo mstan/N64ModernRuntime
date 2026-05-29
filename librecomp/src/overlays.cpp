@@ -75,6 +75,12 @@ struct LoadedSection {
 static std::unordered_map<uint32_t, uint16_t> code_sections_by_rom{};
 static std::unordered_map<uint32_t, uint16_t> patch_code_sections_by_rom{};
 static std::vector<LoadedSection> loaded_sections{};
+// Stadium fragment id -> section_table index, recorded by
+// register_runtime_fragment so the symmetric unregister (driven by the
+// game's Memmap_ClearFragmentMemmap) can find the section to release and
+// reset its section_addresses[] entry. Mirrors gFragments[]: one slot
+// per id. See unregister_runtime_fragment.
+static std::unordered_map<uint32_t, size_t> runtime_fragment_id_to_section{};
 static std::unordered_map<int32_t, recomp_func_t*> func_map{};
 // Single-writer / multi-reader lock for func_map. get_function() runs
 // on every recompiled-function indirect call (audio thread, gfx thread,
@@ -1047,6 +1053,16 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                 func_map.erase(link_slot);
             }
         }
+        // Reset the evicted section's address-table entry back to its
+        // link-time vram. The section is no longer resident at this
+        // runtime slot (the new fragment is taking it over), so any
+        // reloc-driven RELOC_HI16/LO16 referencing it must fall back to
+        // the fragment-space literal — matching Memmap_GetFragmentVaddr.
+        // Without this the stale runtime base corrupts fragment-id math
+        // (((addr & 0x0FF00000) >> 20) - 0x10) for the evicted fragment.
+        if (section_addresses != nullptr) {
+            section_addresses[old_section.index] = old_section.ram_addr;
+        }
         // Remove from loaded_sections so subsequent registrations
         // don't see this entry as a "ghost" still occupying the
         // runtime address. Without this, a re-register would attempt
@@ -1126,6 +1142,11 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     } else {
         find_existing->loaded_ram_addr = fragment_ptr;
     }
+    // Remember which section this id mapped to so the game's
+    // Memmap_ClearFragmentMemmap(id) can release exactly this section
+    // (resetting section_addresses[] back to the link literal). One slot
+    // per id, mirroring gFragments[].
+    runtime_fragment_id_to_section[id] = found_index;
     record_load_order(found_index);
 
     // Run the textbin trampoline scanner on the fragment, same as the
@@ -1346,6 +1367,62 @@ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
         }
         ++it;
     }
+}
+
+// Symmetric counterpart to register_runtime_fragment, driven by the
+// game's Memmap_ClearFragmentMemmap(id). Once the game clears
+// gFragments[id], the fragment is no longer resident, so its code
+// section must stop claiming a runtime address. unload_overlay_by_
+// section_index resets section_addresses[section.index] back to the
+// section's link-time ram_addr, which makes reloc-driven RELOC_HI16/
+// LO16 fall back to the fragment-space literal (e.g. 0x8D000000) —
+// exactly what Memmap_GetFragmentVaddr does when gFragments[id].vaddr
+// is NULL.
+//
+// Without this, section_addresses[] kept the stale runtime base of the
+// last load. Fragment code that extracts a fragment id from such an
+// address with ((addr & 0x0FF00000) >> 20) - 0x10 then computed a wrong
+// (often negative) id; passed to func_80004454 -> Memmap_RelocateFragment
+// -> Memmap_SetFragmentMap it indexed gFragments[] out of bounds and
+// clobbered gSegments[] (the menu cursor/icon "sparkle" corruption).
+void recomp::overlays::unregister_runtime_fragment(uint32_t id) {
+    FuncMapWriteLock _fml;
+    auto it = runtime_fragment_id_to_section.find(id);
+    if (it == runtime_fragment_id_to_section.end()) {
+        return;
+    }
+    // Reset section_addresses + drop func_map/loaded_sections entries for
+    // this section. Idempotent: a second clear with no intervening
+    // register finds nothing in loaded_sections but re-asserts the link
+    // literal, which is harmless. The id->section entry is intentionally
+    // retained as "last section for this id" (re-register overwrites it).
+    unload_overlay_by_section_index((uint32_t)it->second);
+}
+
+extern "C" void recomp_unregister_runtime_fragment(uint32_t id) {
+    recomp::overlays::unregister_runtime_fragment(id);
+}
+
+// Verification probe: for a Stadium fragment id, report the section it
+// last registered to, that section's current section_addresses[] value,
+// and its link-time ram_addr. Returns 0 if the id was never registered
+// (or has been released). Used by the debug server to confirm
+// section_addresses falls back to the link literal after a clear.
+extern "C" int recomp_debug_runtime_fragment(uint32_t id,
+                                             uint32_t* out_section_index,
+                                             int32_t* out_section_addr,
+                                             int32_t* out_link_addr) {
+    auto it = runtime_fragment_id_to_section.find(id);
+    if (it == runtime_fragment_id_to_section.end()) {
+        return 0;
+    }
+    size_t found_index = it->second;
+    const SectionTableEntry& section = sections_info.code_sections[found_index];
+    if (out_section_index) *out_section_index = (uint32_t)section.index;
+    if (out_section_addr)  *out_section_addr  =
+        (section_addresses != nullptr) ? section_addresses[section.index] : 0;
+    if (out_link_addr)     *out_link_addr     = (int32_t)section.ram_addr;
+    return 1;
 }
 
 void recomp::overlays::init_overlays() {
@@ -1966,6 +2043,107 @@ extern "C" int32_t recomp_resolve_via_data_context(
         return ls.loaded_ram_addr + int32_t(offset);
     }
     return 0;
+}
+
+// ── Fragment-vaddr resolution helpers ─────────────────────────────
+//
+// Games that ship variant-aware fragments (Pokemon Stadium pattern-bucket
+// fragments at the 0x8FF00000 link-vram, etc.) need a runtime resolver
+// to disambiguate a single game-side fragment id between multiple
+// concurrently-loaded variants. The original game maintained an implicit
+// invariant: while walking variant X's data, gFragments[X.id] points to
+// X's buffer, and embedded link-vaddr literals resolve against X. In the
+// recompiler, multiple variants are host-resident concurrently, so the
+// single-pointer-per-id model becomes ambiguous.
+//
+// The three helpers above (recomp_addr_in_loaded_variant,
+// recomp_resolve_synthetic_fragment, recomp_resolve_via_data_context)
+// each handle one piece of that disambiguation. recomp_resolve_fragment_vaddr
+// below orchestrates them in priority order so a game-side hook on the
+// fragment-vaddr-resolver function is a one-liner.
+//
+// Pairs with librecomp_fragment_input_push / _pop for the typical
+// entry-hook-saves-input / exit-hook-uses-input pattern. The TLS stack
+// handles recursive calls.
+
+namespace {
+    constexpr int kFragmentInputStackDepth = 16;
+    thread_local uint32_t s_fragment_input_stack[kFragmentInputStackDepth];
+    thread_local int      s_fragment_input_sp = 0;
+}
+
+extern "C" void librecomp_fragment_input_push(uint32_t input) {
+    if (s_fragment_input_sp < kFragmentInputStackDepth) {
+        s_fragment_input_stack[s_fragment_input_sp] = input;
+    }
+    s_fragment_input_sp++;
+}
+
+extern "C" uint32_t librecomp_fragment_input_pop(void) {
+    s_fragment_input_sp--;
+    int idx = (s_fragment_input_sp >= 0 && s_fragment_input_sp < kFragmentInputStackDepth)
+        ? s_fragment_input_sp : 0;
+    return s_fragment_input_stack[idx];
+}
+
+// Unified fragment-vaddr resolver. Pops the matching push_input from
+// the TLS stack, runs the 3-step orchestration, returns the resolved
+// vaddr (or game_result if no override applies).
+//
+// Game-side hook usage (toml):
+//   [[patches.hook]]              # entry
+//   func = "<game's resolver>"
+//   before_vram = <entry>
+//   text = "librecomp_fragment_input_push((uint32_t)ctx->r4);"
+//
+//   [[patches.hook]]              # exit
+//   func = "<game's resolver>"
+//   before_vram = <exit>
+//   text = "ctx->r4 = librecomp_fragment_resolve_exit(
+//             (uint32_t)ctx->r4, (uint32_t)MEM_W(0, <walker_state_vaddr>));"
+extern "C" uint32_t librecomp_fragment_resolve_exit(
+    uint32_t game_result, uint32_t data_ctx_addr)
+{
+    const uint32_t input = librecomp_fragment_input_pop();
+
+    // Step 1: synthetic-fragment pool (highest priority). For inputs in
+    // the per-variant synthetic-vram range, resolve via the parallel
+    // recomp_synthetic_fragments[] table, bypassing the game's native
+    // gFragments[id]. The native game path returned the input unchanged
+    // here because the input is outside the range the game recognizes
+    // — we substitute our resolution.
+    {
+        int32_t synth = recomp_resolve_synthetic_fragment(input);
+        if (synth != 0) {
+            return (uint32_t)synth;
+        }
+    }
+
+    // Bounded scope: only the known-ambiguous 0x8FF00000 bucket (the
+    // pattern-bucket family). Other inputs use the game's native answer
+    // untouched — single-variant fragments need no disambiguation.
+    if ((input & 0xFFF00000u) != 0x8FF00000u) return game_result;
+    if (input < 0x81000000u || input >= 0x90000000u) return game_result;
+
+    // Step 2: trust the game's answer when it lands inside a registered
+    // variant of this bucket. Steady-state walks where gFragments[id]
+    // happens to point to the correct variant.
+    if (recomp_addr_in_loaded_variant(input & 0xFFF00000u, game_result)) {
+        return game_result;
+    }
+
+    // Step 3: data-context resolution. The walker's current data
+    // pointer lives in exactly one variant's RDRAM buffer — resolve
+    // against that variant.
+    int32_t resolved = recomp_resolve_via_data_context(input, data_ctx_addr);
+    if (resolved != 0) return (uint32_t)resolved;
+
+    // Step 4: fall back to the game's answer. Deliberately do NOT pick
+    // a variant by heuristic — the underlying issue would be a missing
+    // variant load in the game-state orchestration, and a heuristic
+    // pick would silently mask it. The lookup-miss in callers IS the
+    // diagnostic.
+    return game_result;
 }
 
 extern "C" recomp_func_t * get_function(int32_t addr) {

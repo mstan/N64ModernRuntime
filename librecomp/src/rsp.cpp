@@ -11,13 +11,18 @@
 //   - Always-on watchdog + PC trail at every label (paired with
 //     RSPRecomp emit).
 //   - Framework-level libultra ring + boot-sequence fixes.
+//   - CPU-visible SP_STATUS mirror for HLE/recompiled RSP task completion.
+//   - Honor OSTask::ucode_data_size up to the DMEM task block.
+//   - Optional RSP DMA trace ring for ucode bring-up.
 //
 // Copyright (c) 2026 Matthew Stanley
 //
 // ---------------------------------------------------------------------
 
 #include <atomic>
+#include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <string>
@@ -37,6 +42,70 @@
 // values, which is exactly what get_last_pc_trail callers want.
 namespace {
 std::atomic<RspContext*> g_last_rsp_context{nullptr};
+constexpr uint64_t kSpStatusAddr = 0xFFFFFFFFA4040010ull;
+constexpr uint32_t kSpStatusSignal3 = 1u << 10;
+std::atomic<uint32_t> g_sp_status{0};
+std::atomic<uint32_t> g_sp_status_preempt_skip_budget{0};
+
+struct RspDmaTraceEvent {
+    uint64_t seq;
+    uint32_t write;
+    uint32_t dmem_addr;
+    uint32_t dram_addr;
+    uint32_t byte_count;
+    uint32_t nonzero_bytes;
+    int32_t first_nonzero;
+    uint8_t first16[16];
+};
+
+constexpr uint32_t kRspDmaTraceCap = 4096;
+RspDmaTraceEvent g_rsp_dma_trace[kRspDmaTraceCap]{};
+std::atomic<uint64_t> g_rsp_dma_trace_seq{0};
+
+bool rsp_dma_trace_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("PSR_RSP_DMA_TRACE");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+void publish_sp_status(uint8_t* rdram) {
+    if (rdram == nullptr) {
+        return;
+    }
+
+    MEM_W(0, kSpStatusAddr) = (int32_t)g_sp_status.load(std::memory_order_relaxed);
+}
+
+uint32_t apply_sp_status_write(uint32_t status, uint32_t value) {
+    auto apply_pair = [&](uint32_t clear_bit, uint32_t set_bit, uint32_t read_bit) {
+        bool clear = (value & clear_bit) != 0;
+        bool set = (value & set_bit) != 0;
+        if (clear == set) {
+            return;
+        }
+
+        if (set) {
+            status |= read_bit;
+        } else {
+            status &= ~read_bit;
+        }
+    };
+
+    apply_pair(1u << 0, 1u << 1, 1u << 0); // halt
+    if (value & (1u << 2)) {
+        status &= ~(1u << 1); // broke
+    }
+    apply_pair(1u << 5, 1u << 6, 1u << 5); // single-step
+    apply_pair(1u << 7, 1u << 8, 1u << 6); // interrupt-on-break
+
+    for (uint32_t i = 0; i < 8; i++) {
+        apply_pair(1u << (9 + i * 2), 1u << (10 + i * 2), 1u << (7 + i));
+    }
+
+    return status;
+}
 }
 
 static recomp::rsp::callbacks_t rsp_callbacks {};
@@ -114,9 +183,112 @@ void recomp::rsp::dma_rdram_to_dmem_external(uint8_t* rdram,
     dma_rdram_to_dmem(rdram, dmem_addr, dram_addr, rd_len);
 }
 
+void recomp::rsp::write_sp_status(uint8_t* rdram, uint32_t value) {
+    uint32_t old_status = g_sp_status.load(std::memory_order_relaxed);
+    uint32_t new_status = 0;
+    do {
+        new_status = apply_sp_status_write(old_status, value);
+    } while (!g_sp_status.compare_exchange_weak(
+        old_status, new_status,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed));
+
+    publish_sp_status(rdram);
+}
+
+void recomp::rsp::mark_sp_task_complete(uint8_t* rdram, uint32_t task_type) {
+    if (task_type == M_GFXTASK) {
+        g_sp_status.fetch_or(kSpStatusSignal3, std::memory_order_relaxed);
+        g_sp_status_preempt_skip_budget.store(2, std::memory_order_relaxed);
+    }
+
+    publish_sp_status(rdram);
+}
+
+extern "C" void recomp_rsp_mark_sp_task_complete(uint8_t* rdram, uint32_t task_type) {
+    recomp::rsp::mark_sp_task_complete(rdram, task_type);
+}
+
+extern "C" uint32_t recomp_rsp_get_sp_status(void) {
+    return g_sp_status.load(std::memory_order_relaxed);
+}
+
+extern "C" uint32_t recomp_rsp_consume_preempt_skip_budget(void) {
+    uint32_t old_budget = g_sp_status_preempt_skip_budget.load(std::memory_order_relaxed);
+    while (old_budget != 0) {
+        if (g_sp_status_preempt_skip_budget.compare_exchange_weak(
+            old_budget, old_budget - 1,
+            std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 uint8_t dmem[0x1000];
 uint16_t rspReciprocals[512];
 uint16_t rspInverseSquareRoots[512];
+
+void recomp::rsp::trace_dma(bool write, uint32_t dmem_addr, uint32_t dram_addr,
+                            uint32_t byte_count) {
+    if (!rsp_dma_trace_enabled()) {
+        return;
+    }
+
+    uint64_t seq = g_rsp_dma_trace_seq.fetch_add(1, std::memory_order_relaxed);
+    RspDmaTraceEvent& ev = g_rsp_dma_trace[seq % kRspDmaTraceCap];
+    ev.seq = seq;
+    ev.write = write ? 1u : 0u;
+    ev.dmem_addr = dmem_addr;
+    ev.dram_addr = dram_addr;
+    ev.byte_count = byte_count;
+    ev.nonzero_bytes = 0;
+    ev.first_nonzero = -1;
+    std::memset(ev.first16, 0, sizeof(ev.first16));
+
+    const uint32_t capped = std::min<uint32_t>(byte_count, 0x1000 - (dmem_addr & 0xFFF));
+    for (uint32_t i = 0; i < capped; i++) {
+        uint8_t b = RSP_MEM_BU(i, dmem_addr);
+        if (i < sizeof(ev.first16)) {
+            ev.first16[i] = b;
+        }
+        if (b != 0) {
+            ev.nonzero_bytes++;
+            if (ev.first_nonzero < 0) {
+                ev.first_nonzero = (int32_t)i;
+            }
+        }
+    }
+}
+
+extern "C" void recomp_rsp_dma_recent_copy(RspDmaTraceEvent* out,
+                                           uint32_t out_cap,
+                                           uint32_t* out_count,
+                                           uint64_t* out_write_index) {
+    if (out_count != nullptr) {
+        *out_count = 0;
+    }
+    uint64_t write_index = g_rsp_dma_trace_seq.load(std::memory_order_acquire);
+    if (out_write_index != nullptr) {
+        *out_write_index = write_index;
+    }
+    if (out == nullptr || out_cap == 0 || !rsp_dma_trace_enabled()) {
+        return;
+    }
+
+    uint32_t count = (uint32_t)std::min<uint64_t>(write_index, kRspDmaTraceCap);
+    if (count > out_cap) {
+        count = out_cap;
+    }
+    uint64_t start = write_index - count;
+    for (uint32_t i = 0; i < count; i++) {
+        out[i] = g_rsp_dma_trace[(start + i) % kRspDmaTraceCap];
+    }
+    if (out_count != nullptr) {
+        *out_count = count;
+    }
+}
 
 // From Ares emulator. For license details, see rsp_vu.h
 void recomp::rsp::constants_init() {
@@ -139,18 +311,31 @@ void recomp::rsp::constants_init() {
 // Runs a recompiled RSP microcode
 bool recomp::rsp::run_task(uint8_t* rdram, const OSTask* task) {
     assert(rsp_callbacks.get_rsp_microcode != nullptr);
-    RspUcodeFunc* ucode_func = rsp_callbacks.get_rsp_microcode(task);
+    RspUcodeFunc* ucode_func = rsp_callbacks.get_rsp_microcode(rdram, task);
 
     if (ucode_func == nullptr) {
         fprintf(stderr, "No registered RSP ucode for %" PRIu32 " (returned `nullptr`)\n", task->t.type);
         return false;
     }
 
-    // Load the OSTask into DMEM
-    memcpy(&dmem[0xFC0], task, sizeof(OSTask));
+    // Load as much ucode data as the task advertises, without
+    // overwriting the OSTask block at DMEM[0xFC0..0xFFF]. Older tasks
+    // that leave the size unset keep the historical 0xF80-byte load.
+    constexpr uint32_t kTaskDmemOffset = 0xFC0;
+    uint32_t ucode_data_size = (uint32_t)task->t.ucode_data_size;
+    if (ucode_data_size == 0) {
+        ucode_data_size = 0xF80;
+    }
+    if (ucode_data_size > kTaskDmemOffset) {
+        ucode_data_size = kTaskDmemOffset;
+    }
+    if (ucode_data_size != 0) {
+        dma_rdram_to_dmem(rdram, 0x0000, task->t.ucode_data, ucode_data_size - 1);
+    }
 
-    // Load the ucode data into DMEM
-    dma_rdram_to_dmem(rdram, 0x0000, task->t.ucode_data, 0xF80 - 1);
+    // Load the OSTask into DMEM after ucode_data so task fields always
+    // win over any oversized ucode_data blob.
+    memcpy(&dmem[kTaskDmemOffset], task, sizeof(OSTask));
 
     // Record run_task entry into the libultra ring so probes can
     // attribute "RSP code went in, never came out" without needing
@@ -178,7 +363,7 @@ bool recomp::rsp::run_task(uint8_t* rdram, const OSTask* task) {
     // handlers offline and identify the culprit.
     {
         // M_AUDTASK = 2 (libultra OSTask::type for aspMain).
-        if (task->t.type == 2) {
+        if (task->t.type == 2 && task->t.ucode != 0 && task->t.data_size <= 0x10000) {
             static const uint16_t kExpectedTable[16] = {
                 0x10EC, 0x139C, 0x119C, 0x1A64, 0x11C8, 0x17EC, 0x1208, 0x0000,
                 0x0000, 0x127C, 0x1348, 0x1248, 0x1C84, 0x12D4, 0x02B0, 0x1384,

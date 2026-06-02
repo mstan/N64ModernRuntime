@@ -412,6 +412,36 @@ static uint32_t decode_jal_target(uint32_t instr, uint32_t pc_delay_slot) {
     return (pc_delay_slot & 0xF0000000) | (target_field << 2);
 }
 
+static bool func_entry_may_be_fragment_jump_slot(const FuncEntry& func) {
+    return func.offset >= 0x20 &&
+           (func.offset & 7u) == 0 &&
+           func.rom_size == 8;
+}
+
+static bool func_entry_is_live_fragment_jump_slot(
+    uint8_t* rdram,
+    const SectionTableEntry& section,
+    int32_t runtime_base,
+    const FuncEntry& func) {
+    if (!func_entry_may_be_fragment_jump_slot(func)) {
+        return false;
+    }
+
+    uint32_t instr = read_rdram_u32_be(rdram, runtime_base + (int32_t)func.offset);
+    uint32_t delay = read_rdram_u32_be(rdram, runtime_base + (int32_t)func.offset + 4);
+    if (delay != 0) {
+        return false;
+    }
+
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    if (opcode != 0x02) {
+        return false;
+    }
+
+    uint32_t target = decode_jal_target(instr, section.ram_addr + func.offset + 4);
+    return target != 0;
+}
+
 // Translate a link-time vram (assigned by the linker when the section
 // was built) to its current runtime RAM address. Returns 0 if no
 // loaded section covers the link-time address.
@@ -561,6 +591,9 @@ static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_ind
     // smallest non-zero offset in the FuncEntry list.
     uint32_t first_func_offset = section.size;
     for (size_t i = 0; i < section.num_funcs; i++) {
+        if (func_entry_is_live_fragment_jump_slot(rdram, section, runtime_base, section.funcs[i])) {
+            continue;
+        }
         uint32_t off = section.funcs[i].offset;
         if (off > 0 && off < first_func_offset) first_func_offset = off;
     }
@@ -1028,6 +1061,9 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         // the new section.
         uint32_t first_func_offset = old_section.size;
         for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
+            if (func_entry_may_be_fragment_jump_slot(old_section.funcs[fi])) {
+                continue;
+            }
             uint32_t off = old_section.funcs[fi].offset;
             if (off > 0 && off < first_func_offset) first_func_offset = off;
         }
@@ -1530,6 +1566,172 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
 // when the bogus pointer is actually invoked.
 static int32_t g_last_lookup_miss_addr = 0;
 
+static FILE* open_last_error_log(const char* mode) {
+    FILE* f = fopen("build/last_error.log", mode);
+    if (f == nullptr) {
+        f = fopen("F:/Projects/n64recomp/PokemonStadiumRecomp/build/last_error.log", mode);
+    }
+    return f;
+}
+
+static uint32_t rdram_offset_for_vaddr(uint32_t vaddr) {
+    return (uint32_t)(((uint64_t)vaddr - 0xFFFFFFFF80000000ull) & 0x3FFFFFFFull);
+}
+
+static uint32_t read_rdram_u32_macro_order(uint8_t* rdram, uint32_t vaddr) {
+    if (rdram == nullptr) {
+        return 0;
+    }
+
+    uint32_t value = 0;
+    memcpy(&value, rdram + rdram_offset_for_vaddr(vaddr), sizeof(value));
+    return value;
+}
+
+static uint32_t read_rdram_u32_xor_be_for_diag(uint8_t* rdram, uint32_t vaddr) {
+    if (rdram == nullptr) {
+        return 0;
+    }
+
+    uint32_t paddr = rdram_offset_for_vaddr(vaddr);
+    uint32_t value = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        value = (value << 8) | rdram[(paddr + i) ^ 3];
+    }
+    return value;
+}
+
+static void dump_lookup_addr_classification(FILE* f, uint32_t addr) {
+    if (f == nullptr || sections_info.code_sections == nullptr) {
+        return;
+    }
+
+    bool matched = false;
+    fprintf(f, "  address classification for 0x%08X:\n", addr);
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+        uint32_t runtime_base = (uint32_t)ls.loaded_ram_addr;
+        uint32_t link_base = (uint32_t)sec.ram_addr;
+        if (addr >= runtime_base && addr < runtime_base + sec.size) {
+            fprintf(f,
+                "    runtime code section index=%zu link=0x%08X runtime=0x%08X size=0x%X offset=0x%X load_order=%llu\n",
+                ls.section_table_index, link_base, runtime_base, sec.size,
+                addr - runtime_base,
+                (unsigned long long)get_load_order(ls.section_table_index));
+            matched = true;
+        }
+        if (addr >= link_base && addr < link_base + sec.size) {
+            fprintf(f,
+                "    link-time code section index=%zu link=0x%08X runtime=0x%08X size=0x%X offset=0x%X load_order=%llu\n",
+                ls.section_table_index, link_base, runtime_base, sec.size,
+                addr - link_base,
+                (unsigned long long)get_load_order(ls.section_table_index));
+            matched = true;
+        }
+    }
+    if (!matched) {
+        fprintf(f, "    no loaded code section contains this as runtime or link-time address\n");
+    }
+}
+
+static void dump_lookup_memory_window(FILE* f, uint8_t* rdram, const char* label, uint32_t center) {
+    if (f == nullptr || rdram == nullptr) {
+        return;
+    }
+
+    uint32_t start = (center - 0x20u) & ~3u;
+    fprintf(f, "  %s window around 0x%08X:\n", label, center);
+    for (uint32_t row = 0; row < 8; row++) {
+        uint32_t addr = start + row * 0x10u;
+        fprintf(f, "    %08X:", addr);
+        for (uint32_t col = 0; col < 4; col++) {
+            uint32_t cur = addr + col * 4u;
+            fprintf(f, " %08X/%08X",
+                read_rdram_u32_macro_order(rdram, cur),
+                read_rdram_u32_xor_be_for_diag(rdram, cur));
+        }
+        fprintf(f, "\n");
+    }
+    fprintf(f, "    values are macro-order/xor-be u32\n");
+}
+
+static void dump_lookup_context(FILE* f, uint8_t* rdram, recomp_context* ctx) {
+    if (f == nullptr || ctx == nullptr) {
+        return;
+    }
+
+    const uint64_t regs[32] = {
+        ctx->r0,  ctx->r1,  ctx->r2,  ctx->r3,
+        ctx->r4,  ctx->r5,  ctx->r6,  ctx->r7,
+        ctx->r8,  ctx->r9,  ctx->r10, ctx->r11,
+        ctx->r12, ctx->r13, ctx->r14, ctx->r15,
+        ctx->r16, ctx->r17, ctx->r18, ctx->r19,
+        ctx->r20, ctx->r21, ctx->r22, ctx->r23,
+        ctx->r24, ctx->r25, ctx->r26, ctx->r27,
+        ctx->r28, ctx->r29, ctx->r30, ctx->r31,
+    };
+    static const char* names[32] = {
+        "r0", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+        "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+    };
+
+    fprintf(f, "  ctx registers:\n");
+    for (uint32_t i = 0; i < 32; i += 4) {
+        fprintf(f,
+            "    %-2s=%016llX %-2s=%016llX %-2s=%016llX %-2s=%016llX\n",
+            names[i + 0], (unsigned long long)regs[i + 0],
+            names[i + 1], (unsigned long long)regs[i + 1],
+            names[i + 2], (unsigned long long)regs[i + 2],
+            names[i + 3], (unsigned long long)regs[i + 3]);
+    }
+    fprintf(f,
+        "    hi=%016llX lo=%016llX tail_pending=%u tail_target=0x%08X tail_func=%p\n",
+        (unsigned long long)ctx->hi,
+        (unsigned long long)ctx->lo,
+        ctx->tailcall_pending,
+        ctx->tailcall_target,
+        (void*)ctx->tailcall_func);
+
+    const uint32_t gp = (uint32_t)ctx->r28;
+    const uint32_t sp = (uint32_t)ctx->r29;
+    const uint32_t gb_dispatch_slot = gp + 0x53C8u;
+    fprintf(f,
+        "  diagnostic slots:\n"
+        "    gp+0x53C4 @ %08X = %08X/%08X\n"
+        "    gp+0x53C8 @ %08X = %08X/%08X\n"
+        "    gp+0x53CC @ %08X = %08X/%08X\n"
+        "    gp+0x55AC @ %08X = %08X/%08X\n"
+        "    sp+0x088 @ %08X = %08X/%08X\n"
+        "    sp+0x08C @ %08X = %08X/%08X\n"
+        "    sp+0x090 @ %08X = %08X/%08X\n",
+        gp + 0x53C4u, read_rdram_u32_macro_order(rdram, gp + 0x53C4u), read_rdram_u32_xor_be_for_diag(rdram, gp + 0x53C4u),
+        gb_dispatch_slot, read_rdram_u32_macro_order(rdram, gb_dispatch_slot), read_rdram_u32_xor_be_for_diag(rdram, gb_dispatch_slot),
+        gp + 0x53CCu, read_rdram_u32_macro_order(rdram, gp + 0x53CCu), read_rdram_u32_xor_be_for_diag(rdram, gp + 0x53CCu),
+        gp + 0x55ACu, read_rdram_u32_macro_order(rdram, gp + 0x55ACu), read_rdram_u32_xor_be_for_diag(rdram, gp + 0x55ACu),
+        sp + 0x88u, read_rdram_u32_macro_order(rdram, sp + 0x88u), read_rdram_u32_xor_be_for_diag(rdram, sp + 0x88u),
+        sp + 0x8Cu, read_rdram_u32_macro_order(rdram, sp + 0x8Cu), read_rdram_u32_xor_be_for_diag(rdram, sp + 0x8Cu),
+        sp + 0x90u, read_rdram_u32_macro_order(rdram, sp + 0x90u), read_rdram_u32_xor_be_for_diag(rdram, sp + 0x90u));
+    if (section_addresses != nullptr && sections_info.num_code_sections > 9) {
+        uint32_t section9_base = (uint32_t)section_addresses[9];
+        fprintf(f,
+            "    section[9] base=%08X target+0xA204=%08X target+0xA1CC=%08X\n",
+            section9_base,
+            section9_base + 0xA204u,
+            section9_base + 0xA1CCu);
+    }
+
+    dump_lookup_memory_window(f, rdram, "bad target", (uint32_t)g_last_lookup_miss_addr);
+    dump_lookup_memory_window(f, rdram, "sp", (uint32_t)ctx->r29);
+    dump_lookup_memory_window(f, rdram, "sp+0x8C", (uint32_t)ctx->r29 + 0x8Cu);
+    dump_lookup_memory_window(f, rdram, "gp", (uint32_t)ctx->r28);
+    dump_lookup_memory_window(f, rdram, "gp+0x53C8", gb_dispatch_slot);
+    dump_lookup_memory_window(f, rdram, "v1", (uint32_t)ctx->r3);
+    dump_lookup_memory_window(f, rdram, "a2", (uint32_t)ctx->r6);
+    dump_lookup_memory_window(f, rdram, "at", (uint32_t)ctx->r1);
+}
+
 // Trace-ring queries (defined in extras.c — game-side instrumentation).
 extern "C" {
     uint64_t pkmnstadium_trace_write_idx(void);
@@ -1542,17 +1744,22 @@ extern "C" {
     void psr_post_mortem_dump(const char* reason, void* fault_info);
 }
 
-static void unhandled_lookup_trampoline(uint8_t* /*rdram*/, recomp_context* /*ctx*/) {
+static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
     fprintf(stderr,
         "[recomp] lookup-miss trampoline reached — aborting\n"
         "  bad function pointer: 0x%08X\n",
         g_last_lookup_miss_addr);
-    FILE* f = fopen("F:/Projects/PokemonStadiumRecomp/build/last_error.log", "a");
+    FILE* f = open_last_error_log("a");
     if (f) {
         fprintf(f,
             "\n=== lookup-miss trampoline reached (post-call) ===\n"
             "  bad function pointer: 0x%08X\n",
             g_last_lookup_miss_addr);
+        {
+            std::shared_lock<std::shared_mutex> lock(func_map_mutex);
+            dump_lookup_addr_classification(f, (uint32_t)g_last_lookup_miss_addr);
+        }
+        dump_lookup_context(f, rdram, ctx);
 #ifdef _WIN32
         // Host stack backtrace — the immediate caller of the trampoline
         // is the recompiled function that invoked the bad pointer.
@@ -2150,9 +2357,10 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     std::shared_lock<std::shared_mutex> lock(func_map_mutex);
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
-        FILE* f = fopen("F:/Projects/PokemonStadiumRecomp/build/last_error.log", "a");
+        FILE* f = open_last_error_log("a");
         if (f) {
             fprintf(f, "\n=== get_function lookup miss: 0x%08X ===\n", addr);
+            dump_lookup_addr_classification(f, (uint32_t)addr);
             fclose(f);
         }
         fprintf(stderr, "[Warn] get_function lookup miss: 0x%08X — returning trampoline\n", addr);

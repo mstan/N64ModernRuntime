@@ -76,7 +76,11 @@ static void __osContGetInitData(u8* pattern, OSContStatus *data) {
             data[controller].status = device_info.connected_pak != ultramodern::input::Pak::None;
             data[controller].err_no = 0x00;
 
-            *pattern = 1 << controller;
+            // Accumulate, don't overwrite: each connected controller sets its
+            // own bit. Using '=' here clobbered every lower controller's bit,
+            // so with >1 controller only the highest-indexed port survived and
+            // controller 1 (bit 0) read as disconnected. (= -> |= fix.)
+            *pattern |= 1 << controller;
         }
         else {
             // Mark controller as not connected

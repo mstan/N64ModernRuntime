@@ -5,9 +5,12 @@
 // Modified 2026 by Matthew Stanley:
 //   - Auto-increment RSP DMA addresses after each transfer (matches
 //     real-N64 RSP-DMA HLE semantics).
+//   - Decode RSP DMA length/count/skip fields instead of treating the
+//     SP length register as a flat byte count.
 //   - get_last_pc_trail API for live RSP hang inspection.
 //   - Pre-task hook registry + DMA helper export.
 //   - Framework-level libultra-call ring + RSP watchdog hooks.
+//   - CPU-visible SP_STATUS mirror for HLE/recompiled RSP task completion.
 //
 // Copyright (c) 2026 Matthew Stanley
 //
@@ -70,6 +73,13 @@ extern uint8_t dmem[];
 extern uint16_t rspReciprocals[512];
 extern uint16_t rspInverseSquareRoots[512];
 
+namespace recomp {
+    namespace rsp {
+        void trace_dma(bool write, uint32_t dmem_addr, uint32_t dram_addr,
+                       uint32_t byte_count);
+    }
+}
+
 #define RSP_MEM_B(offset, addr) \
     (*reinterpret_cast<int8_t*>(dmem + (0xFFF & (((offset) + (addr)) ^ 3))))
 
@@ -123,55 +133,100 @@ static inline void RSP_MEM_H_STORE(uint32_t offset, uint32_t addr, uint32_t val)
 
 #define SET_DMA_MEM(mem_addr) dma_mem_address = (mem_addr)
 #define SET_DMA_DRAM(dram_addr) dma_dram_address = (dram_addr)
-// Real RSP DMA hardware auto-increments SP_MEM_ADDR and SP_DRAM_ADDR
-// by (length + 1) after each transfer. Tight loops like aspMain's
-// L_10EC <-> L_11B4 DMA pump (and any other ucode that fires DMAs in a
-// loop without re-writing SP_MEM_ADDR / SP_DRAM_ADDR each iteration)
-// rely on this to walk through the audio command stream chunk by
-// chunk. Without the increment the same DMEM region gets reloaded
+#define WRITE_SP_STATUS(val) ::recomp::rsp::write_sp_status(rdram, (uint32_t)(val))
 // forever — observed as Stadium's aspMain hanging in the dispatch
-// loop on a never-advancing command word. Verified against Ares'
-// rsp/dma.cpp (pbusAddress += 8 / dramAddress += 8 per 8-byte chunk).
+static inline uint32_t rsp_dma_block_len(uint32_t len_reg) {
+    return (len_reg & 0xFF8u) + 8u;
+}
+
+static inline uint32_t rsp_dma_count(uint32_t len_reg) {
+    return (len_reg >> 12) & 0xFFu;
+}
+
+static inline uint32_t rsp_dma_skip(uint32_t len_reg) {
+    return (len_reg >> 20) & 0xFF8u;
+}
+
+static inline uint32_t rsp_dma_pbus_increment(uint32_t len_reg) {
+    return (rsp_dma_count(len_reg) + 1u) * rsp_dma_block_len(len_reg);
+}
+
+static inline uint32_t rsp_dma_dram_increment(uint32_t len_reg) {
+    return rsp_dma_pbus_increment(len_reg) + (rsp_dma_count(len_reg) * rsp_dma_skip(len_reg));
+}
+
+// Real RSP DMA length registers encode an 8-byte aligned block length,
+// a repeat count, and a DRAM skip. Tight loops like aspMain's DMA pump
+// rely on SP_MEM_ADDR / SP_DRAM_ADDR auto-incrementing after the copy;
+// GB Tower's ucode additionally relies on count/skip row copies.
 #define DO_DMA_READ(rd_len) do { \
-    uint32_t _rsp_dma_inc = (uint32_t)(rd_len) + 1; \
+    uint32_t _rsp_dma_len_reg = (uint32_t)(rd_len); \
     dma_rdram_to_dmem(rdram, dma_mem_address, dma_dram_address, (rd_len)); \
-    dma_mem_address  += _rsp_dma_inc; \
-    dma_dram_address += _rsp_dma_inc; \
+    dma_mem_address  += rsp_dma_pbus_increment(_rsp_dma_len_reg); \
+    dma_dram_address += rsp_dma_dram_increment(_rsp_dma_len_reg); \
 } while (0)
 #define DO_DMA_WRITE(wr_len) do { \
-    uint32_t _rsp_dma_inc = (uint32_t)(wr_len) + 1; \
+    uint32_t _rsp_dma_len_reg = (uint32_t)(wr_len); \
     dma_dmem_to_rdram(rdram, dma_mem_address, dma_dram_address, (wr_len)); \
-    dma_mem_address  += _rsp_dma_inc; \
-    dma_dram_address += _rsp_dma_inc; \
+    dma_mem_address  += rsp_dma_pbus_increment(_rsp_dma_len_reg); \
+    dma_dram_address += rsp_dma_dram_increment(_rsp_dma_len_reg); \
 } while (0)
 
 static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t rd_len) {
-    rd_len += 1; // Read length is inclusive
-    dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + rd_len <= 0x1000);
-    for (uint32_t i = 0; i < rd_len; i++) {
-        RSP_MEM_B(i, dmem_addr) = MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
+    const uint32_t block_len = rsp_dma_block_len(rd_len);
+    const uint32_t count = rsp_dma_count(rd_len);
+    const uint32_t skip = rsp_dma_skip(rd_len);
+    uint32_t cur_dmem = dmem_addr & 0x0FF8u;
+    uint32_t cur_dram = dram_addr & 0xFFFFF8u;
+
+    assert(block_len <= 0x1000);
+    for (uint32_t block = 0; block <= count; block++) {
+        for (uint32_t i = 0; i < block_len; i++) {
+            RSP_MEM_B(i, cur_dmem) = MEM_B(0, (int64_t)(int32_t)(cur_dram + i + 0x80000000));
+        }
+        ::recomp::rsp::trace_dma(false, cur_dmem, cur_dram, block_len);
+
+        cur_dmem = (cur_dmem + block_len) & 0x0FFFu;
+        cur_dram = (cur_dram + block_len) & 0xFFFFF8u;
+        if (block != count) {
+            cur_dram = (cur_dram + skip) & 0xFFFFF8u;
+        }
     }
 }
 
 static inline void dma_dmem_to_rdram(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t wr_len) {
-    wr_len += 1; // Write length is inclusive
-    dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + wr_len <= 0x1000);
-    for (uint32_t i = 0; i < wr_len; i++) {
-        MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000)) = RSP_MEM_B(i, dmem_addr);
+    const uint32_t block_len = rsp_dma_block_len(wr_len);
+    const uint32_t count = rsp_dma_count(wr_len);
+    const uint32_t skip = rsp_dma_skip(wr_len);
+    uint32_t cur_dmem = dmem_addr & 0x0FF8u;
+    uint32_t cur_dram = dram_addr & 0xFFFFF8u;
+
+    assert(block_len <= 0x1000);
+    for (uint32_t block = 0; block <= count; block++) {
+        for (uint32_t i = 0; i < block_len; i++) {
+            MEM_B(0, (int64_t)(int32_t)(cur_dram + i + 0x80000000)) = RSP_MEM_B(i, cur_dmem);
+        }
+        ::recomp::rsp::trace_dma(true, cur_dmem, cur_dram, block_len);
+
+        cur_dmem = (cur_dmem + block_len) & 0x0FFFu;
+        cur_dram = (cur_dram + block_len) & 0xFFFFF8u;
+        if (block != count) {
+            cur_dram = (cur_dram + skip) & 0xFFFFF8u;
+        }
     }
 }
 
 namespace recomp {
     namespace rsp {
         struct callbacks_t {
-            using get_rsp_microcode_t = RspUcodeFunc*(const OSTask* task);
+            using get_rsp_microcode_t = RspUcodeFunc*(uint8_t* rdram, const OSTask* task);
 
             /**
-             * Return a function pointer to the corresponding RSP microcode function for the given `task_type`.
+             * Return a function pointer to the corresponding RSP microcode function for the given task.
              *
-             * The full OSTask (`task` parameter) is passed in case the `task_type` number is not enough information to distinguish out the exact microcode function.
+             * The full OSTask and RDRAM are passed because task type alone is not enough to distinguish ucodes.
+             * Some games submit multiple task shapes under M_AUDTASK and the safest generic discriminator is the
+             * loaded ucode's boot/data signature.
              *
              * This function is allowed to return `nullptr` if no microcode matches the specified task. In this case a message will be printed to stderr and the program will exit.
              */
@@ -186,8 +241,9 @@ namespace recomp {
 
         /**
          * Pre-task hook signature. Called by the recompiled ucode legacy
-         * wrapper after the OSTask has been loaded into DMEM[0xFC0..],
-         * ucode_data has been DMA'd into DMEM[0..0xF7F], and persistent
+         * wrapper after ucode_data has been DMA'd into DMEM up to the
+         * OSTask block, the OSTask has been loaded into DMEM[0xFC0..],
+         * and persistent
          * RspContext is constructed — but BEFORE the ucode entry at
          * PC 0x1000 begins executing.
          *
@@ -236,6 +292,18 @@ namespace recomp {
          */
         void dma_rdram_to_dmem_external(uint8_t* rdram, uint32_t dmem_addr,
                                         uint32_t dram_addr, uint32_t rd_len);
+
+        /**
+         * Apply an SP_STATUS write word and publish the resulting readback
+         * value into the CPU-visible MMIO mirror.
+         */
+        void write_sp_status(uint8_t* rdram, uint32_t value);
+
+        /**
+         * Publish task-completion status bits expected by CPU code that polls
+         * raw SP_STATUS instead of waiting only on libultra event messages.
+         */
+        void mark_sp_task_complete(uint8_t* rdram, uint32_t task_type);
 
         /**
          * Snapshot of the watchdog state for the most-recently-launched

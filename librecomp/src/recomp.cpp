@@ -471,6 +471,31 @@ extern "C" void do_break(uint32_t vram) {
     exit(EXIT_FAILURE);
 }
 
+extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
+    if (ctx->tailcall_dispatching) {
+        return;
+    }
+
+    ctx->tailcall_dispatching = 1;
+    uint32_t dispatch_count = 0;
+    while (ctx->tailcall_pending) {
+        uint32_t target = ctx->tailcall_target;
+        recomp_func_t* func = ctx->tailcall_func;
+        ctx->tailcall_pending = 0;
+        ctx->tailcall_target = 0;
+        ctx->tailcall_func = nullptr;
+
+        if (func == nullptr) {
+            func = get_function((int32_t)target);
+        }
+        func(rdram, ctx);
+        if ((++dispatch_count & 0xFFFu) == 0) {
+            ultramodern_scheduler_tick();
+        }
+    }
+    ctx->tailcall_dispatching = 0;
+}
+
 std::optional<std::u8string> current_game = std::nullopt;
 std::atomic<GameStatus> game_status = GameStatus::None;
 
@@ -490,6 +515,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 
     recomp_func_t* func = get_function(addr);
     func(rdram, &ctx);
+    recomp_handle_tailcalls(rdram, &ctx);
 }
 
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
@@ -709,6 +735,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
 
                 try {
                     game_entry.entrypoint(rdram, context);
+                    recomp_handle_tailcalls(rdram, context);
                 } catch (ultramodern::thread_terminated& terminated) {
 
                 }

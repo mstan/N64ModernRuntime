@@ -16,6 +16,8 @@
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/scheduler_tick.hpp"
 
+extern "C" uint32_t recomp_rsp_consume_preempt_skip_budget(void);
+
 namespace {
 
 // Read-mostly flag set by host monitor when no game-thread context
@@ -54,10 +56,21 @@ constexpr uint64_t kMonitorIntervalMs = 50;
 // path becomes a cheap load against a permanently-zero atomic.
 std::atomic<bool> g_enabled{true};
 
+constexpr uint64_t kRecompMemBase = 0xFFFFFFFF80000000ull;
+constexpr uint32_t kRecompMemMask = 0x3FFFFFFFu;
+constexpr uint64_t kSpStatusAddr = 0xFFFFFFFFA4040010ull;
+constexpr uint32_t kSpStatusSignalMask = 0x00007F80u;
+constexpr OSPri kHardwarePollPriority = 80;
+
 inline uint64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(
         steady_clock::now().time_since_epoch()).count();
+}
+
+uint32_t load_mem_word(uint8_t* rdram, uint64_t vaddr) {
+    return *reinterpret_cast<uint32_t*>(
+        rdram + ((vaddr - kRecompMemBase) & kRecompMemMask));
 }
 
 void monitor_func() {
@@ -120,15 +133,25 @@ extern "C" void ultramodern_voluntary_preemption_set_enabled(int enable) {
 }
 
 extern "C" void ultramodern_scheduler_tick(void) {
-    // Hot path: one relaxed atomic load + branch. Returns immediately
-    // when no yield is pending (the common case — flag is 0).
+    // Hot path: relaxed atomic loads + branches. Returns immediately
+    // when no yield or externally-posted message is pending.
     if (__builtin_expect(g_should_yield.load(std::memory_order_relaxed) == 0, 1)) {
+        if (!ultramodern::external_message_pending()) {
+            return;
+        }
+        if (!ultramodern::is_game_thread()) return;
+        if (g_rdram == nullptr) return;
+        uint8_t* rdram = g_rdram;
+
+        ultramodern::wait_for_external_message_timed(rdram, 0);
+        ultramodern::check_running_queue(rdram);
         return;
     }
     // Slow path. Defensive: skip if called outside a game thread, or
     // before init_scheduler_tick stashed rdram.
     if (!ultramodern::is_game_thread()) return;
     if (g_rdram == nullptr) return;
+    uint8_t* rdram = g_rdram;
 
     // Clear the flag *before* yielding. If we cleared it after, a
     // monitor wake during our yield could re-set it and we'd miss the
@@ -139,10 +162,25 @@ extern "C" void ultramodern_scheduler_tick(void) {
     // Non-blocking. This is what unblocks predicate-flipping threads
     // sitting in osRecvMesg waiting for a completion event posted from
     // a host thread (audio task complete, DP/SP/VI completions, etc.).
-    ultramodern::wait_for_external_message_timed(g_rdram, 0);
+    ultramodern::wait_for_external_message_timed(rdram, 0);
+
+    // If an RSP signal bit is already visible to CPU-side MMIO polling,
+    // let the current busy-waiting thread consume it immediately instead
+    // of queueing that thread behind unrelated game work. This preserves
+    // the voluntary-preemption escape hatch for unsatisfied waits while
+    // avoiding starvation at the exact moment an HLE/recompiled RSP task
+    // has published the predicate the loop is spinning on.
+    if ((load_mem_word(rdram, kSpStatusAddr) & kSpStatusSignalMask) != 0) {
+        PTR(OSThread) self = ultramodern::this_thread();
+        bool high_priority_poll = self != NULLPTR &&
+            TO_PTR(OSThread, self)->priority >= kHardwarePollPriority;
+        if (high_priority_poll || recomp_rsp_consume_preempt_skip_budget() != 0) {
+            return;
+        }
+    }
 
     // Swap to head of running_queue regardless of priority. The stuck
     // thread is by definition busy-waiting on a predicate that some
     // other thread (often same-or-lower priority) needs to flip.
-    ultramodern::yield_to_any_queued(g_rdram);
+    ultramodern::yield_to_any_queued(rdram);
 }

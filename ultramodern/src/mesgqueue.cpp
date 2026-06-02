@@ -131,9 +131,11 @@ struct QueuedMessage {
 };
 
 static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
+static std::atomic<uint32_t> g_external_pending{0};
 
 void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
     external_messages.enqueue({mq, msg, jam});
+    g_external_pending.fetch_add(1, std::memory_order_relaxed);
     mesg_log::record(mesg_log::OP_SEND_EXTERNAL,
                      uint32_t(mq), uint32_t(uintptr_t(msg)),
                      0, 0, false, false);
@@ -150,6 +152,7 @@ static std::atomic<uint64_t> g_external_requeues{0};
 void dequeue_external_messages(RDRAM_ARG1) {
     QueuedMessage to_send;
     while (external_messages.try_dequeue(to_send)) {
+        g_external_pending.fetch_sub(1, std::memory_order_relaxed);
         OSMesgQueue* mq_pre = TO_PTR(OSMesgQueue, to_send.mq);
         const uint16_t vb = uint16_t(mq_pre ? mq_pre->validCount : 0);
         // Try non-blocking send first.
@@ -190,6 +193,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
             // "fire-and-forget" must mean "delivered eventually",
             // not "occasionally lost."
             external_messages.enqueue(to_send);
+            g_external_pending.fetch_add(1, std::memory_order_relaxed);
             g_external_requeues.fetch_add(1, std::memory_order_relaxed);
             break;
         } else {
@@ -211,14 +215,38 @@ extern "C" uint64_t ultramodern_external_requeues(void) {
 void ultramodern::wait_for_external_message(RDRAM_ARG1) {
     QueuedMessage to_send;
     external_messages.wait_dequeue(to_send);
+    g_external_pending.fetch_sub(1, std::memory_order_relaxed);
     do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
 }
 
 void ultramodern::wait_for_external_message_timed(RDRAM_ARG1, u32 millis) {
     QueuedMessage to_send;
     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+        g_external_pending.fetch_sub(1, std::memory_order_relaxed);
         do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
     }
+}
+
+bool ultramodern::external_message_pending() {
+    return g_external_pending.load(std::memory_order_relaxed) != 0;
+}
+
+void ultramodern::send_external_message_after(
+    RDRAM_ARG PTR(OSMesgQueue) mq, OSMesg msg, u32 delay_us)
+{
+    (void)rdram;
+    if (delay_us == 0) {
+        enqueue_external_message(mq, msg, false);
+        return;
+    }
+    std::thread{[mq, msg, delay_us]() {
+        if (delay_us >= 1000) {
+            std::this_thread::sleep_for(std::chrono::microseconds{delay_us});
+        } else {
+            std::this_thread::yield();
+        }
+        enqueue_external_message(mq, msg, false);
+    }}.detach();
 }
 
 extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {

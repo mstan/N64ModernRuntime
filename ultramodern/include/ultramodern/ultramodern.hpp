@@ -54,6 +54,8 @@ PTR(OSThread) thread_queue_peek(RDRAM_ARG PTR(PTR(OSThread)) queue);
 // Message queues.
 void wait_for_external_message(RDRAM_ARG1);
 void wait_for_external_message_timed(RDRAM_ARG1, u32 millis);
+bool external_message_pending();
+void send_external_message_after(RDRAM_ARG PTR(OSMesgQueue) mq, OSMesg msg, u32 delay_us);
 
 // Thread scheduling.
 void check_running_queue(RDRAM_ARG1);

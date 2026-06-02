@@ -9,6 +9,7 @@
 //     (commit dd8137d).
 //   - Framework-level libultra ring + RSP watchdog + boot fixes for
 //     PokemonStadium boot sequencing.
+//   - Publish HLE SP task-completion status for CPU-side SP_STATUS polling.
 //
 // Copyright (c) 2026 Matthew Stanley
 //
@@ -96,7 +97,10 @@ static struct {
 
             uint32_t yScale = field_regs->yScale;
             if (next_state->state & VI_STATE_REPEATLINE) {
-                yScale = 0;
+                // libultra implements osViRepeatLine by writing a zero VI_Y_SCALE
+                // and pointing VI_ORIGIN at the framebuffer start. RT64 treats a
+                // zero y scale as a zero-height VI, so preserve the normal scale
+                // until repeated-scanline presentation is implemented there.
                 origin = framebuffer;
             }
 
@@ -303,6 +307,8 @@ static std::atomic<uint32_t> g_current_dl_data_ptr{0};
 static std::atomic<uint32_t> g_current_dl_data_size{0};
 static std::atomic<uint32_t> g_current_dl_ucode_ptr{0};
 
+extern "C" void recomp_rsp_mark_sp_task_complete(uint8_t* rdram, uint32_t task_type);
+
 extern "C" void ultramodern_get_current_dl_state(
     uint64_t* entry_seq, uint64_t* exit_seq,
     uint64_t* entry_ms,  uint64_t* exit_ms,
@@ -318,15 +324,38 @@ extern "C" void ultramodern_get_current_dl_state(
     if (ucode_ptr) *ucode_ptr = g_current_dl_ucode_ptr.load();
 }
 
-void sp_complete() {
+extern "C" void ultramodern_get_vi_debug_state(
+    uint32_t* cur_flags, uint32_t* next_flags,
+    uint32_t* cur_fb,    uint32_t* next_fb,
+    uint32_t* origin,    uint32_t* h_start,
+    uint32_t* y_scale,   uint32_t* status)
+{
+    std::lock_guard lock{ events_context.message_mutex };
+    ViState* cur = events_context.vi.get_cur_state();
+    ViState* next = events_context.vi.get_next_state();
+    if (cur_flags)  *cur_flags = cur->state;
+    if (next_flags) *next_flags = next->state;
+    if (cur_fb)     *cur_fb = cur->framebuffer;
+    if (next_fb)    *next_fb = next->framebuffer;
+    if (origin)     *origin = events_context.vi.regs.VI_ORIGIN_REG;
+    if (h_start)    *h_start = events_context.vi.regs.VI_H_START_REG;
+    if (y_scale)    *y_scale = events_context.vi.regs.VI_Y_SCALE_REG;
+    if (status)     *status = events_context.vi.regs.VI_STATUS_REG;
+}
+
+void sp_complete(uint32_t task_type) {
     uint8_t* rdram = events_context.rdram;
+    recomp_rsp_mark_sp_task_complete(rdram, task_type);
+
     std::lock_guard lock{ events_context.message_mutex };
     osSendMesg(PASS_RDRAM events_context.sp.mq, events_context.sp.msg, OS_MESG_NOBLOCK);
     g_sp_complete_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-void dp_complete() {
+void dp_complete(uint32_t task_type) {
     uint8_t* rdram = events_context.rdram;
+    recomp_rsp_mark_sp_task_complete(rdram, task_type);
+
     std::lock_guard lock{ events_context.message_mutex };
     osSendMesg(PASS_RDRAM events_context.dp.mq, events_context.dp.msg, OS_MESG_NOBLOCK);
     g_dp_complete_count.fetch_add(1, std::memory_order_relaxed);
@@ -354,7 +383,7 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
         }
 
         // Tell the game that the RSP has completed
-        sp_complete();
+        sp_complete(task->t.type);
     }
 }
 
@@ -433,7 +462,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
                 // is finished as well, so sending this early shouldn't be an issue in most cases.
                 // If this causes issues then the logic can be replaced with responding to yield requests.
-                sp_complete();
+                sp_complete(task_action->task.t.type);
                 ultramodern::measure_input_latency();
 
                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
@@ -467,7 +496,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                     g_current_dl_exit_seq.fetch_add(1, std::memory_order_release);
                 }
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
-                dp_complete();
+                dp_complete(task_action->task.t.type);
                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
             }
             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {

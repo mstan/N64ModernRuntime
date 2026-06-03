@@ -471,6 +471,38 @@ extern "C" void do_break(uint32_t vram) {
     exit(EXIT_FAILURE);
 }
 
+// ── TEMP control-flow diagnostics (dev/register-quit-softlock) ──────────────
+// Per-thread ring of recent control-flow events; dumped when a thread-entry
+// function RETURNS (for an infinite-loop guest thread like Game_Thread, that is
+// the BAD event). Gated by env PSR_CFDIAG=1 (cheap no-op when off). Remove with
+// the register-quit diagnosis. See ISSUES.md #7.
+namespace {
+    struct CfEvent {
+        const char* kind;
+        uint32_t target;     // tailcall target vram
+        uint32_t resolved;   // 1 if get_function(target) != null
+        uint32_t sp;         // ctx->r29 at the event
+        uint32_t r31;        // ctx->r31
+        uint32_t hrt;        // ctx->host_return_target
+        uint32_t seq;
+    };
+    constexpr int CF_RING = 64;
+    thread_local CfEvent tl_cf_ring[CF_RING];
+    thread_local uint32_t tl_cf_idx = 0;
+    int cfdiag_enabled() {
+        static int v = -1;
+        if (v < 0) { const char* e = std::getenv("PSR_CFDIAG"); v = (e && e[0] == '1') ? 1 : 0; }
+        return v;
+    }
+    void cf_push(const char* kind, uint32_t target, uint32_t resolved, recomp_context* ctx) {
+        CfEvent& e = tl_cf_ring[tl_cf_idx % CF_RING];
+        e.kind = kind; e.target = target; e.resolved = resolved;
+        e.sp = (uint32_t)ctx->r29; e.r31 = (uint32_t)ctx->r31;
+        e.hrt = ctx->host_return_target; e.seq = tl_cf_idx;
+        tl_cf_idx++;
+    }
+}
+
 extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
     if (ctx->tailcall_dispatching) {
         return;
@@ -487,6 +519,9 @@ extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
 
         if (func == nullptr) {
             func = get_function((int32_t)target);
+        }
+        if (cfdiag_enabled()) {
+            cf_push("tailcall", target, func != nullptr ? 1u : 0u, ctx);
         }
         func(rdram, ctx);
         if ((++dispatch_count & 0xFFFu) == 0) {
@@ -515,6 +550,30 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 
     recomp_func_t* func = get_function(addr);
     func(rdram, &ctx);
+    // TEMP (dev/register-quit-softlock): a thread-entry function returning is
+    // the BAD event for an infinite-loop guest thread (e.g. Game_Thread @0x8002B330,
+    // which is a while(1) dispatch loop with no C return). Log the exit ctx + the
+    // per-thread control-flow ring so the FIRST diverging event is visible. The
+    // SP-mismatch unwind (`if (ctx->r29 != recomp_call_sp) return;`) is inline in
+    // generated code (not in this ring) — if the ring shows NO recent suspicious
+    // tailcall before the exit, the divergence was an SP-mismatch cascade.
+    if (cfdiag_enabled()) {
+        std::fprintf(stderr,
+            "[cfdiag] THREAD-ENTRY RETURNED: entry=0x%08X r31=0x%08X r29(sp)=0x%08X "
+            "host_return_target=0x%08X tc_pending=%u tc_target=0x%08X tc_dispatching=%u\n",
+            (uint32_t)addr, (uint32_t)ctx.r31, (uint32_t)ctx.r29, ctx.host_return_target,
+            ctx.tailcall_pending, ctx.tailcall_target, ctx.tailcall_dispatching);
+        uint32_t n = tl_cf_idx < (uint32_t)CF_RING ? tl_cf_idx : (uint32_t)CF_RING;
+        uint32_t start = tl_cf_idx - n;
+        std::fprintf(stderr, "  [cfdiag] last %u control-flow events (oldest->newest):\n", n);
+        for (uint32_t i = 0; i < n; i++) {
+            const CfEvent& e = tl_cf_ring[(start + i) % CF_RING];
+            std::fprintf(stderr,
+                "    [cf#%u] %s target=0x%08X resolved=%u sp=0x%08X r31=0x%08X hrt=0x%08X\n",
+                e.seq, e.kind, e.target, e.resolved, e.sp, e.r31, e.hrt);
+        }
+        std::fflush(stderr);
+    }
     recomp_handle_tailcalls(rdram, &ctx);
 }
 

@@ -18,6 +18,7 @@
 #include <memory>
 #include <fstream>
 #include <array>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <mutex>
@@ -93,6 +94,89 @@ constexpr uint32_t k1_to_phys(uint32_t addr) {
 
 constexpr uint32_t phys_to_k1(uint32_t addr) {
     return addr | 0xA0000000;
+}
+
+void save_write_ptr(const void* in, uint32_t offset, uint32_t count);
+void save_clear(uint32_t start, uint32_t size, char value);
+
+namespace {
+    constexpr uint32_t flash_size = 0x20000;
+    constexpr uint32_t flash_page_size = 128;
+    constexpr uint32_t flash_pages_per_sector = 128;
+    constexpr uint32_t flash_sector_size = flash_page_size * flash_pages_per_sector;
+    constexpr uint32_t flash_cmd_reg = 0x10000;
+    constexpr uint32_t flash_cmd_chip_erase = 0x3C000000;
+    constexpr uint32_t flash_cmd_sector_erase = 0x4B000000;
+    constexpr uint32_t flash_cmd_execute_erase = 0x78000000;
+    constexpr uint32_t flash_cmd_program_page = 0xA5000000;
+    constexpr uint32_t flash_cmd_page_program = 0xB4000000;
+    constexpr uint32_t flash_cmd_status = 0xD2000000;
+    constexpr uint32_t flash_cmd_id = 0xE1000000;
+    constexpr uint32_t flash_cmd_read_array = 0xF0000000;
+    // MX_B/D makes libultra use 0x80-byte Flash page addressing, matching
+    // the runtime's 128-byte page program/read granularity.
+    constexpr uint32_t flash_id_type = 0x11118001;
+    constexpr uint32_t flash_id_maker = 0x00C2001D;
+
+    enum class FlashMode {
+        ReadArray,
+        Status,
+        Id,
+        PageProgram,
+        SectorErase,
+        ChipErase,
+    };
+
+    FlashMode flash_mode = FlashMode::ReadArray;
+    uint8_t flash_status = 0;
+    uint32_t flash_pending_erase_page = 0;
+    std::array<char, flash_page_size> flash_write_buffer{};
+
+    bool flash_region_contains(uint32_t physical_addr, uint32_t size) {
+        if (!recomp::flashram_allowed()) {
+            return false;
+        }
+        if (physical_addr < recomp::sram_base) {
+            return false;
+        }
+        const uint32_t offset = physical_addr - recomp::sram_base;
+        return offset <= flash_size && size <= flash_size - offset;
+    }
+
+    uint32_t flash_page_offset(uint32_t page_num) {
+        return page_num * flash_page_size;
+    }
+
+    void flash_program_page(uint32_t page_num) {
+        const uint32_t offset = flash_page_offset(page_num);
+        if (offset + flash_page_size <= flash_size) {
+            save_write_ptr(flash_write_buffer.data(), offset, flash_page_size);
+            flash_status = 0x04;
+        }
+        else {
+            flash_status = 0;
+        }
+        flash_mode = FlashMode::Status;
+    }
+
+    void flash_erase_sector(uint32_t page_num) {
+        const uint32_t sector_page = (page_num / flash_pages_per_sector) * flash_pages_per_sector;
+        const uint32_t offset = flash_page_offset(sector_page);
+        if (offset + flash_sector_size <= flash_size) {
+            save_clear(offset, flash_sector_size, static_cast<char>(0xFF));
+            flash_status = 0x08;
+        }
+        else {
+            flash_status = 0;
+        }
+        flash_mode = FlashMode::Status;
+    }
+
+    void flash_erase_chip() {
+        save_clear(0, flash_size, static_cast<char>(0xFF));
+        flash_status = 0x08;
+        flash_mode = FlashMode::Status;
+    }
 }
 
 extern "C" void __osPiGetAccess_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -309,7 +393,7 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
 }
 
 void save_clear(uint32_t start, uint32_t size, char value) {
-    assert(start + size < save_context.save_buffer.size());
+    assert(start + size <= save_context.save_buffer.size());
 
     {
         std::lock_guard lock { save_context.save_buffer_mutex };
@@ -342,14 +426,14 @@ void read_save_file() {
     // Ensure the save file directory exists.
     std::filesystem::create_directories(save_file_path.parent_path());
 
+    const char blank_value =
+        recomp::get_save_type() == recomp::SaveType::Flashram ? static_cast<char>(0xFF) : 0;
+    std::fill(save_context.save_buffer.begin(), save_context.save_buffer.end(), blank_value);
+
     // Read the save file if it exists.
     std::ifstream save_file = recomp::open_input_file_with_backup(save_file_path, std::ios_base::binary);
     if (save_file.good()) {
         save_file.read(save_context.save_buffer.data(), save_context.save_buffer.size());
-    }
-    else {
-        // Otherwise clear the save file to all zeroes.
-        std::fill(save_context.save_buffer.begin(), save_context.save_buffer.end(), 0);
     }
 }
 
@@ -412,6 +496,22 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
 
             // Send a message to the mq to indicate that the transfer completed
             osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+        } else if (flash_region_contains(physical_addr, size)) {
+            const uint32_t offset = physical_addr - recomp::sram_base;
+            if (flash_mode == FlashMode::Id) {
+                if (size >= sizeof(uint32_t)) {
+                    MEM_W(0, rdram_address) = flash_id_type;
+                }
+                if (size >= sizeof(uint32_t) * 2) {
+                    MEM_W(sizeof(uint32_t), rdram_address) = flash_id_maker;
+                }
+                for (uint32_t i = sizeof(uint32_t) * 2; i < size; i++) {
+                    MEM_B(i, rdram_address) = 0;
+                }
+            } else {
+                save_read(rdram, rdram_address, offset, size);
+            }
+            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
         } else if (physical_addr >= recomp::sram_base) {
             if (!recomp::sram_allowed()) {
                 // SRAM region is also used by the 64DD's diagnostic/RAM
@@ -452,6 +552,24 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
         if (physical_addr >= recomp::rom_base) {
             // write cart rom
             throw std::runtime_error("ROM DMA write unimplemented");
+        } else if (flash_region_contains(physical_addr, size)) {
+            if (flash_mode == FlashMode::PageProgram) {
+                const uint32_t copy_size = std::min<uint32_t>(size, flash_page_size);
+                for (uint32_t i = 0; i < copy_size; i++) {
+                    flash_write_buffer[i] = MEM_B(i, rdram_address);
+                }
+                for (uint32_t i = copy_size; i < flash_page_size; i++) {
+                    flash_write_buffer[i] = static_cast<char>(0xFF);
+                }
+            } else {
+                static int log_count = 0;
+                if (log_count++ < 8) {
+                    fprintf(stderr,
+                        "[pi] FlashRAM DMA write in mode %d phys=0x%08X size=0x%X -- ignoring\n",
+                        static_cast<int>(flash_mode), physical_addr, size);
+                }
+            }
+            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
         } else if (physical_addr >= recomp::sram_base) {
             if (!recomp::sram_allowed()) {
                 // Same reasoning as the read path — drop drive writes
@@ -517,6 +635,16 @@ extern "C" void osEPiReadIo_recomp(RDRAM_ARG recomp_context * ctx) {
     if (physical_addr >= recomp::rom_base) {
         // cart rom
         recomp::do_rom_pio(PASS_RDRAM dramAddr, physical_addr);
+    } else if (flash_region_contains(physical_addr, sizeof(uint32_t))) {
+        uint32_t value = 0;
+        if (flash_mode == FlashMode::Status) {
+            value = flash_status;
+        } else if (flash_mode == FlashMode::Id) {
+            value = flash_id_type;
+        }
+        MEM_W(0, dramAddr) = static_cast<int32_t>(value);
+        ctx->r2 = 0;
+        return;
     } else if (physical_addr >= 0x05000000 && physical_addr < 0x06000000) {
         // 64DD ASIC register space. With no drive attached the status
         // register MUST report "no disk inserted" so libleo's poll loop
@@ -556,11 +684,57 @@ extern "C" void osEPiWriteIo_recomp(RDRAM_ARG recomp_context * ctx) {
     // there are silently dropped. Writes to 64DD register space
     // (0x05000000+) target a peripheral that isn't present in this
     // environment — dropping the write models "no device responding,"
-    // which is the behavior libleo expects when polling. Other PI-bus
-    // devices (cart bank switching, flash) would need real handlers.
+    // which is the behavior libleo expects when polling.
     OSPiHandle* handle = TO_PTR(OSPiHandle, ctx->r4);
     uint32_t devAddr = handle->baseAddress | ctx->r5;
-    (void)devAddr;
+    uint32_t physical_addr = k1_to_phys(devAddr);
+    uint32_t data = static_cast<uint32_t>(ctx->r6);
+
+    if (recomp::flashram_allowed() && physical_addr == recomp::sram_base + flash_cmd_reg) {
+        switch (data & 0xFF000000) {
+        case flash_cmd_chip_erase:
+            flash_mode = FlashMode::ChipErase;
+            break;
+        case flash_cmd_sector_erase:
+            flash_pending_erase_page = data & 0x0000FFFF;
+            flash_mode = FlashMode::SectorErase;
+            break;
+        case flash_cmd_execute_erase:
+            if (flash_mode == FlashMode::ChipErase) {
+                flash_erase_chip();
+            } else if (flash_mode == FlashMode::SectorErase) {
+                flash_erase_sector(flash_pending_erase_page);
+            }
+            break;
+        case flash_cmd_program_page:
+            flash_program_page(data & 0x0000FFFF);
+            break;
+        case flash_cmd_page_program:
+            flash_mode = FlashMode::PageProgram;
+            break;
+        case flash_cmd_status:
+            flash_mode = FlashMode::Status;
+            break;
+        case flash_cmd_id:
+            flash_mode = FlashMode::Id;
+            break;
+        case flash_cmd_read_array:
+            flash_mode = FlashMode::ReadArray;
+            break;
+        default:
+            break;
+        }
+        ctx->r2 = 0;
+        return;
+    }
+
+    if (recomp::flashram_allowed() && physical_addr == recomp::sram_base && data == 0) {
+        flash_status = 0;
+        flash_mode = FlashMode::ReadArray;
+        ctx->r2 = 0;
+        return;
+    }
+
     ctx->r2 = 0;
 }
 

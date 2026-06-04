@@ -51,9 +51,10 @@ extern "C" void osFlashReadId_recomp(uint8_t * rdram, recomp_context * ctx) {
     PTR(u32) flash_type = ctx->r4;
     PTR(u32) flash_maker = ctx->r5;
 
-    // Mimic a real flash chip's type and maker, as some games actually check if one is present.
+    // Mimic an MX_B/D flash chip so libultra uses 0x80-byte page addressing,
+    // matching the runtime's 128-byte page program/read granularity.
     MEM_W(0, flash_type) = 0x11118001;
-    MEM_W(0, flash_maker) = 0x00C2001E;
+    MEM_W(0, flash_maker) = 0x00C2001D;
 }
 
 extern "C" void osFlashClearStatus_recomp(uint8_t * rdram, recomp_context * ctx) {

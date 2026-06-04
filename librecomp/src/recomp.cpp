@@ -479,11 +479,15 @@ extern "C" void do_break(uint32_t vram) {
 namespace {
     struct CfEvent {
         const char* kind;
-        uint32_t target;     // tailcall target vram
-        uint32_t resolved;   // 1 if get_function(target) != null
+        uint32_t value0;     // tailcall target or wrapper call SP
+        uint32_t value1;     // tailcall resolved flag or wrapper previous HRT
+        uint32_t value2;     // wrapper call HRT
+        uintptr_t func;      // resolved tailcall function pointer
         uint32_t sp;         // ctx->r29 at the event
         uint32_t r31;        // ctx->r31
         uint32_t hrt;        // ctx->host_return_target
+        uint32_t pending;    // ctx->tailcall_pending
+        uint32_t dispatching;// ctx->tailcall_dispatching
         uint32_t seq;
     };
     constexpr int CF_RING = 64;
@@ -494,20 +498,26 @@ namespace {
         if (v < 0) { const char* e = std::getenv("PSR_CFDIAG"); v = (e && e[0] == '1') ? 1 : 0; }
         return v;
     }
-    void cf_push(const char* kind, uint32_t target, uint32_t resolved, recomp_context* ctx) {
+    void cf_push(const char* kind, uint32_t value0, uint32_t value1, uint32_t value2, uintptr_t func, recomp_context* ctx) {
         CfEvent& e = tl_cf_ring[tl_cf_idx % CF_RING];
-        e.kind = kind; e.target = target; e.resolved = resolved;
+        e.kind = kind; e.value0 = value0; e.value1 = value1; e.value2 = value2; e.func = func;
         e.sp = (uint32_t)ctx->r29; e.r31 = (uint32_t)ctx->r31;
-        e.hrt = ctx->host_return_target; e.seq = tl_cf_idx;
+        e.hrt = ctx->host_return_target;
+        e.pending = ctx->tailcall_pending;
+        e.dispatching = ctx->tailcall_dispatching;
+        e.seq = tl_cf_idx;
         tl_cf_idx++;
     }
 }
 
-extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
-    if (ctx->tailcall_dispatching) {
-        return;
+extern "C" void recomp_cf_note(const char* kind, uint32_t value0, uint32_t value1, uint32_t value2, recomp_context* ctx) {
+    if (cfdiag_enabled()) {
+        cf_push(kind, value0, value1, value2, 0, ctx);
     }
+}
 
+extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t prev_tailcall_dispatching = ctx->tailcall_dispatching;
     ctx->tailcall_dispatching = 1;
     uint32_t dispatch_count = 0;
     while (ctx->tailcall_pending) {
@@ -521,14 +531,14 @@ extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
             func = get_function((int32_t)target);
         }
         if (cfdiag_enabled()) {
-            cf_push("tailcall", target, func != nullptr ? 1u : 0u, ctx);
+            cf_push("tailcall", target, func != nullptr ? 1u : 0u, 0, (uintptr_t)func, ctx);
         }
         func(rdram, ctx);
         if ((++dispatch_count & 0xFFFu) == 0) {
             ultramodern_scheduler_tick();
         }
     }
-    ctx->tailcall_dispatching = 0;
+    ctx->tailcall_dispatching = prev_tailcall_dispatching;
 }
 
 std::optional<std::u8string> current_game = std::nullopt;
@@ -569,8 +579,10 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         for (uint32_t i = 0; i < n; i++) {
             const CfEvent& e = tl_cf_ring[(start + i) % CF_RING];
             std::fprintf(stderr,
-                "    [cf#%u] %s target=0x%08X resolved=%u sp=0x%08X r31=0x%08X hrt=0x%08X\n",
-                e.seq, e.kind, e.target, e.resolved, e.sp, e.r31, e.hrt);
+                "    [cf#%u] %s v0=0x%08X v1=0x%08X v2=0x%08X func=%p "
+                "sp=0x%08X r31=0x%08X hrt=0x%08X pending=%u dispatching=%u\n",
+                e.seq, e.kind, e.value0, e.value1, e.value2, (void*)e.func,
+                e.sp, e.r31, e.hrt, e.pending, e.dispatching);
         }
         std::fflush(stderr);
     }

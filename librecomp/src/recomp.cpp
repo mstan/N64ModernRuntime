@@ -513,12 +513,29 @@ namespace {
 extern "C" void recomp_cf_note(const char* kind, uint32_t value0, uint32_t value1, uint32_t value2, recomp_context* ctx) {
     if (cfdiag_enabled()) {
         cf_push(kind, value0, value1, value2, 0, ctx);
+        if (std::strcmp(kind, "call-nested-return-dispatch") == 0) {
+            static thread_local uint32_t nested_return_count = 0;
+            nested_return_count++;
+            if ((nested_return_count & 0xFFu) == 0) {
+                std::fprintf(stderr,
+                    "[cfdiag] nested-return #%u call_sp=0x%08X prev=0x%08X call_hrt=0x%08X "
+                    "sp=0x%08X r31=0x%08X hrt=0x%08X pending=%u target=0x%08X dispatching=%u\n",
+                    nested_return_count, value0, value1, value2, (uint32_t)ctx->r29,
+                    (uint32_t)ctx->r31, ctx->host_return_target, ctx->tailcall_pending,
+                    ctx->tailcall_target, ctx->tailcall_dispatching);
+                std::fflush(stderr);
+            }
+        }
     }
 }
 
 extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
-    uint32_t prev_tailcall_dispatching = ctx->tailcall_dispatching;
-    ctx->tailcall_dispatching = 1;
+    // tailcall_dispatching is the current NESTED-TRAMPOLINE DEPTH, not a 0/1
+    // flag. Generated call wrappers read it to decide drain-locally (shallow,
+    // preserves finite continuations like register-quit #7) vs bubble-up (deep,
+    // caps unbounded tailcall loops like the GB Tower emulator #11). Balanced
+    // ++/-- around the drain loop; ctx is per guest thread so depth is per-thread.
+    ctx->tailcall_dispatching++;
     uint32_t dispatch_count = 0;
     while (ctx->tailcall_pending) {
         uint32_t target = ctx->tailcall_target;
@@ -538,7 +555,7 @@ extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
             ultramodern_scheduler_tick();
         }
     }
-    ctx->tailcall_dispatching = prev_tailcall_dispatching;
+    ctx->tailcall_dispatching--;
 }
 
 std::optional<std::u8string> current_game = std::nullopt;

@@ -1,12 +1,36 @@
 # N64 Modern Runtime
 
-> **Fork notice** — This fork is maintained under the
-> [SS Anne](https://github.com/ss-anne) organization as part of the
-> [PokemonStadiumRecomp](https://github.com/ss-anne/PokemonStadiumRecomp)
-> project ecosystem. Changes here exist to support that port; they
-> may lag behind upstream and are not intended as a replacement for
-> the canonical project. For canonical N64ModernRuntime, see
+> **Fork notice** — This is a fork maintained as part of **SS Anne**, a
+> [Pokémon Stadium recompilation project](https://github.com/mstan/PokemonStadiumRecomp).
+> The changes here exist to support that port; they may lag behind
+> upstream and are not intended as a replacement for the canonical
+> project. For canonical N64ModernRuntime, see
 > [N64Recomp/N64ModernRuntime](https://github.com/N64Recomp/N64ModernRuntime).
+
+## Changes in this fork
+
+N64ModernRuntime stands in for the N64's operating system while the
+recompiled game runs on PC. These changes make it host Pokémon Stadium
+correctly:
+
+- **Fixes the menu cursor and icons turning to garbage**, by correctly
+  tracking where the game's load-on-demand code sits in memory as it loads
+  and unloads.
+- **Stops the music and sound effects clicking and ticking**, by letting
+  the game set its own audio pace the way it does on the real console, and
+  hardens the sound code against a class of crashes.
+- **Makes saving work** — registered Pokémon are kept between runs (the
+  game writes to emulated flash memory).
+- **Fixes several freezes and softlocks**, including ones reaching certain
+  menus and Game Boy Tower, by letting busy game loops step aside instead
+  of locking up, and by handing the graphics/audio co-processor's work to
+  the right place.
+- **Stops out-of-range memory reads from crashing the game** — bad reads
+  return zeroes and get logged instead.
+- **Lets the game detect the Transfer Pak** accessory being plugged in.
+- **Smaller things:** a fix for a rare crash when two threads touch the
+  function-lookup table at once; points its recompiler dependency at this
+  project's fork; records which files were modified.
 
 A modern runtime for traditional ports and recompilations of N64 games. \
 The runtime is consists of two libraries: [ultramodern](#ultramodern) and [librecomp](#librecomp).

@@ -886,8 +886,9 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                 fflush(stderr);
                 size_t dump_size = sections_info.code_sections[candidates.front()].size;
                 char path[128];
-                snprintf(path, sizeof(path),
-                    "F:/Projects/PokemonStadiumRecomp/build/hash_miss_id_%X.bin", id);
+                // Diagnostic dump written to the working directory (next to the
+                // exe for a packaged build) — never an absolute machine path.
+                snprintf(path, sizeof(path), "hash_miss_id_%X.bin", id);
                 FILE* f = fopen(path, "wb");
                 if (f) {
                     if (paddr + dump_size <= (8u * 1024u * 1024u)) {
@@ -1559,17 +1560,19 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
 // actually invokes the function pointer; but the lookup itself
 // returns, so static initializers / table walks finish cleanly.
 //
-// Per project principles: not a stub. The trampoline doesn't simulate
-// behavior — it surfaces "execution reached unimplemented code" with
-// full address context. Surfaces are richer than std::exit().
+// Not a stub: the trampoline doesn't simulate behavior — it surfaces
+// "execution reached unimplemented code" with full address context.
+// Surfaces are richer than std::exit().
 // Set by get_function on a lookup miss; consumed by the trampoline
 // when the bogus pointer is actually invoked.
 static int32_t g_last_lookup_miss_addr = 0;
 
 static FILE* open_last_error_log(const char* mode) {
-    FILE* f = fopen("build/last_error.log", mode);
+    // Working-directory-relative (next to the exe for a packaged build); fall
+    // back to a build/ subdir if one exists. Never an absolute machine path.
+    FILE* f = fopen("last_error.log", mode);
     if (f == nullptr) {
-        f = fopen("F:/Projects/n64recomp/PokemonStadiumRecomp/build/last_error.log", mode);
+        f = fopen("build/last_error.log", mode);
     }
     return f;
 }

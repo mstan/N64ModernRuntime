@@ -12,6 +12,7 @@
 // ---------------------------------------------------------------------
 
 #include <cstdio>
+#include "ultramodern/ultra_trace.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -413,6 +414,7 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
 }
 
 extern "C" void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = 8 * 1024 * 1024;
 }
 
@@ -444,13 +446,29 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
         changed &= ~(uint32_t)StatusReg::FR;
     }
 
-    // If any other bits were changed, assert false as they're not handled currently
+    // Any other changed bits are the CP0 Status interrupt-control / mode bits
+    // (IE, EXL, ERL, IM7..0, KSU, etc.). Under this HLE model those are
+    // vestigial: real CPU interrupts don't exist — the runtime's cooperative
+    // scheduler and event threads emulate VI/SP/etc. — so a recompiled libultra
+    // interrupt routine (e.g. __osDisableInt/__osRestoreInt/osSetIntMask, which
+    // do a literal `mtc0 Status`) has no host action to take. We simply absorb
+    // the new value so a subsequent `mfc0 Status` reads back consistently.
+    //
+    // (Previously this aborted. That was only ever safe for ports whose
+    // interrupt routines are all HLE-reimplemented and thus never execute a
+    // recompiled `mtc0 Status` — e.g. PokemonStadiumRecomp. ROM-direct ports
+    // that recompile libultra wholesale, like PocketMonstersStadiumRecomp, do
+    // execute it, and aborting killed boot. Tolerating the bits is the correct
+    // HLE behaviour and is a no-op for ports that never hit this path.)
     if (changed) {
-        printf("Unhandled status register bits changed: 0x%08X\n", changed);
-        assert(false);
-        exit(EXIT_FAILURE);
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            printf("[librecomp] cop0_status_write: ignoring HLE-vestigial Status "
+                   "bits 0x%08X (interrupt/mode bits have no host effect; "
+                   "logged once)\n", changed);
+        }
     }
-    
+
     // Update the status register in the context
     ctx->status_reg = new_sr;
 }
@@ -543,6 +561,13 @@ extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
         ctx->tailcall_pending = 0;
         ctx->tailcall_target = 0;
         ctx->tailcall_func = nullptr;
+
+        if (target == ctx->host_return_target) {
+            if (cfdiag_enabled()) {
+                cf_push("tailcall-host-return", target, 0, 0, 0, ctx);
+            }
+            break;
+        }
 
         if (func == nullptr) {
             func = get_function((int32_t)target);

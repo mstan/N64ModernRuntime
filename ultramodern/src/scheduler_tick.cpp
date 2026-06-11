@@ -61,6 +61,17 @@ constexpr uint32_t kRecompMemMask = 0x3FFFFFFFu;
 constexpr uint64_t kSpStatusAddr = 0xFFFFFFFFA4040010ull;
 constexpr uint32_t kSpStatusSignalMask = 0x00007F80u;
 constexpr OSPri kHardwarePollPriority = 80;
+constexpr uint32_t kLoopCheckpointCapacity = 256;
+
+struct LoopCheckpointSlot {
+    std::atomic<uint32_t> pc{0};
+    std::atomic<uint32_t> thread{0};
+    std::atomic<uint32_t> thread_id{0};
+    std::atomic<uint32_t> ms{0};
+    std::atomic<uint64_t> count{0};
+};
+
+LoopCheckpointSlot g_loop_checkpoints[kLoopCheckpointCapacity];
 
 inline uint64_t now_ms() {
     using namespace std::chrono;
@@ -92,47 +103,33 @@ void monitor_func() {
     }
 }
 
-} // namespace
-
-void ultramodern::init_scheduler_tick(RDRAM_ARG1) {
-    g_rdram = rdram;
-    if (g_monitor_started.exchange(true, std::memory_order_relaxed)) return;
-    g_monitor_exit.store(false, std::memory_order_relaxed);
-    g_monitor_thread = std::thread{monitor_func};
-}
-
-void ultramodern::join_scheduler_tick() {
-    if (!g_monitor_started.load(std::memory_order_relaxed)) return;
-    g_monitor_exit.store(true, std::memory_order_relaxed);
-    if (g_monitor_thread.joinable()) {
-        g_monitor_thread.join();
-    }
-    g_monitor_started.store(false, std::memory_order_relaxed);
-}
-
-void ultramodern::record_context_switch() {
-    g_last_switch_ms.store(now_ms(), std::memory_order_relaxed);
-}
-
-void ultramodern::yield_to_any_queued(RDRAM_ARG1) {
-    if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+void record_loop_checkpoint(uint32_t pc) {
+    if (pc == 0) {
         return;
     }
-    PTR(OSThread) next_ = ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue);
-    OSThread* next_thread = TO_PTR(OSThread, next_);
-    // Re-queue ourselves at the priority-ordered position then resume
-    // the next thread and block on our own context. Same shape as the
-    // file-static swap_to_thread in scheduling.cpp.
-    ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
-    TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
-    ultramodern::resume_thread_and_wait(PASS_RDRAM next_thread);
+
+    uint32_t thread = 0;
+    uint32_t thread_id = 0;
+    uint8_t* rdram = g_rdram;
+    if (rdram != nullptr) {
+        PTR(OSThread) self = ultramodern::this_thread();
+        if (self != NULLPTR) {
+            OSThread* t = TO_PTR(OSThread, self);
+            thread = static_cast<uint32_t>(self);
+            thread_id = static_cast<uint32_t>(t->id);
+        }
+    }
+
+    uint32_t slot_idx = thread_id < kLoopCheckpointCapacity ? thread_id : 0;
+    LoopCheckpointSlot& slot = g_loop_checkpoints[slot_idx];
+    slot.pc.store(pc, std::memory_order_relaxed);
+    slot.thread.store(thread, std::memory_order_relaxed);
+    slot.thread_id.store(thread_id, std::memory_order_relaxed);
+    slot.ms.store(static_cast<uint32_t>(now_ms()), std::memory_order_relaxed);
+    slot.count.fetch_add(1, std::memory_order_release);
 }
 
-extern "C" void ultramodern_voluntary_preemption_set_enabled(int enable) {
-    g_enabled.store(enable != 0, std::memory_order_relaxed);
-}
-
-extern "C" void ultramodern_scheduler_tick(void) {
+void scheduler_tick_impl() {
     // Hot path: relaxed atomic loads + branches. Returns immediately
     // when no yield or externally-posted message is pending.
     if (__builtin_expect(g_should_yield.load(std::memory_order_relaxed) == 0, 1)) {
@@ -183,4 +180,83 @@ extern "C" void ultramodern_scheduler_tick(void) {
     // thread is by definition busy-waiting on a predicate that some
     // other thread (often same-or-lower priority) needs to flip.
     ultramodern::yield_to_any_queued(rdram);
+}
+
+} // namespace
+
+void ultramodern::init_scheduler_tick(RDRAM_ARG1) {
+    g_rdram = rdram;
+    if (g_monitor_started.exchange(true, std::memory_order_relaxed)) return;
+    g_monitor_exit.store(false, std::memory_order_relaxed);
+    g_monitor_thread = std::thread{monitor_func};
+}
+
+void ultramodern::join_scheduler_tick() {
+    if (!g_monitor_started.load(std::memory_order_relaxed)) return;
+    g_monitor_exit.store(true, std::memory_order_relaxed);
+    if (g_monitor_thread.joinable()) {
+        g_monitor_thread.join();
+    }
+    g_monitor_started.store(false, std::memory_order_relaxed);
+}
+
+void ultramodern::record_context_switch() {
+    g_last_switch_ms.store(now_ms(), std::memory_order_relaxed);
+}
+
+void ultramodern::yield_to_any_queued(RDRAM_ARG1) {
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 130, ultramodern::running_queue, ultramodern::this_thread());
+    if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+        ultramodern::scheduler_trace_mark(PASS_RDRAM 131, ultramodern::running_queue, ultramodern::this_thread());
+        return;
+    }
+    PTR(OSThread) next_ = ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue);
+    OSThread* next_thread = TO_PTR(OSThread, next_);
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 132, ultramodern::running_queue, next_);
+    // Re-queue ourselves at the priority-ordered position then resume
+    // the next thread and block on our own context. Same shape as the
+    // file-static swap_to_thread in scheduling.cpp.
+    ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 133, ultramodern::running_queue, ultramodern::this_thread());
+    TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 134, ultramodern::running_queue, next_);
+    ultramodern::resume_thread_and_wait(PASS_RDRAM next_thread);
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 135, ultramodern::running_queue, ultramodern::this_thread());
+}
+
+extern "C" void ultramodern_voluntary_preemption_set_enabled(int enable) {
+    g_enabled.store(enable != 0, std::memory_order_relaxed);
+}
+
+extern "C" void ultramodern_scheduler_tick(void) {
+    scheduler_tick_impl();
+}
+
+extern "C" void ultramodern_scheduler_tick_vram(uint32_t pc) {
+    record_loop_checkpoint(pc);
+    scheduler_tick_impl();
+}
+
+extern "C" uint32_t ultramodern_loop_checkpoint_capacity(void) {
+    return kLoopCheckpointCapacity;
+}
+
+extern "C" int ultramodern_loop_checkpoint_get(uint32_t thread_id,
+                                               ultramodern_loop_checkpoint_event* out) {
+    if (out == nullptr || thread_id >= kLoopCheckpointCapacity) {
+        return 0;
+    }
+
+    LoopCheckpointSlot& slot = g_loop_checkpoints[thread_id];
+    uint64_t count = slot.count.load(std::memory_order_acquire);
+    if (count == 0) {
+        return 0;
+    }
+
+    out->pc = slot.pc.load(std::memory_order_relaxed);
+    out->thread = slot.thread.load(std::memory_order_relaxed);
+    out->thread_id = slot.thread_id.load(std::memory_order_relaxed);
+    out->ms = slot.ms.load(std::memory_order_relaxed);
+    out->count = count;
+    return 1;
 }

@@ -1,4 +1,5 @@
 #include <array>
+#include "ultramodern/ultra_trace.hpp"
 #include <cassert>
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
@@ -23,6 +24,7 @@ void save_clear(uint32_t start, uint32_t size, char value);
 std::array<char, page_size> write_buffer;
 
 extern "C" void osFlashInit_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -32,6 +34,7 @@ extern "C" void osFlashInit_recomp(uint8_t * rdram, recomp_context * ctx) {
 }
 
 extern "C" void osFlashReadStatus_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -43,6 +46,7 @@ extern "C" void osFlashReadStatus_recomp(uint8_t * rdram, recomp_context * ctx) 
 }
 
 extern "C" void osFlashReadId_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -58,6 +62,7 @@ extern "C" void osFlashReadId_recomp(uint8_t * rdram, recomp_context * ctx) {
 }
 
 extern "C" void osFlashClearStatus_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -67,6 +72,7 @@ extern "C" void osFlashClearStatus_recomp(uint8_t * rdram, recomp_context * ctx)
 }
 
 extern "C" void osFlashAllErase_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -78,6 +84,7 @@ extern "C" void osFlashAllErase_recomp(uint8_t * rdram, recomp_context * ctx) {
 }
 
 extern "C" void osFlashAllEraseThrough_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -90,6 +97,7 @@ extern "C" void osFlashAllEraseThrough_recomp(uint8_t * rdram, recomp_context * 
 
 // This function is named sector but really means page.
 extern "C" void osFlashSectorErase_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -110,6 +118,7 @@ extern "C" void osFlashSectorErase_recomp(uint8_t * rdram, recomp_context * ctx)
 
 // Same naming issue as above.
 extern "C" void osFlashSectorEraseThrough_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -129,6 +138,7 @@ extern "C" void osFlashSectorEraseThrough_recomp(uint8_t * rdram, recomp_context
 }
 
 extern "C" void osFlashCheckEraseEnd_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -139,6 +149,7 @@ extern "C" void osFlashCheckEraseEnd_recomp(uint8_t * rdram, recomp_context * ct
 }
 
 extern "C" void osFlashWriteBuffer_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -155,12 +166,16 @@ extern "C" void osFlashWriteBuffer_recomp(uint8_t * rdram, recomp_context * ctx)
     }
 
     // Send the message indicating write completion
-    osSendMesg(PASS_RDRAM mq, 0, OS_MESG_NOBLOCK);
+    {
+        s32 sent = osSendMesg(PASS_RDRAM mq, 0, OS_MESG_NOBLOCK);
+        recomp_ultra_trace_record("~flash_done", 0, (uint32_t)mq, 0, (uint32_t)sent, 0);
+    }
 
     ctx->r2 = 0;
 }
 
 extern "C" void osFlashWriteArray_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -175,6 +190,7 @@ extern "C" void osFlashWriteArray_recomp(uint8_t * rdram, recomp_context * ctx) 
 }
 
 extern "C" void osFlashReadArray_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();
@@ -194,12 +210,16 @@ extern "C" void osFlashReadArray_recomp(uint8_t * rdram, recomp_context * ctx) {
     save_read(PASS_RDRAM dramAddr, offset, count);
 
     // Send the message indicating read completion
-    osSendMesg(PASS_RDRAM mq, 0, OS_MESG_NOBLOCK);
+    {
+        s32 sent = osSendMesg(PASS_RDRAM mq, 0, OS_MESG_NOBLOCK);
+        recomp_ultra_trace_record("~flash_done", 0, (uint32_t)mq, 1, (uint32_t)sent, 0);
+    }
 
     ctx->r2 = 0;
 }
 
 extern "C" void osFlashChange_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     if (!recomp::flashram_allowed()) {
         ultramodern::error_handling::message_box("Attempted to use FlashRAM saving with other save type");
         ULTRAMODERN_QUICK_EXIT();

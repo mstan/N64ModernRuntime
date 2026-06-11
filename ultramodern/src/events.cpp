@@ -33,6 +33,7 @@
 
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/renderer_context.hpp"
+#include "ultramodern/ultra_trace.hpp"
 
 static ultramodern::events::callbacks_t events_callbacks{};
 
@@ -260,16 +261,19 @@ void vi_thread_func() {
             ViState* cur_state = events_context.vi.get_cur_state();
             if (remaining_retraces == 0) {
                 if (cur_state->mq != NULLPTR) {
-                    if (osSendMesg(PASS_RDRAM cur_state->mq, cur_state->msg, OS_MESG_NOBLOCK) == -1) {
-                        //printf("Game skipped a VI frame!\n");
-                    }
+                    s32 sent = osSendMesg(PASS_RDRAM cur_state->mq, cur_state->msg, OS_MESG_NOBLOCK);
+                    // Always-on ring: runtime→guest VI retrace delivery
+                    // (a2 = result; -1 means the game's queue was full and
+                    // the retrace was dropped). See ultra_trace.hpp.
+                    recomp_ultra_trace_record("~vi_retrace", 0,
+                        (uint32_t)cur_state->mq, (uint32_t)cur_state->msg, (uint32_t)sent, 0);
                 }
                 remaining_retraces = cur_state->retrace_count;
             }
             if (events_context.ai.mq != NULLPTR) {
-                if (osSendMesg(PASS_RDRAM events_context.ai.mq, events_context.ai.msg, OS_MESG_NOBLOCK) == -1) {
-                    //printf("Game skipped a AI frame!\n");
-                }
+                s32 sent = osSendMesg(PASS_RDRAM events_context.ai.mq, events_context.ai.msg, OS_MESG_NOBLOCK);
+                recomp_ultra_trace_record("~ai_event", 0,
+                    (uint32_t)events_context.ai.mq, (uint32_t)events_context.ai.msg, (uint32_t)sent, 0);
             }
         }
 
@@ -348,7 +352,9 @@ void sp_complete(uint32_t task_type) {
     recomp_rsp_mark_sp_task_complete(rdram, task_type);
 
     std::lock_guard lock{ events_context.message_mutex };
-    osSendMesg(PASS_RDRAM events_context.sp.mq, events_context.sp.msg, OS_MESG_NOBLOCK);
+    s32 sent = osSendMesg(PASS_RDRAM events_context.sp.mq, events_context.sp.msg, OS_MESG_NOBLOCK);
+    recomp_ultra_trace_record("~sp_done", 0,
+        (uint32_t)events_context.sp.mq, (uint32_t)events_context.sp.msg, (uint32_t)sent, task_type);
     g_sp_complete_count.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -357,7 +363,9 @@ void dp_complete(uint32_t task_type) {
     recomp_rsp_mark_sp_task_complete(rdram, task_type);
 
     std::lock_guard lock{ events_context.message_mutex };
-    osSendMesg(PASS_RDRAM events_context.dp.mq, events_context.dp.msg, OS_MESG_NOBLOCK);
+    s32 sent = osSendMesg(PASS_RDRAM events_context.dp.mq, events_context.dp.msg, OS_MESG_NOBLOCK);
+    recomp_ultra_trace_record("~dp_done", 0,
+        (uint32_t)events_context.dp.mq, (uint32_t)events_context.dp.msg, (uint32_t)sent, task_type);
     g_dp_complete_count.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -704,7 +712,9 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
 }
 
 void ultramodern::send_si_message(RDRAM_ARG1) {
-    osSendMesg(PASS_RDRAM events_context.si.mq, events_context.si.msg, OS_MESG_NOBLOCK);
+    s32 sent = osSendMesg(PASS_RDRAM events_context.si.mq, events_context.si.msg, OS_MESG_NOBLOCK);
+    recomp_ultra_trace_record("~si_done", 0,
+        (uint32_t)events_context.si.mq, (uint32_t)events_context.si.msg, (uint32_t)sent, 0);
 }
 
 void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle window_handle) {

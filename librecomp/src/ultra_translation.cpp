@@ -74,19 +74,31 @@ extern "C" void osCreateMesgQueue_recomp(uint8_t* rdram, recomp_context* ctx) {
     osCreateMesgQueue(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
 }
 
+// The three queue ops also record on RETURN ("~os*.done") — see the event-class
+// doc in ultramodern/ultra_trace.hpp. This makes a wake from a blocking call
+// directly visible in the ring: a thread whose osRecvMesg entry has no matching
+// `.done` is still blocked; one with a `.done` but no subsequent os call has run
+// off into call-free guest code (spin loop). pc=caller ra, a0=mq, a1=result,
+// a2=flags.
 extern "C" void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
+    uint32_t ra = (uint32_t)ctx->r31, mq = (uint32_t)ctx->r4, flags = (uint32_t)ctx->r6;
     ctx->r2 = osRecvMesg(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
+    recomp_ultra_trace_record("~osRecvMesg.done", ra, mq, (uint32_t)ctx->r2, flags, 0);
 }
 
 extern "C" void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
+    uint32_t ra = (uint32_t)ctx->r31, mq = (uint32_t)ctx->r4, flags = (uint32_t)ctx->r6;
     ctx->r2 = osSendMesg(rdram, (int32_t)ctx->r4, (OSMesg)ctx->r5, (s32)ctx->r6);
+    recomp_ultra_trace_record("~osSendMesg.done", ra, mq, (uint32_t)ctx->r2, flags, 0);
 }
 
 extern "C" void osJamMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
+    uint32_t ra = (uint32_t)ctx->r31, mq = (uint32_t)ctx->r4, flags = (uint32_t)ctx->r6;
     ctx->r2 = osJamMesg(rdram, (int32_t)ctx->r4, (OSMesg)ctx->r5, (s32)ctx->r6);
+    recomp_ultra_trace_record("~osJamMesg.done", ra, mq, (uint32_t)ctx->r2, flags, 0);
 }
 
 extern "C" void osSetEventMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -135,38 +147,47 @@ extern "C" void osStopTimer_recomp(uint8_t * rdram, recomp_context * ctx) {
 }
 
 extern "C" void osVirtualToPhysical_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = osVirtualToPhysical((int32_t)ctx->r4);
 }
 
 extern "C" void osInvalDCache_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
 extern "C" void osInvalICache_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
 extern "C" void osWritebackDCache_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
 extern "C" void osWritebackDCacheAll_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
 extern "C" void osSetIntMask_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
 extern "C" void __osDisableInt_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
 extern "C" void __osRestoreInt_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ;
 }
 
 extern "C" void __osSetFpcCsr_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = 0;
 }
 

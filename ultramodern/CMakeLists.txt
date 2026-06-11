@@ -20,6 +20,7 @@ add_library(ultramodern STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/threadqueue.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/threads.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/timer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_trace.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ultrainit.cpp"
 )
 

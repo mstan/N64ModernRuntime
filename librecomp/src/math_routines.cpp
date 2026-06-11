@@ -4,6 +4,13 @@
 // TODO remove these by implementing the necessary instructions and control flow handling in the recompiler.
 // This has already been partially completed.
 
+// NOTE (ultra_trace): these wrappers are deliberately NOT instrumented with
+// LIBRECOMP_ULTRA_TRACE. They are compiler-runtime arithmetic shims (libgcc
+// 64-bit math), not libultra OS-boundary events; tracing them would evict the
+// entire OS-call history from the ring within microseconds of tight math code
+// and add overhead to every 64-bit divide in Release builds. The ring's event
+// class is documented in ultramodern/ultra_trace.hpp.
+
 extern "C" void __udivdi3_recomp(uint8_t * rdram, recomp_context * ctx) {
     uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
     uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);

@@ -62,6 +62,7 @@ void check_running_queue(RDRAM_ARG1);
 void run_next_thread_and_wait(RDRAM_ARG1);
 void resume_thread_and_wait(RDRAM_ARG OSThread* t);
 void schedule_running_thread(RDRAM_ARG PTR(OSThread) t);
+void scheduler_trace_mark(RDRAM_ARG uint32_t op, PTR(PTR(OSThread)) queue, PTR(OSThread) t);
 void cleanup_thread(UltraThreadContext* thread_context);
 struct thread_terminated : std::exception {};
 

@@ -148,7 +148,9 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
 #endif
 
 void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 120, NULLPTR, ultramodern::this_thread());
     thread_context->running.wait();
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 121, NULLPTR, ultramodern::this_thread());
     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
     // This will trigger thread cleanup instead.
     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
@@ -160,31 +162,40 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     ultramodern::record_context_switch();
 }
 
-void resume_thread(OSThread* t) {
+void resume_thread(RDRAM_ARG OSThread* t) {
     debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 122, NULLPTR, NULLPTR);
     t->context->running.signal();
 }
 
 void run_next_thread(RDRAM_ARG1) {
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 123, ultramodern::running_queue, NULLPTR);
     if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+        ultramodern::scheduler_trace_mark(PASS_RDRAM 124, ultramodern::running_queue, NULLPTR);
         throw std::runtime_error("No threads left to run!\n");
     }
 
-    OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
+    PTR(OSThread) to_run_ = ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue);
+    OSThread* to_run = TO_PTR(OSThread, to_run_);
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 125, ultramodern::running_queue, to_run_);
     debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
     to_run->context->running.signal();
 }
 
 void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
     UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 126, ultramodern::running_queue, ultramodern::this_thread());
     run_next_thread(PASS_RDRAM1);
     wait_for_resumed(PASS_RDRAM cur_context);
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 127, ultramodern::running_queue, ultramodern::this_thread());
 }
 
 void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
     UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
-    resume_thread(t);
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 112, ultramodern::running_queue, ultramodern::this_thread());
+    resume_thread(PASS_RDRAM t);
     wait_for_resumed(PASS_RDRAM cur_context);
+    ultramodern::scheduler_trace_mark(PASS_RDRAM 113, ultramodern::running_queue, ultramodern::this_thread());
 }
 
 static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
@@ -244,7 +255,7 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
     // Otherwise, immediately start the thread and terminate this one.
     else {
         t->state = OSThreadState::QUEUED;
-        resume_thread(t);
+        resume_thread(PASS_RDRAM t);
         //throw ultramodern::thread_terminated{};
     }
 }

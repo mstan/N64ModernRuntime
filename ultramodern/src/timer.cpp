@@ -5,6 +5,7 @@
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
+#include "ultramodern/ultra_trace.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -130,7 +131,10 @@ void timer_thread(RDRAM_ARG1) {
         }
         else {
             // Waiting for the timer completed, so send the timer's message to its message queue
-            osSendMesg(PASS_RDRAM cur_timer->mq, cur_timer->msg, OS_MESG_NOBLOCK);
+            s32 sent = osSendMesg(PASS_RDRAM cur_timer->mq, cur_timer->msg, OS_MESG_NOBLOCK);
+            // Always-on ring: runtime→guest timer delivery (see ultra_trace.hpp).
+            recomp_ultra_trace_record("~timer_fire", 0,
+                (uint32_t)cur_timer->mq, (uint32_t)cur_timer->msg, (uint32_t)sent, (uint32_t)cur_timer_);
             // If the timer has a specified interval then reload it with that value
             if (cur_timer->interval != 0) {
                 cur_timer->timestamp = cur_timer->interval + time_now();

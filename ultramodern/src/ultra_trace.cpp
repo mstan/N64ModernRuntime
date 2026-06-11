@@ -7,6 +7,9 @@
 // Added 2026 by Matthew Stanley:
 //   - Lock-free fixed-size ring of recent libultra calls + accessor
 //     APIs for runner-side diagnostics.
+//   - 2026-06: moved from librecomp/src to ultramodern/src so the
+//     runtime's own event-delivery paths can record into the ring
+//     (see ultramodern/ultra_trace.hpp for the event classes).
 //
 // Copyright (c) 2026 Matthew Stanley
 //
@@ -21,13 +24,14 @@
  * to the requested idx to detect overwrites.
  *
  * No backpressure, no eviction logic — the slot at (idx & mask) is
- * simply the most recent writer's record. With a 4096-deep ring
- * this gives ~4 ms of history at typical libultra call rates,
+ * simply the most recent writer's record. With a 16384-deep ring
+ * this gives plenty of history at typical libultra call rates,
  * which is far more than the wall-clock window between an LLM
  * probe firing and the boot event we want to inspect.
  */
 
-#include "librecomp/ultra_trace.hpp"
+#include "ultramodern/ultra_trace.hpp"
+#include "ultramodern/ultramodern.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -58,6 +62,9 @@ struct Slot {
     uint32_t a1;
     uint32_t a2;
     uint32_t a3;
+    uint32_t thread;
+    uint16_t thread_id;
+    uint16_t pad;
     uint64_t ms;
 };
 
@@ -83,6 +90,21 @@ uint64_t now_ns() {
                        .time_since_epoch().count();
 }
 
+void current_guest_thread(uint32_t& thread, uint16_t& thread_id) {
+    thread = 0;
+    thread_id = 0;
+
+    unsigned char* rdram = g_rdram.load(std::memory_order_relaxed);
+    PTR(OSThread) self = ultramodern::this_thread();
+    if (rdram == nullptr || self == NULLPTR) {
+        return;
+    }
+
+    OSThread* t = TO_PTR(OSThread, self);
+    thread = static_cast<uint32_t>(self);
+    thread_id = static_cast<uint16_t>(t->id);
+}
+
 } /* namespace */
 
 extern "C" void recomp_ultra_trace_record(const char* name,
@@ -103,6 +125,9 @@ extern "C" void recomp_ultra_trace_record(const char* name,
 
     uint64_t seq = g_write_idx.fetch_add(1, std::memory_order_relaxed);
     uint64_t ms  = (now_ns() - origin) / 1000000ull;
+    uint32_t thread = 0;
+    uint16_t thread_id = 0;
+    current_guest_thread(thread, thread_id);
 
     auto fill = [&](Slot& s) {
         s.seq.store(UINT64_MAX, std::memory_order_relaxed);
@@ -117,6 +142,9 @@ extern "C" void recomp_ultra_trace_record(const char* name,
         s.a1 = a1;
         s.a2 = a2;
         s.a3 = a3;
+        s.thread = thread;
+        s.thread_id = thread_id;
+        s.pad = 0;
         s.ms = ms;
         s.seq.store(seq, std::memory_order_release);
     };
@@ -164,6 +192,9 @@ extern "C" int recomp_ultra_trace_get(uint64_t idx,
     out->a1  = s.a1;
     out->a2  = s.a2;
     out->a3  = s.a3;
+    out->thread = s.thread;
+    out->thread_id = s.thread_id;
+    out->pad = s.pad;
     out->ms  = s.ms;
     out->seq = got;
 
@@ -196,6 +227,9 @@ extern "C" int recomp_ultra_trace_boot_get(uint32_t pos,
     out->a1  = s.a1;
     out->a2  = s.a2;
     out->a3  = s.a3;
+    out->thread = s.thread;
+    out->thread_id = s.thread_id;
+    out->pad = s.pad;
     out->ms  = s.ms;
     out->seq = got;
 

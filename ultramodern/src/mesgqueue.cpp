@@ -56,12 +56,15 @@ namespace mesg_log {
         uint64_t ms;
         uint32_t mq;          // OSMesgQueue pointer (gpr-style)
         uint32_t msg;         // message value (often pointer)
+        uint32_t thread;      // current OSThread guest pointer, or 0
+        uint16_t thread_id;   // current OSThread id, or 0 outside game threads
         uint16_t valid_before;
         uint16_t valid_after;
         uint8_t  op;
         uint8_t  block;       // 1 = OS_MESG_BLOCK, 0 = OS_MESG_NOBLOCK
         uint8_t  game_thread; // 1 = sender/receiver was game thread
         uint8_t  pad;
+        uint16_t reserved;
     };
 
     // Bumped from 1024 to 65536 to span ~18 minutes of VI ticks at 60Hz —
@@ -78,21 +81,44 @@ namespace mesg_log {
             std::chrono::steady_clock::now() - t0).count());
     }
 
-    inline void record(uint8_t op, uint32_t mq, uint32_t msg,
+    inline void current_thread(uint8_t* rdram, uint32_t& thread, uint16_t& thread_id) {
+        thread = 0;
+        thread_id = 0;
+        if (rdram == nullptr) {
+            return;
+        }
+
+        PTR(OSThread) self = ultramodern::this_thread();
+        if (self == NULLPTR) {
+            return;
+        }
+
+        OSThread* t = TO_PTR(OSThread, self);
+        thread = static_cast<uint32_t>(self);
+        thread_id = static_cast<uint16_t>(t->id);
+    }
+
+    inline void record(uint8_t* rdram, uint8_t op, uint32_t mq, uint32_t msg,
                        uint16_t vb, uint16_t va,
                        bool block, bool game_thread) {
         const uint64_t s = next_seq.fetch_add(1, std::memory_order_relaxed);
+        uint32_t thread = 0;
+        uint16_t thread_id = 0;
+        current_thread(rdram, thread, thread_id);
         Event& e = ring[s % RING_CAP];
         e.seq = s;
         e.ms = now_ms();
         e.mq = mq;
         e.msg = msg;
+        e.thread = thread;
+        e.thread_id = thread_id;
         e.valid_before = vb;
         e.valid_after = va;
         e.op = op;
         e.block = block ? 1 : 0;
         e.game_thread = game_thread ? 1 : 0;
         e.pad = 0;
+        e.reserved = 0;
     }
 }
 
@@ -136,7 +162,7 @@ static std::atomic<uint32_t> g_external_pending{0};
 void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
     external_messages.enqueue({mq, msg, jam});
     g_external_pending.fetch_add(1, std::memory_order_relaxed);
-    mesg_log::record(mesg_log::OP_SEND_EXTERNAL,
+    mesg_log::record(nullptr, mesg_log::OP_SEND_EXTERNAL,
                      uint32_t(mq), uint32_t(uintptr_t(msg)),
                      0, 0, false, false);
 }
@@ -158,7 +184,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
         // Try non-blocking send first.
         bool ok = do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
         if (!ok) {
-            mesg_log::record(mesg_log::OP_EXT_DEQ_FULL,
+            mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_FULL,
                              uint32_t(to_send.mq),
                              uint32_t(uintptr_t(to_send.mesg)),
                              vb, vb, false, true);
@@ -199,7 +225,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
         } else {
             OSMesgQueue* mq_post = TO_PTR(OSMesgQueue, to_send.mq);
             const uint16_t va = uint16_t(mq_post ? mq_post->validCount : 0);
-            mesg_log::record(mesg_log::OP_EXT_DEQ_OK,
+            mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_OK,
                              uint32_t(to_send.mq),
                              uint32_t(uintptr_t(to_send.mesg)),
                              vb, va, false, true);
@@ -331,7 +357,7 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
     else {
         // Otherwise, yield this thread until the queue has room.
         while (MQ_IS_FULL(mq)) {
-            mesg_log::record(mesg_log::OP_DO_SEND_BLOCK,
+            mesg_log::record(rdram, mesg_log::OP_DO_SEND_BLOCK,
                              uint32_t(mq_), uint32_t(uintptr_t(msg)),
                              uint16_t(mq->validCount), uint16_t(mq->validCount),
                              true, true);
@@ -373,7 +399,7 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     } else {
         // Otherwise, yield this thread in a loop until the queue is no longer full
         while (MQ_IS_EMPTY(mq)) {
-            mesg_log::record(mesg_log::OP_RECV_BLOCK,
+            mesg_log::record(rdram, mesg_log::OP_RECV_BLOCK,
                              uint32_t(mq_), 0,
                              uint16_t(mq->validCount), uint16_t(mq->validCount),
                              true, true);
@@ -416,7 +442,7 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
     // Try to send the message.
     bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
     const uint16_t va = uint16_t(mq ? mq->validCount : 0);
-    mesg_log::record(mesg_log::OP_SEND_GAME,
+    mesg_log::record(rdram, mesg_log::OP_SEND_GAME,
                      uint32_t(mq_), uint32_t(uintptr_t(msg)),
                      vb, va, flags == OS_MESG_BLOCK, true);
 
@@ -454,7 +480,7 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 
     assert(ultramodern::is_game_thread() && "RecvMesg not allowed outside of game threads.");
 
     const uint16_t vb_enter = uint16_t(mq ? mq->validCount : 0);
-    mesg_log::record(mesg_log::OP_RECV_ENTER,
+    mesg_log::record(rdram, mesg_log::OP_RECV_ENTER,
                      uint32_t(mq_), 0, vb_enter, vb_enter,
                      flags == OS_MESG_BLOCK, true);
 
@@ -469,7 +495,7 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 
         if (msg_ != NULLPTR) {
             got = uint32_t(uintptr_t(*TO_PTR(OSMesg, msg_)));
         }
-        mesg_log::record(mesg_log::OP_RECV_RETURN_OK,
+        mesg_log::record(rdram, mesg_log::OP_RECV_RETURN_OK,
                          uint32_t(mq_), got, vb_enter, va,
                          flags == OS_MESG_BLOCK, true);
     }

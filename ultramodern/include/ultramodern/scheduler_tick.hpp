@@ -75,6 +75,22 @@ extern "C" {
 // threads.
 void ultramodern_scheduler_tick(void);
 
+// Same scheduler tick, with the guest branch PC for loop-checkpoint
+// diagnostics. Generated code should prefer this form for back-edges.
+void ultramodern_scheduler_tick_vram(uint32_t pc);
+
+typedef struct ultramodern_loop_checkpoint_event {
+    uint32_t pc;
+    uint32_t thread;
+    uint32_t thread_id;
+    uint32_t ms;
+    uint64_t count;
+} ultramodern_loop_checkpoint_event;
+
+uint32_t ultramodern_loop_checkpoint_capacity(void);
+int ultramodern_loop_checkpoint_get(uint32_t thread_id,
+                                    ultramodern_loop_checkpoint_event* out);
+
 // Master enable for voluntary preemption. Runner reads its environment
 // at startup and calls this; if disabled, the monitor never sets the
 // flag and the trace_entry hot path is a cheap load against a zero.

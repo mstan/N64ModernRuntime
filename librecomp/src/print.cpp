@@ -1,4 +1,5 @@
 #include <vector>
+#include "ultramodern/ultra_trace.hpp"
 
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
@@ -6,30 +7,38 @@
 #include "euc-jp.hpp"
 
 extern "C" void __checkHardware_msp_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = 0;
 }
 
 extern "C" void __checkHardware_kmc_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = 0;
 }
 
 extern "C" void __checkHardware_isv_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = 0;
 }
 
 extern "C" void __osInitialize_msp_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
 }
 
 extern "C" void __osInitialize_kmc_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
 }
 
 extern "C" void __osInitialize_isv_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
 }
 
 extern "C" void isPrintfInit_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
 }
 
 extern "C" void __osRdbSend_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     gpr buf = ctx->r4;
     size_t size = ctx->r5;
     u32 type = (u32)ctx->r6;
@@ -46,6 +55,7 @@ extern "C" void __osRdbSend_recomp(uint8_t * rdram, recomp_context * ctx) {
 }
 
 extern "C" void is_proutSyncPrintf_recomp(uint8_t * rdram, recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     // Buffering to speed up print performance
     static std::vector<char> print_buffer;
 

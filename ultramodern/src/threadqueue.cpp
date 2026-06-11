@@ -1,14 +1,152 @@
 #include <cassert>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 
 #include "ultramodern/ultramodern.hpp"
 
 static PTR(OSThread) running_queue_impl = NULLPTR;
+
+extern "C" uint32_t ultramodern_running_queue_head(void) {
+    return static_cast<uint32_t>(running_queue_impl);
+}
+
+namespace sched_log {
+    enum Op : uint32_t {
+        OP_INSERT = 1,
+        OP_POP = 2,
+        OP_REMOVE = 3,
+        OP_REMOVE_MISS = 4,
+        OP_SCHEDULE_RUNNING = 100,
+        OP_CHECK_EMPTY = 101,
+        OP_CHECK_PEEK = 102,
+        OP_CHECK_NO_SWAP = 103,
+        OP_CHECK_SWAP = 104,
+        OP_SWAP_ENTER = 110,
+        OP_SWAP_INSERT_SELF = 111,
+        OP_SWAP_WAIT_ENTER = 112,
+        OP_SWAP_WAIT_RETURN = 113,
+        OP_WAIT_BEGIN = 120,
+        OP_WAIT_RETURN = 121,
+        OP_RESUME_SIGNAL = 122,
+        OP_RUN_NEXT_ENTER = 123,
+        OP_RUN_NEXT_EMPTY = 124,
+        OP_RUN_NEXT_TARGET = 125,
+        OP_RUN_NEXT_WAIT_ENTER = 126,
+        OP_RUN_NEXT_WAIT_RETURN = 127,
+        OP_YIELD_ANY_ENTER = 130,
+        OP_YIELD_ANY_EMPTY = 131,
+        OP_YIELD_ANY_TARGET = 132,
+        OP_YIELD_ANY_REQUEUE_SELF = 133,
+        OP_YIELD_ANY_WAIT_ENTER = 134,
+        OP_YIELD_ANY_WAIT_RETURN = 135,
+    };
+
+    struct Event {
+        uint64_t seq;
+        uint64_t ms;
+        uint32_t op;
+        uint32_t queue;
+        uint32_t thread;
+        uint32_t current_thread;
+        uint32_t head_after;
+        uint32_t next_after;
+        uint16_t thread_id;
+        uint16_t current_thread_id;
+        int16_t priority;
+        uint16_t pad;
+    };
+
+    static_assert(sizeof(Event) == 48, "scheduler queue event size changed");
+
+    constexpr size_t RING_CAP = 65536;
+    static Event ring[RING_CAP];
+    static std::atomic<uint64_t> next_seq{0};
+    static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+
+    uint64_t now_ms() {
+        return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+    }
+
+    uint16_t thread_id(RDRAM_ARG PTR(OSThread) t_) {
+        if (t_ == NULLPTR) {
+            return 0;
+        }
+        return static_cast<uint16_t>(TO_PTR(OSThread, t_)->id);
+    }
+
+    int16_t thread_priority(RDRAM_ARG PTR(OSThread) t_) {
+        if (t_ == NULLPTR) {
+            return 0;
+        }
+        return static_cast<int16_t>(TO_PTR(OSThread, t_)->priority);
+    }
+
+    void record(RDRAM_ARG uint32_t op,
+                PTR(PTR(OSThread)) queue_,
+                PTR(OSThread) thread_,
+                PTR(OSThread) head_after) {
+        const uint64_t s = next_seq.fetch_add(1, std::memory_order_relaxed);
+        Event& e = ring[s % RING_CAP];
+        e.seq = s;
+        e.ms = now_ms();
+        e.op = op;
+        e.queue = static_cast<uint32_t>(queue_);
+        e.thread = static_cast<uint32_t>(thread_);
+        e.current_thread = static_cast<uint32_t>(ultramodern::this_thread());
+        e.head_after = static_cast<uint32_t>(head_after);
+        e.next_after = thread_ != NULLPTR ? static_cast<uint32_t>(TO_PTR(OSThread, thread_)->next) : 0;
+        e.thread_id = thread_id(PASS_RDRAM thread_);
+        e.current_thread_id = thread_id(PASS_RDRAM ultramodern::this_thread());
+        e.priority = thread_priority(PASS_RDRAM thread_);
+        e.pad = 0;
+    }
+}
+
+extern "C" void ultramodern_sched_recent_copy(
+    void* out_void, size_t cap, size_t* n_written, uint64_t* next_seq_out)
+{
+    using namespace sched_log;
+    const uint64_t s = next_seq.load(std::memory_order_relaxed);
+    if (next_seq_out) *next_seq_out = s;
+    if (cap == 0 || out_void == nullptr) {
+        if (n_written) *n_written = 0;
+        return;
+    }
+    const size_t available = std::min<size_t>(s, RING_CAP);
+    const size_t want = std::min(cap, available);
+    Event* out = static_cast<Event*>(out_void);
+    const size_t start = (s - want) % RING_CAP;
+    for (size_t i = 0; i < want; i++) {
+        out[i] = ring[(start + i) % RING_CAP];
+    }
+    if (n_written) *n_written = want;
+}
+
+extern "C" size_t ultramodern_sched_event_size(void) {
+    return sizeof(sched_log::Event);
+}
 
 static PTR(OSThread)* queue_to_ptr(RDRAM_ARG PTR(PTR(OSThread)) queue) {
     if (queue == ultramodern::running_queue) {
         return &running_queue_impl;
     }
     return TO_PTR(PTR(OSThread), queue);
+}
+
+static PTR(OSThread) queue_head_or_zero(RDRAM_ARG PTR(PTR(OSThread)) queue) {
+    if (queue == NULLPTR) {
+        return NULLPTR;
+    }
+    return *queue_to_ptr(PASS_RDRAM queue);
+}
+
+void ultramodern::scheduler_trace_mark(RDRAM_ARG uint32_t op,
+                                       PTR(PTR(OSThread)) queue_,
+                                       PTR(OSThread) thread_) {
+    sched_log::record(PASS_RDRAM op, queue_, thread_, queue_head_or_zero(PASS_RDRAM queue_));
 }
 
 void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) toadd_) {
@@ -21,6 +159,7 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
     toadd->next = (*cur);
     toadd->queue = queue_;
     *cur = toadd_;
+    sched_log::record(PASS_RDRAM sched_log::OP_INSERT, queue_, toadd_, *queue_to_ptr(PASS_RDRAM queue_));
 
     debug_printf("  Contains:");
     cur = queue_to_ptr(PASS_RDRAM queue_);
@@ -36,6 +175,7 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
     PTR(OSThread) ret = *queue;
     *queue = TO_PTR(OSThread, ret)->next;
     TO_PTR(OSThread, ret)->queue = NULLPTR;
+    sched_log::record(PASS_RDRAM sched_log::OP_POP, queue_, ret, *queue);
     debug_printf("[Thread Queue] Popped thread %d from queue 0x%08X\n", TO_PTR(OSThread, ret)->id, (uintptr_t)queue_);
     return ret;
 }
@@ -43,16 +183,17 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
 bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
     debug_printf("[Thread Queue] Removing thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
 
-    PTR(PTR(OSThread)) cur = queue_;
-    while (cur != NULLPTR) {
-        PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
+    PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
+    while (*cur_ptr != NULLPTR) {
         if (*cur_ptr == t_) {
             *cur_ptr = TO_PTR(OSThread, *cur_ptr)->next;
+            sched_log::record(PASS_RDRAM sched_log::OP_REMOVE, queue_, t_, *queue_to_ptr(PASS_RDRAM queue_));
             return true;
         }
-        cur = TO_PTR(OSThread, *cur_ptr)->next;
+        cur_ptr = &TO_PTR(OSThread, *cur_ptr)->next;
     }
 
+    sched_log::record(PASS_RDRAM sched_log::OP_REMOVE_MISS, queue_, t_, *queue_to_ptr(PASS_RDRAM queue_));
     return false;
 }
 

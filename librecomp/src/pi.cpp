@@ -463,6 +463,14 @@ void ultramodern::join_saving_thread() {
     }
 }
 
+// PI DMA completion: post the done-message to the request's return queue and
+// record the delivery in the always-on ring ("~pi_dma_done": a0=mq, a1=phys,
+// a2=send result, a3=size — see ultramodern/ultra_trace.hpp event classes).
+static void dma_complete(RDRAM_ARG PTR(OSMesgQueue) mq, uint32_t physical_addr, uint32_t size) {
+    s32 sent = osSendMesg(PASS_RDRAM mq, 0, OS_MESG_NOBLOCK);
+    recomp_ultra_trace_record("~pi_dma_done", 0, (uint32_t)mq, physical_addr, (uint32_t)sent, size);
+}
+
 void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
     // TODO asynchronous transfer
     // TODO implement unaligned DMA correctly
@@ -495,7 +503,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             }
 
             // Send a message to the mq to indicate that the transfer completed
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            dma_complete(rdram, mq, physical_addr, size);
         } else if (flash_region_contains(physical_addr, size)) {
             const uint32_t offset = physical_addr - recomp::sram_base;
             if (flash_mode == FlashMode::Id) {
@@ -511,7 +519,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             } else {
                 save_read(rdram, rdram_address, offset, size);
             }
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            dma_complete(rdram, mq, physical_addr, size);
         } else if (physical_addr >= recomp::sram_base) {
             if (!recomp::sram_allowed()) {
                 // SRAM region is also used by the 64DD's diagnostic/RAM
@@ -533,18 +541,18 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
                 for (uint32_t i = 0; i < size; i++) {
                     MEM_B(i, rdram_address) = (int8_t)0xFF;
                 }
-                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+                dma_complete(rdram, mq, physical_addr, size);
             } else {
                 // read sram
                 save_read(rdram, rdram_address, physical_addr - recomp::sram_base, size);
-                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+                dma_complete(rdram, mq, physical_addr, size);
             }
         } else if (physical_addr >= recomp::drive_base) {
             // 64DD region (0x06000000-0x07FFFFFF). No drive attached →
             // return zeros and complete cleanly so libleo proceeds along
             // its no-disk path instead of hanging on a missing DMA done.
             fprintf(stderr, "[pi] Drive read 0x%08X size=0x%X — no drive, returning zeros\n", physical_addr, size);
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            dma_complete(rdram, mq, physical_addr, size);
         } else {
             fprintf(stderr, "[WARN] PI DMA read from unknown region, phys address 0x%08X\n", physical_addr);
         }
@@ -569,20 +577,20 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
                         static_cast<int>(flash_mode), physical_addr, size);
                 }
             }
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            dma_complete(rdram, mq, physical_addr, size);
         } else if (physical_addr >= recomp::sram_base) {
             if (!recomp::sram_allowed()) {
                 // Same reasoning as the read path — drop drive writes
                 // when the configured save type is not SRAM.
                 fprintf(stderr, "[pi] Drive/SRAM write 0x%08X size=0x%X — no-device, dropping\n", physical_addr, size);
-                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+                dma_complete(rdram, mq, physical_addr, size);
             } else {
                 save_write(rdram, rdram_address, physical_addr - recomp::sram_base, size);
-                osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+                dma_complete(rdram, mq, physical_addr, size);
             }
         } else if (physical_addr >= recomp::drive_base) {
             fprintf(stderr, "[pi] Drive write 0x%08X size=0x%X — no drive, dropping\n", physical_addr, size);
-            osSendMesg(rdram, mq, 0, OS_MESG_NOBLOCK);
+            dma_complete(rdram, mq, physical_addr, size);
         } else {
             fprintf(stderr, "[WARN] PI DMA write to unknown region, phys address 0x%08X\n", physical_addr);
         }
@@ -744,6 +752,7 @@ extern "C" void osPiGetStatus_recomp(RDRAM_ARG recomp_context * ctx) {
 }
 
 extern "C" void osPiRawStartDma_recomp(RDRAM_ARG recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ultramodern::error_handling::message_box(
         "Stub `osPiRawStartDma_recomp` function called!\n"
         "Most games do not call this function directly, which means the libultra function\n"
@@ -761,6 +770,7 @@ extern "C" void osPiRawStartDma_recomp(RDRAM_ARG recomp_context * ctx) {
 }
 
 extern "C" void osEPiRawStartDma_recomp(RDRAM_ARG recomp_context * ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ultramodern::error_handling::message_box(
         "Stub `osEPiRawStartDma_recomp` function called!\n"
         "Most games do not call this function directly, which means the libultra function\n"

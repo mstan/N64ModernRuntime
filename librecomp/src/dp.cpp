@@ -1,4 +1,5 @@
 #include "recomp.h"
+#include "ultramodern/ultra_trace.hpp"
 #include "librecomp/rdp.hpp"
 
 enum class RDPStatusBit {
@@ -36,14 +37,17 @@ recomp::rdp::DpRegisters& recomp::rdp::dp_registers() {
 }
 
 extern "C" void osDpSetNextBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     assert(false);
 }
 
 extern "C" void osDpGetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     ctx->r2 = recomp::rdp::dp_registers().status;
 }
 
 extern "C" void osDpSetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     uint32_t& status = recomp::rdp::dp_registers().status;
     update_bit(status, ctx->r4, RDPStatusBit::XbusDmem);
     update_bit(status, ctx->r4, RDPStatusBit::Freeze);
@@ -51,6 +55,7 @@ extern "C" void osDpSetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osDpGetCounters_recomp(uint8_t* rdram, recomp_context* ctx) {
+    LIBRECOMP_ULTRA_TRACE(ctx);
     const auto& regs = recomp::rdp::dp_registers();
     const gpr array = ctx->r4;
     MEM_W(0x00, array) = regs.clock;

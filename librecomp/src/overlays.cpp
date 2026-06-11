@@ -94,6 +94,18 @@ static std::unordered_map<int32_t, recomp_func_t*> func_map{};
 // SEGV crashes during heavy overlay loading.
 static std::shared_mutex func_map_mutex;
 
+static bool section_original_fragment_base(const SectionTableEntry& sec,
+                                           uint32_t& base_out);
+static void install_section_func_aliases(const SectionTableEntry& section,
+                                         int32_t runtime_base,
+                                         const FuncEntry& func);
+static void erase_section_func_aliases(const SectionTableEntry& section,
+                                       int32_t runtime_base,
+                                       const FuncEntry& func);
+static void erase_fragment_slot_aliases(const SectionTableEntry& section,
+                                        int32_t runtime_base,
+                                        uint32_t offset);
+
 // Recursive helper: writer entry points like register_runtime_fragment
 // call internal helpers (scan_fragment_section_trampolines,
 // retry_pending_trampolines, try_install_trampoline) that ALSO touch
@@ -341,10 +353,7 @@ void load_overlay(size_t section_table_index, int32_t ram) {
     // recompiler use link-time vrams. Both must dispatch correctly.
     for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
         const FuncEntry& func = section.funcs[function_index];
-        func_map[ram + func.offset] = func.func;
-        if (section.ram_addr != ram) {
-            func_map[section.ram_addr + func.offset] = func.func;
-        }
+        install_section_func_aliases(section, ram, func);
         pc_index_register(func.func, section_table_index);
     }
 
@@ -442,14 +451,27 @@ static bool func_entry_is_live_fragment_jump_slot(
     return target != 0;
 }
 
+static bool section_original_fragment_base(const SectionTableEntry& sec,
+                                           uint32_t& base_out);
+
 // Translate a link-time vram (assigned by the linker when the section
 // was built) to its current runtime RAM address. Returns 0 if no
 // loaded section covers the link-time address.
 static int32_t translate_link_time_to_runtime(uint32_t link_time) {
     for (const auto& ls : loaded_sections) {
         const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+        if (link_time >= (uint32_t)ls.loaded_ram_addr &&
+            link_time < (uint32_t)ls.loaded_ram_addr + sec.size) {
+            return (int32_t)link_time;
+        }
         if (link_time >= sec.ram_addr && link_time < sec.ram_addr + sec.size) {
             return ls.loaded_ram_addr + (int32_t)(link_time - sec.ram_addr);
+        }
+        uint32_t original_base = 0;
+        if (section_original_fragment_base(sec, original_base) &&
+            link_time >= original_base &&
+            link_time < original_base + sec.size) {
+            return ls.loaded_ram_addr + (int32_t)(link_time - original_base);
         }
     }
     return 0;
@@ -488,6 +510,10 @@ static bool try_install_trampoline(int32_t trampoline_runtime_addr, uint32_t lin
             int32_t link_time_vram = (int32_t)sec.ram_addr + off;
             if (link_time_vram != trampoline_runtime_addr) {
                 func_map[link_time_vram] = it->second;
+                uint32_t original_base = 0;
+                if (section_original_fragment_base(sec, original_base)) {
+                    func_map[(int32_t)original_base + off] = it->second;
+                }
                 // Diagnostic — narrate every link-time alias install
                 // when the env var probe is targeting this address.
                 static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
@@ -599,6 +625,12 @@ static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_ind
     }
     if (first_func_offset <= 0x20) return;  // nothing between header and first func
 
+    uint32_t decode_base = section.ram_addr;
+    uint32_t original_base = 0;
+    if (section_original_fragment_base(section, original_base)) {
+        decode_base = original_base;
+    }
+
     // Walk 8-byte slots. Each slot is { instr, nop } per Stadium's
     // convention. Non-conforming slots (no nop in delay slot) are
     // skipped — they're probably padding or data, not trampolines.
@@ -617,7 +649,7 @@ static void scan_fragment_section_trampolines(uint8_t* rdram, size_t section_ind
             continue;
         }
 
-        uint32_t pc_delay = section.ram_addr + slot_off + 4;
+        uint32_t pc_delay = decode_base + slot_off + 4;
         uint32_t target = decode_jal_target(instr, pc_delay);
         if (target == 0) {
             if (probe_slot) {
@@ -748,6 +780,65 @@ static inline size_t synthetic_bucket_idx(uint32_t addr) {
     return size_t((addr - kSyntheticPoolBase) / kSyntheticPoolStride);
 }
 
+static bool section_original_fragment_base(const SectionTableEntry& sec,
+                                           uint32_t& base_out) {
+    if (sec.original_pattern_id == 0xFFFFFFFFu) {
+        return false;
+    }
+    const uint32_t bucket = (sec.original_pattern_id + 0x10u) & 0x0FFu;
+    base_out = 0x80000000u | (bucket << 20);
+    return true;
+}
+
+static void install_section_func_aliases(const SectionTableEntry& section,
+                                         int32_t runtime_base,
+                                         const FuncEntry& func) {
+    if (func.func == nullptr) return;
+
+    const int32_t offset = (int32_t)func.offset;
+    func_map[runtime_base + offset] = func.func;
+    if ((int32_t)section.ram_addr != runtime_base) {
+        func_map[(int32_t)section.ram_addr + offset] = func.func;
+    }
+
+    uint32_t original_base = 0;
+    if (section_original_fragment_base(section, original_base)) {
+        func_map[(int32_t)original_base + offset] = func.func;
+    }
+}
+
+static void erase_section_func_aliases(const SectionTableEntry& section,
+                                       int32_t runtime_base,
+                                       const FuncEntry& func) {
+    if (func.func == nullptr) return;
+
+    const int32_t offset = (int32_t)func.offset;
+    func_map.erase(runtime_base + offset);
+    if ((int32_t)section.ram_addr != runtime_base) {
+        func_map.erase((int32_t)section.ram_addr + offset);
+    }
+
+    uint32_t original_base = 0;
+    if (section_original_fragment_base(section, original_base)) {
+        func_map.erase((int32_t)original_base + offset);
+    }
+}
+
+static void erase_fragment_slot_aliases(const SectionTableEntry& section,
+                                        int32_t runtime_base,
+                                        uint32_t offset) {
+    const int32_t signed_offset = (int32_t)offset;
+    func_map.erase(runtime_base + signed_offset);
+    if ((int32_t)section.ram_addr != runtime_base) {
+        func_map.erase((int32_t)section.ram_addr + signed_offset);
+    }
+
+    uint32_t original_base = 0;
+    if (section_original_fragment_base(section, original_base)) {
+        func_map.erase((int32_t)original_base + signed_offset);
+    }
+}
+
 void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, int32_t fragment_ptr) {
     FuncMapWriteLock _fml;
     if (sections_info.code_sections == nullptr) return;
@@ -784,11 +875,20 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     }
 
     size_t found_index = (size_t)-1;
-    if (candidates.size() == 1) {
-        // Common case: exactly one section per bucket (every static
-        // overlay + the single-block decompressed_section path).
+    bool has_hashed_candidate = false;
+    for (size_t ci : candidates) {
+        const SectionTableEntry& sec = sections_info.code_sections[ci];
+        if (sec.content_hash != 0) {
+            has_hashed_candidate = true;
+            break;
+        }
+    }
+    if (candidates.size() == 1 && !has_hashed_candidate) {
+        // Common case: exactly one non-content-addressed section per
+        // bucket (every static overlay + the single-block
+        // decompressed_section path).
         found_index = candidates.front();
-    } else if (candidates.size() > 1) {
+    } else if (!candidates.empty()) {
         // Pattern-synthesized case: hash the bytes Stadium just put
         // in RDRAM at fragment_ptr, look up the matching section by
         // content_hash. Window must match the build-time hash window
@@ -860,8 +960,11 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
             }
 
             if (found_index == (size_t)-1) {
-                // Still no match. Fall back to first-candidate; log
-                // diagnostics + dump live bytes for offline ID.
+                // Still no match. Legacy non-content-addressed candidates
+                // keep the old bucket fallback after logging. Pattern
+                // candidates with content_hash are content-addressed; a
+                // mismatch means the live fragment variant is unknown and
+                // must stay unregistered until the generator learns it.
                 fprintf(stderr,
                     "[reg-frag] no content-hash match for id=0x%X "
                     "fragment_ptr=0x%08X live_hash=0x%016llX "
@@ -883,6 +986,10 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                         "  live header link_vram=0x%08X (no candidate range matched)\n",
                         hdr_link_vram);
                 }
+                if (has_hashed_candidate) {
+                    fprintf(stderr,
+                        "  hashed candidate mismatch is terminal; leaving fragment unregistered\n");
+                }
                 fflush(stderr);
                 size_t dump_size = sections_info.code_sections[candidates.front()].size;
                 char path[128];
@@ -903,7 +1010,9 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                     }
                     fclose(f);
                 }
-                found_index = candidates.front();
+                if (!has_hashed_candidate) {
+                    found_index = candidates.front();
+                }
             }
         }
     }
@@ -1029,7 +1138,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
             const FuncEntry& fe = old_section.funcs[fi];
             if (fe.func == nullptr) continue;
-            func_map.erase(fragment_ptr + (int32_t)fe.offset);
+            erase_section_func_aliases(old_section, fragment_ptr, fe);
             // Erase the OLD section's link-time alias too — for
             // pattern-shared bucket vrams (e.g. 0x8FF00000) this
             // is critical since multiple sections claim the same
@@ -1069,7 +1178,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
             if (off > 0 && off < first_func_offset) first_func_offset = off;
         }
         for (uint32_t slot_off = 0x20; slot_off + 8 <= first_func_offset; slot_off += 8) {
-            func_map.erase(fragment_ptr + (int32_t)slot_off);
+            erase_fragment_slot_aliases(old_section, fragment_ptr, slot_off);
             if ((int32_t)old_section.ram_addr != fragment_ptr) {
                 int32_t link_slot = (int32_t)old_section.ram_addr + (int32_t)slot_off;
                 static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
@@ -1118,10 +1227,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     for (size_t fi = 0; fi < section.num_funcs; fi++) {
         const FuncEntry& fe = section.funcs[fi];
         if (fe.func == nullptr) continue;
-        func_map[fragment_ptr + (int32_t)fe.offset] = fe.func;
-        if ((int32_t)section.ram_addr != fragment_ptr) {
-            func_map[(int32_t)section.ram_addr + (int32_t)fe.offset] = fe.func;
-        }
+        install_section_func_aliases(section, fragment_ptr, fe);
         // Track host PC → section_index so caller-context disambiguation
         // can map a return PC back to the variant that hosts it.
         pc_index_register(fe.func, found_index);
@@ -1336,10 +1442,7 @@ static void unload_overlay_by_section_index(uint32_t section_table_index) {
         // slot address and the section's link-time vram.
         for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
             const auto& func = section.funcs[func_index];
-            func_map.erase(func.offset + find_it->loaded_ram_addr);
-            if (section.ram_addr != find_it->loaded_ram_addr) {
-                func_map.erase(func.offset + section.ram_addr);
-            }
+            erase_section_func_aliases(section, find_it->loaded_ram_addr, func);
         }
         // Reset the section's address in the address table
         section_addresses[section.index] = section.ram_addr;
@@ -1390,10 +1493,7 @@ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
             // runtime slot address and the section's link-time vram.
             for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
                 const auto& func = section.funcs[func_index];
-                func_map.erase(func.offset + it->loaded_ram_addr);
-                if (section.ram_addr != it->loaded_ram_addr) {
-                    func_map.erase(func.offset + section.ram_addr);
-                }
+                erase_section_func_aliases(section, it->loaded_ram_addr, func);
             }
             // Reset the section's address in the address table
             section_addresses[section.index] = section.ram_addr;

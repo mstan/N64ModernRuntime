@@ -38,6 +38,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -2703,6 +2704,127 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     }
     g_tier_static_hits.fetch_add(1, std::memory_order_relaxed);
     return func_find->second;
+}
+
+// ---------------------------------------------------------------------
+// Debug-only hooks to exercise the always-on lookup-miss capture without
+// a real crash (PMS has no benign misses — a real miss IS a crash). Both
+// are invoked only from explicit debug-server commands; they never run on
+// their own. See PocketMonstersStadiumRecomp/src/main/debug_server.cpp.
+// ---------------------------------------------------------------------
+
+// Dump the live loaded-section table to build/loaded_sections.json so a
+// probe can pick a guaranteed-interior offset (code-entry) and a
+// guaranteed reloc offset (pointer-site) from REAL section data rather
+// than guessing addresses.
+extern "C" void recomp_debug_dump_loaded_sections(void) {
+    FILE* f = fopen("build/loaded_sections.json", "w");
+    if (f == nullptr) {
+        f = fopen("loaded_sections.json", "w");
+    }
+    if (f == nullptr) {
+        return;
+    }
+    std::shared_lock<std::shared_mutex> lock(func_map_mutex);
+    fprintf(f, "[\n");
+    bool first = true;
+    if (sections_info.code_sections != nullptr) {
+        for (const auto& ls : loaded_sections) {
+            const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+            uint32_t runtime_base = (uint32_t)ls.loaded_ram_addr;
+
+            // A guaranteed-interior, non-4-aligned offset: cannot be a
+            // (4-aligned) function start and cannot match a (4-aligned)
+            // reloc offset -> probing it yields a "code-entry" miss.
+            uint32_t code_off = (sec.size > 8) ? (((sec.size / 2) & ~3u) | 1u) : 1u;
+
+            // The first reloc offset that is NOT a function start: probing
+            // it yields a "pointer-site" miss (reloc present, but the
+            // address is not a registered function so get_function misses).
+            std::unordered_set<uint32_t> func_starts;
+            func_starts.reserve(sec.num_funcs * 2);
+            for (size_t i = 0; i < sec.num_funcs; i++) {
+                func_starts.insert(sec.funcs[i].offset);
+            }
+            uint32_t ptr_off = 0xFFFFFFFFu;
+            for (size_t i = 0; i < sec.num_relocs; i++) {
+                uint32_t off = sec.relocs[i].offset;
+                if (off < sec.size && func_starts.find(off) == func_starts.end()) {
+                    ptr_off = off;
+                    break;
+                }
+            }
+
+            char ptr_field[24];
+            if (ptr_off == 0xFFFFFFFFu) {
+                snprintf(ptr_field, sizeof(ptr_field), "null");
+            } else {
+                snprintf(ptr_field, sizeof(ptr_field), "\"0x%08X\"", runtime_base + ptr_off);
+            }
+            fprintf(f,
+                "%s  {\"index\":%zu,\"runtime_base\":\"0x%08X\",\"link_base\":\"0x%08X\","
+                "\"size\":\"0x%X\",\"content_hash\":\"0x%016llX\",\"num_funcs\":%zu,"
+                "\"num_relocs\":%zu,\"probe_code_addr\":\"0x%08X\",\"probe_pointer_addr\":%s}",
+                first ? "" : ",\n",
+                ls.section_table_index, runtime_base, sec.ram_addr,
+                sec.size, (unsigned long long)sec.content_hash, sec.num_funcs,
+                sec.num_relocs, runtime_base + code_off, ptr_field);
+            first = false;
+        }
+    }
+    fprintf(f, "\n]\n");
+    fclose(f);
+}
+
+// Force a get_function lookup for `addr` to drive the capture pipeline.
+// Returns 1 if the lookup missed (capture fired), 0 if it resolved to a
+// real function. Does NOT invoke the returned pointer, so a miss records
+// + returns without aborting.
+extern "C" int recomp_debug_probe_lookup(uint32_t addr) {
+    recomp_func_t* f = get_function((int32_t)addr);
+    return (f == unhandled_lookup_trampoline) ? 1 : 0;
+}
+
+// Pick a CURRENTLY-loaded section with a reloc offset that is not a
+// function start and probe runtime_base+offset (a "pointer-site" miss).
+// Computes the target against the live table just before probing, so it
+// can't be defeated by fragment eviction the way a stale dumped address
+// can. Writes the chosen address to *out_addr; returns 1 on a miss.
+extern "C" int recomp_debug_probe_pointer_site(uint32_t* out_addr) {
+    uint32_t target = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(func_map_mutex);
+        if (sections_info.code_sections != nullptr) {
+            for (const auto& ls : loaded_sections) {
+                const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+                if (sec.num_relocs == 0 || sec.num_funcs == 0) {
+                    continue;
+                }
+                std::unordered_set<uint32_t> starts;
+                starts.reserve(sec.num_funcs * 2);
+                for (size_t i = 0; i < sec.num_funcs; i++) {
+                    starts.insert(sec.funcs[i].offset);
+                }
+                for (size_t i = 0; i < sec.num_relocs && target == 0; i++) {
+                    uint32_t off = sec.relocs[i].offset;
+                    if (off < sec.size && starts.find(off) == starts.end()) {
+                        target = (uint32_t)ls.loaded_ram_addr + off;
+                    }
+                }
+                if (target != 0) {
+                    break;
+                }
+            }
+        }
+    } // release shared lock before get_function re-locks
+    if (out_addr != nullptr) {
+        *out_addr = target;
+    }
+    if (target == 0) {
+        return 0;
+    }
+    recomp_func_t* f = get_function((int32_t)target);
+    return (f == unhandled_lookup_trampoline) ? 1 : 0;
 }
 
 std::unordered_map<recomp_func_t*, recomp::overlays::BasePatchedFunction> recomp::overlays::get_base_patched_funcs() {

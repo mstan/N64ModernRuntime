@@ -28,9 +28,69 @@ correctly:
 - **Stops out-of-range memory reads from crashing the game** — bad reads
   return zeroes and get logged instead.
 - **Lets the game detect the Transfer Pak** accessory being plugged in.
+- **Always-on diagnostic rings + a guest-memory access surface.** The fork
+  records libultra calls, message-queue and scheduler events, SP/graphics
+  tasks and (with `trace_mode`) per-function entries into always-on ring
+  buffers, and exposes the guest RDRAM base to host code. These are the
+  diagnostic backbone used to bring the port up — and the same surface a
+  consumer can build runtime features on. See
+  [Runtime text-translation hook](#runtime-text-translation-hook) for a
+  worked example (the Pocket Monsters Stadium English patch).
 - **Smaller things:** a fix for a rare crash when two threads touch the
   function-lookup table at once; points its recompiler dependency at this
   project's fork; records which files were modified.
+
+## Runtime text-translation hook
+
+A consumer of this runtime —
+[PocketMonstersStadiumRecomp](https://github.com/mstan/PocketMonstersStadiumRecomp)
+— uses the infrastructure here to render a Japanese-only game in **English at
+runtime**, with no ROM edits or asset re-packing. It is a useful reference for
+what the diagnostic/trace surface enables, so the mechanism is documented here.
+
+**The surface this relies on:**
+
+- **`trace_mode` per-function entry hook.** When the recompiler
+  ([N64Recomp fork](https://github.com/mstan/N64Recomp)) is built with
+  `trace_mode = true`, it emits a `TRACE_ENTRY()` at the top of every
+  recompiled function, where the function's `ctx` (registers) and `rdram`
+  (guest memory) are in scope. The consumer defines that macro, so it is a
+  zero-cost extension point into every guest function call.
+- **`recomp_runtime_get_rdram()`** + the always-on rings (see
+  `ultramodern/ultra_trace.hpp`) let host code read guest memory and observe
+  execution without arming a one-shot trace — recording is continuous from
+  process start, so probes query a window rather than capture-then-hope.
+
+**How the translation works, end to end:**
+
+1. **Find the text routine, empirically.** A per-function census (built on the
+   trace hook) records every function entered with arguments that look like a
+   string draw — small x/y plus a pointer to NUL-terminated bytes — so the
+   game's single string-draw routine is identified from runtime behaviour, not
+   guessed from addresses (recompiled code is laid out differently than any
+   source oracle).
+2. **Key by content hash.** On each call to that routine the hook reads the
+   source glyph bytes from guest RDRAM (the game's text is a 2-byte EUC-JP-like
+   encoding; ASCII is single-byte) and hashes them (FNV-1a). The hash is the
+   translation key — robust to the game reusing text buffers.
+3. **Look up + replace.** Keys map to English strings in a small JSON table
+   loaded next to the executable and hot-reloaded on change. On a miss, the
+   original text is drawn unchanged.
+4. **Render English through the game's own font.** The font sheets already
+   contain Latin glyphs, so a hit re-drives the game's glyph drawer over the
+   English bytes — no glyph injection. Because the replacement never writes
+   back into game memory, it is **not bounded by the original length**.
+   Latin advance widths are measured from the resident font (or fall back to a
+   tight uniform advance for fonts streamed per-draw) so English is spaced
+   proportionally and fits the original text boxes. Format strings (`%d`/`%s`)
+   keep the game's own formatting path so dynamic values still work.
+
+The translation logic itself lives in the consumer
+([`src/main/diagnostics.cpp`](https://github.com/mstan/PocketMonstersStadiumRecomp/blob/main/src/main/diagnostics.cpp),
+`include/trace.h`), not in this runtime — the runtime only provides the rings,
+the guest-memory accessor, and the trace entry point. See the
+[PocketMonstersStadiumRecomp README](https://github.com/mstan/PocketMonstersStadiumRecomp#english-translation-patch)
+for how to capture strings and author translations.
 
 A modern runtime for traditional ports and recompilations of N64 games. \
 The runtime is consists of two libraries: [ultramodern](#ultramodern) and [librecomp](#librecomp).

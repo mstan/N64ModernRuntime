@@ -30,9 +30,11 @@
 // ---------------------------------------------------------------------
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -1835,6 +1837,201 @@ static void dump_lookup_context(FILE* f, uint8_t* rdram, recomp_context* ctx) {
     dump_lookup_memory_window(f, rdram, "at", (uint32_t)ctx->r1);
 }
 
+// ---------------------------------------------------------------------
+// Runtime overlay-discovery capture (Track B1 / C-capture).
+//
+// A get_function miss is almost always an undiscovered function entry
+// inside a decompressed fragment — an indirect jalr the static
+// recompiler never saw (FINDINGS.md CRASH-001). Instead of only
+// aborting, we record enough ground-truth per UNIQUE missing address to
+// drive the static fold-back (tools/fold_captures.py ->
+// game.toml force_function_vrams):
+//   - the missing vaddr
+//   - the enclosing loaded section's content_hash + offset-in-section
+//     (content_hash is stable across the synthetic per-variant link
+//      addresses, so it is the real key the fold-back joins on)
+//   - whether the offset sits on a reloc (the miss is a relocated
+//     POINTER site whose true target is section[target]:target_offset)
+//     vs. plain interior CODE (an undiscovered entry to seed here)
+//
+// Loud-but-not-destructive: each unique address logs ONCE (stderr +
+// last_error.log + a captures-file rewrite). Repeat hits of the same
+// address only bump an in-memory counter — no per-hit stderr spam and
+// no I/O flood for table-walk callers that hit the trampoline in a loop.
+// ---------------------------------------------------------------------
+struct LookupCapture {
+    uint32_t missed_addr = 0;
+    uint64_t hit_count = 0;
+    bool enclosing_found = false;
+    const char* match_kind = "none";   // "runtime" | "link" | "none"
+    size_t section_index = 0;
+    uint32_t link_base = 0;
+    uint32_t runtime_base = 0;
+    uint32_t section_size = 0;
+    uint32_t offset_in_section = 0;
+    uint64_t content_hash = 0;
+    uint32_t original_pattern_id = 0xFFFFFFFFu;
+    uint64_t load_order = 0;
+    bool offset_is_known_func = false; // offset matches an existing FuncEntry start
+    bool reloc_at_offset = false;
+    const char* reloc_type = "";
+    uint16_t reloc_target_section = 0;
+    uint32_t reloc_target_offset = 0;
+    const char* classification = "unknown"; // see classify_lookup_capture
+};
+
+// Per-tier execution counters. Today only two tiers exist (static
+// dispatch hit, lookup miss). Names for the rest of the self-healing
+// arc (interpreter / JIT / disk-shard) are added as those tiers land so
+// the coverage report stays forward-compatible.
+static std::atomic<uint64_t> g_tier_static_hits{0};
+static std::atomic<uint64_t> g_tier_lookup_misses{0};
+
+static std::mutex g_lookup_capture_mutex;
+static std::map<uint32_t, LookupCapture> g_lookup_captures;
+
+static const char* reloc_type_name(RelocEntryType t) {
+    switch (t) {
+        case R_MIPS_NONE:    return "R_MIPS_NONE";
+        case R_MIPS_16:      return "R_MIPS_16";
+        case R_MIPS_32:      return "R_MIPS_32";
+        case R_MIPS_REL32:   return "R_MIPS_REL32";
+        case R_MIPS_26:      return "R_MIPS_26";
+        case R_MIPS_HI16:    return "R_MIPS_HI16";
+        case R_MIPS_LO16:    return "R_MIPS_LO16";
+        case R_MIPS_GPREL16: return "R_MIPS_GPREL16";
+        default:             return "R_MIPS_?";
+    }
+}
+
+// Fill `out` from the static section tables. Caller must hold at least a
+// shared lock on func_map_mutex (loaded_sections is mutated only under
+// the writer lock). Mirrors dump_lookup_addr_classification but returns
+// structured data and adds reloc / known-func discrimination.
+static void classify_lookup_capture(uint32_t addr, LookupCapture& out) {
+    out.missed_addr = addr;
+    if (sections_info.code_sections == nullptr) {
+        out.classification = "no-sections";
+        return;
+    }
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+        uint32_t runtime_base = (uint32_t)ls.loaded_ram_addr;
+        uint32_t link_base = (uint32_t)sec.ram_addr;
+        bool in_runtime = (addr >= runtime_base && addr < runtime_base + sec.size);
+        bool in_link    = (addr >= link_base && addr < link_base + sec.size);
+        if (!in_runtime && !in_link) continue;
+
+        out.enclosing_found = true;
+        out.match_kind = in_runtime ? "runtime" : "link";
+        out.section_index = ls.section_table_index;
+        out.link_base = link_base;
+        out.runtime_base = runtime_base;
+        out.section_size = sec.size;
+        out.offset_in_section = in_runtime ? (addr - runtime_base) : (addr - link_base);
+        out.content_hash = sec.content_hash;
+        out.original_pattern_id = sec.original_pattern_id;
+        out.load_order = get_load_order(ls.section_table_index);
+
+        // Known function start? A miss on a known start would point at a
+        // different bug (eviction / aliasing), not a discovery gap.
+        for (size_t i = 0; i < sec.num_funcs; i++) {
+            if (sec.funcs[i].offset == out.offset_in_section) {
+                out.offset_is_known_func = true;
+                break;
+            }
+        }
+        // Reloc at this offset => the miss address is a relocated POINTER
+        // site, not a code entry; the true call target is
+        // section[target_section] : target_section_offset.
+        for (size_t i = 0; i < sec.num_relocs; i++) {
+            if (sec.relocs[i].offset == out.offset_in_section) {
+                out.reloc_at_offset = true;
+                out.reloc_type = reloc_type_name(sec.relocs[i].type);
+                out.reloc_target_section = sec.relocs[i].target_section;
+                out.reloc_target_offset = sec.relocs[i].target_section_offset;
+                break;
+            }
+        }
+        out.classification = out.reloc_at_offset ? "pointer-site" : "code-entry";
+        return; // first enclosing section wins
+    }
+    out.classification = "outside-loaded";
+}
+
+static FILE* open_runtime_captures(const char* mode) {
+    FILE* f = fopen("build/runtime_captures.json", mode);
+    if (f == nullptr) {
+        f = fopen("runtime_captures.json", mode);
+    }
+    return f;
+}
+
+// Rewrite the whole captures file from the in-memory map. Cheap: the map
+// holds one entry per UNIQUE missing address (a handful in practice).
+// Called only when a new unique address appears, or once at abort —
+// never per repeat hit. Caller holds g_lookup_capture_mutex.
+static void write_runtime_captures_locked() {
+    FILE* f = open_runtime_captures("w");
+    if (f == nullptr) {
+        return;
+    }
+    fprintf(f, "{\n");
+    fprintf(f, "  \"coverage\": {\n");
+    fprintf(f, "    \"static_dispatch_hits\": %llu,\n", (unsigned long long)g_tier_static_hits.load());
+    fprintf(f, "    \"lookup_misses\": %llu,\n", (unsigned long long)g_tier_lookup_misses.load());
+    fprintf(f, "    \"unique_missed_addrs\": %zu\n", g_lookup_captures.size());
+    fprintf(f, "  },\n");
+    fprintf(f, "  \"misses\": [\n");
+    size_t i = 0;
+    for (const auto& kv : g_lookup_captures) {
+        const LookupCapture& c = kv.second;
+        ++i;
+        fprintf(f,
+            "    {\n"
+            "      \"missed_addr\": \"0x%08X\",\n"
+            "      \"hit_count\": %llu,\n"
+            "      \"classification\": \"%s\",\n"
+            "      \"enclosing_found\": %s,\n"
+            "      \"match_kind\": \"%s\",\n"
+            "      \"section_index\": %zu,\n"
+            "      \"link_base\": \"0x%08X\",\n"
+            "      \"runtime_base\": \"0x%08X\",\n"
+            "      \"section_size\": \"0x%X\",\n"
+            "      \"offset_in_section\": \"0x%X\",\n"
+            "      \"content_hash\": \"0x%016llX\",\n"
+            "      \"original_pattern_id\": \"0x%X\",\n"
+            "      \"load_order\": %llu,\n"
+            "      \"offset_is_known_func\": %s,\n"
+            "      \"reloc_at_offset\": %s,\n"
+            "      \"reloc_type\": \"%s\",\n"
+            "      \"reloc_target_section\": %u,\n"
+            "      \"reloc_target_offset\": \"0x%X\"\n"
+            "    }%s\n",
+            c.missed_addr,
+            (unsigned long long)c.hit_count,
+            c.classification,
+            c.enclosing_found ? "true" : "false",
+            c.match_kind,
+            c.section_index,
+            c.link_base,
+            c.runtime_base,
+            c.section_size,
+            c.offset_in_section,
+            (unsigned long long)c.content_hash,
+            c.original_pattern_id,
+            (unsigned long long)c.load_order,
+            c.offset_is_known_func ? "true" : "false",
+            c.reloc_at_offset ? "true" : "false",
+            c.reloc_type,
+            (unsigned)c.reloc_target_section,
+            c.reloc_target_offset,
+            (i < g_lookup_captures.size()) ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+}
+
 // Trace-ring queries (defined in extras.c — game-side instrumentation).
 extern "C" {
     uint64_t pkmnstadium_trace_write_idx(void);
@@ -1908,6 +2105,13 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
             }
         }
         fclose(f);
+    }
+    // Persist final capture counts before aborting. Live updates only
+    // fire on the first sighting of each address, so this flush captures
+    // the accurate hit_count accumulated since.
+    {
+        std::lock_guard<std::mutex> clk(g_lookup_capture_mutex);
+        write_runtime_captures_locked();
     }
     // Trigger the unified post-mortem so build/last_run_report.json +
     // build/last_run_input_history.json + RDRAM dump capture context
@@ -2460,19 +2664,44 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     std::shared_lock<std::shared_mutex> lock(func_map_mutex);
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
-        FILE* f = open_last_error_log("a");
-        if (f) {
-            fprintf(f, "\n=== get_function lookup miss: 0x%08X ===\n", addr);
-            dump_lookup_addr_classification(f, (uint32_t)addr);
-            fclose(f);
+        g_tier_lookup_misses.fetch_add(1, std::memory_order_relaxed);
+
+        // Capture ground-truth for this miss, deduped by address. First
+        // sighting: classify, log loudly, refresh the captures file.
+        // Repeat hits: silent counter bump only (no spam, no I/O flood).
+        bool first_sighting = false;
+        {
+            std::lock_guard<std::mutex> clk(g_lookup_capture_mutex);
+            auto emplaced = g_lookup_captures.try_emplace((uint32_t)addr);
+            LookupCapture& cap = emplaced.first->second;
+            if (emplaced.second) {
+                classify_lookup_capture((uint32_t)addr, cap);
+                first_sighting = true;
+            }
+            cap.hit_count++;
+            if (first_sighting) {
+                write_runtime_captures_locked();
+            }
         }
-        fprintf(stderr, "[Warn] get_function lookup miss: 0x%08X — returning trampoline\n", addr);
-        fflush(stderr);
+
+        if (first_sighting) {
+            FILE* f = open_last_error_log("a");
+            if (f) {
+                fprintf(f, "\n=== get_function lookup miss: 0x%08X ===\n", addr);
+                dump_lookup_addr_classification(f, (uint32_t)addr);
+                fclose(f);
+            }
+            fprintf(stderr,
+                "[Warn] get_function lookup miss: 0x%08X — captured (see runtime_captures.json), returning trampoline\n",
+                addr);
+            fflush(stderr);
+        }
         // Stash for the trampoline so post-call diagnostics print
         // *which* address was missing, not just "something bad happened".
         g_last_lookup_miss_addr = addr;
         return unhandled_lookup_trampoline;
     }
+    g_tier_static_hits.fetch_add(1, std::memory_order_relaxed);
     return func_find->second;
 }
 

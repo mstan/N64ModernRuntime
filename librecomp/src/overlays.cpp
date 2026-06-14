@@ -2443,20 +2443,27 @@ static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
     return sh->fn;
 }
 
-// The runtime JIT tier is OPT-IN, default OFF (PSR_JIT_TIER=1 to enable). The
-// underlying N64Recomp live recompiler can stack-overflow or hang on certain
-// functions when driven as a standalone single-function compile, and a
-// stack-overflow crash on the worker thread cannot be isolated in-process (it
-// terminates the whole program; only the SEH-catchable AVs and detachable
-// hangs are guarded). So by default a true gap falls through to the proven,
-// safe loud abort. A game that has validated its gap functions JIT cleanly
-// (via the jit_test hook) opts in. Hardening the live recompiler itself
-// (bounding its control-flow walk) is the path to default-on; tracked
-// separately.
+// The runtime JIT tier is DEFAULT ON (set PSR_JIT_TIER=0 to force-disable).
+// The historical "live recompiler hangs/crashes on certain functions" was a
+// red herring: the real cause was a byte-order bug in jit_compile_inner's word
+// array (it packed Function::words big-endian, but recompile_function_impl
+// byteswaps each word back to big-endian for rabbitizer, so every function was
+// compiled from garbage instructions — a real `sw` decoded as a `jal` — and the
+// sljit generator crashed on float-heavy functions). With that fixed (plus the
+// empty static_funcs_out span), 32/32 sampled resident functions JIT cleanly.
+//
+// Default-on is strictly >= the old loud-abort behavior for a true gap: B3
+// either recompiles + runs the missing function (recovery) or fails and falls
+// through to the same loud abort as before. JIT work runs on a 256 MiB-reserved
+// worker thread guarded by SEH + a 2 s watchdog, so a pathological function
+// still can't take down the process. PSR_JIT_TIER=0 restores the opt-out.
 static bool jit_tier_enabled() {
     static const bool enabled = [](){
         const char* v = std::getenv("PSR_JIT_TIER");
-        return v != nullptr && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+        // Default ON; only an explicit 0/false/no disables it.
+        if (v == nullptr) return true;
+        return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' ||
+                 v[0] == 'n' || v[0] == 'N');
     }();
     return enabled;
 }
@@ -2499,9 +2506,8 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
     // ── B3: runtime JIT tier (tier 3 before the loud abort) ──────────────
     // No registered function and no resident enclosing function — a TRUE gap.
     // JIT the function from its resident rdram image, register it, and run it.
-    // OPT-IN (default off): the live recompiler isn't yet hang/crash-safe on
-    // arbitrary functions, so unless a game enables it (PSR_JIT_TIER=1) we go
-    // straight to the loud abort below.
+    // DEFAULT ON (PSR_JIT_TIER=0 to force-disable): on success we recover; on
+    // failure we fall through to the same loud abort as before.
     if (jit_tier_enabled()) {
         std::string jit_err;
         recomp_func_t* jitted =

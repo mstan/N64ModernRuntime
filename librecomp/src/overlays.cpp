@@ -51,8 +51,25 @@
 
 #include "recomp.h"
 #include "recompiler/context.h"
+#include "recompiler/live_recompiler.h"
 #include "overlays.hpp"
 #include "sections.h"
+#include <memory>
+#include <sstream>
+
+// B3 runtime-JIT tier dependencies. discover_function_bounds lives in
+// N64Recomp's private src/analysis.h (not on librecomp's include path) but
+// is compiled into the N64Recomp lib librecomp links — forward-declare it.
+// The cop0/switch/break handlers are extern "C" in librecomp/src/recomp.cpp.
+namespace N64Recomp {
+    bool discover_function_bounds(const uint8_t* body, size_t bytes_size,
+        uint32_t vram_base, uint32_t entry_offset,
+        size_t& size_out, std::string& error_out);
+}
+extern "C" void cop0_status_write(recomp_context* ctx, gpr value);
+extern "C" gpr cop0_status_read(recomp_context* ctx);
+extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl);
+extern "C" void do_break(uint32_t vram);
 
 static recomp::overlays::overlay_section_table_data_t sections_info {};
 static recomp::overlays::overlays_by_index_t overlays_info {};
@@ -1893,8 +1910,22 @@ static std::atomic<uint64_t> g_tier_lookup_misses{0};
 // func_map), so self_heals >> unique_missed_addrs is expected and healthy.
 static std::atomic<uint64_t> g_tier_self_heals{0};
 // Misses that could NOT be self-healed (no resident enclosing function) and
-// fell through to the loud abort.
+// fell through to the B3 JIT tier / loud abort.
 static std::atomic<uint64_t> g_tier_self_heal_misses{0};
+// B3 runtime-JIT tier: functions compiled live from their resident rdram
+// image when neither static dispatch nor self-heal could resolve them (a
+// TRUE gap — genuinely unrecompiled code). jit_compiles succeed; jit_failures
+// fell through to the loud abort.
+static std::atomic<uint64_t> g_tier_jit_compiles{0};
+static std::atomic<uint64_t> g_tier_jit_failures{0};
+// JIT outputs MUST outlive the program: the native code address is baked into
+// func_map and the generated code bakes in its string/jumptable/section-addr
+// pointers. Freeing any of these would UAF. Guarded by func_map_mutex.
+struct JitEntry {
+    std::unique_ptr<N64Recomp::LiveGeneratorOutput> output;
+    std::unique_ptr<int32_t[]> section_addrs;
+};
+static std::vector<JitEntry> g_jit_entries;
 
 static std::mutex g_lookup_capture_mutex;
 static std::map<uint32_t, LookupCapture> g_lookup_captures;
@@ -1991,6 +2022,8 @@ static void write_runtime_captures_locked() {
     fprintf(f, "    \"lookup_misses\": %llu,\n", (unsigned long long)g_tier_lookup_misses.load());
     fprintf(f, "    \"self_heals\": %llu,\n", (unsigned long long)g_tier_self_heals.load());
     fprintf(f, "    \"self_heal_misses\": %llu,\n", (unsigned long long)g_tier_self_heal_misses.load());
+    fprintf(f, "    \"jit_compiles\": %llu,\n", (unsigned long long)g_tier_jit_compiles.load());
+    fprintf(f, "    \"jit_failures\": %llu,\n", (unsigned long long)g_tier_jit_failures.load());
     fprintf(f, "    \"unique_missed_addrs\": %zu\n", g_lookup_captures.size());
     fprintf(f, "  },\n");
     fprintf(f, "  \"misses\": [\n");
@@ -2121,6 +2154,151 @@ static bool find_resident_enclosing_function(uint32_t addr,
     return false;
 }
 
+// Defined later in this file; needed as a LiveGeneratorInputs callback so
+// JIT-compiled code resolves its own calls through the same dispatch path.
+extern "C" recomp_func_t* get_function(int32_t addr);
+
+// ── B3: runtime LiveRecomp JIT tier ──────────────────────────────────────
+// Last resort when a miss is neither a registered static function nor an
+// interior point of a resident recompiled function (self-heal) — i.e. a TRUE
+// gap: a function whose code is loaded in rdram but was never recompiled at
+// build time. JIT it live from its resident rdram image via N64Recomp's
+// LiveRecomp (sljit) backend, register it in func_map, and return it so every
+// future call takes the static fast path. For PMS this never fires (all
+// misses are interior points of already-compiled code, handled by self-heal),
+// but the framework targets many future games which WILL have real gaps.
+//
+// Only resident main-RDRAM addresses (kseg0 8 MiB) are eligible — that is the
+// only place a loaded code image exists to read. Overlay link addresses
+// (e.g. PMS 0x82xxxxxx) are out of that range and are rejected (no OOB read).
+// Returns the native function and registers it, or nullptr + err on failure.
+// keep_and_register=false compiles and validates without registering or
+// retaining the result (used by the validation hook so it can prove the
+// pipeline on a resident function without swapping the live func_map entry);
+// it returns a non-null success sentinel (never call it) and fills out_sizes.
+static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
+                                           std::string& err,
+                                           bool keep_and_register = true,
+                                           size_t* out_func_size = nullptr,
+                                           size_t* out_code_size = nullptr) {
+    using namespace N64Recomp;
+
+    // Eligibility: code must be physically resident in kseg0 rdram.
+    if (vram < 0x80000000u || vram >= 0x80800000u) {
+        err = "address not in resident kseg0 rdram (8 MiB) — no loaded "
+              "code image to JIT (likely an unloaded overlay link address)";
+        return nullptr;
+    }
+
+    // 1. Snapshot a generous window of the loaded code (big-endian words;
+    //    rdram is XOR-3 byte-swapped), clamped to stay inside the 8 MiB buffer.
+    constexpr uint32_t RDRAM_END = 0x00800000u;
+    const uint32_t pbase = vram & 0x1FFFFFFFu;
+    uint32_t window = 0x8000u;  // 32 KiB upper bound on a single function
+    if (pbase + window > RDRAM_END) {
+        window = RDRAM_END - pbase;
+    }
+    if (window < 8) {
+        err = "too close to end of rdram to read a function";
+        return nullptr;
+    }
+    std::vector<uint8_t> body(window);
+    for (uint32_t i = 0; i < window; i++) {
+        body[i] = rdram[(pbase + i) ^ 3];
+    }
+
+    // 2. Discover the function bounds (BFS control-flow walk).
+    size_t func_size = 0;
+    if (!discover_function_bounds(body.data(), body.size(), vram, 0,
+                                  func_size, err)) {
+        return nullptr;  // err populated by discover_function_bounds
+    }
+    if (func_size < 8 || (func_size & 3u) != 0 || func_size > window) {
+        err = "implausible discovered function size";
+        return nullptr;
+    }
+
+    // 3. Big-endian word array the recompiler consumes.
+    std::vector<uint32_t> words(func_size / 4);
+    for (size_t w = 0; w < words.size(); w++) {
+        const uint8_t* p = body.data() + w * 4;
+        words[w] = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+                   (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    }
+
+    // 4. Minimal single-section, single-function, no-reloc context. The
+    //    resident code already has all relocations applied (absolute
+    //    addresses baked in), so compile it literally; every call resolves
+    //    at runtime through get_function (use_lookup_for_all_function_calls).
+    Context ctx{};
+    Section sec{};
+    sec.rom_addr = 0;
+    sec.ram_addr = vram;
+    sec.size = (uint32_t)func_size;
+    sec.name = "jit";
+    sec.executable = true;
+    ctx.sections.push_back(std::move(sec));
+    ctx.functions.emplace_back(vram, 0u, words,
+                               "jit_" + std::to_string(vram), (uint16_t)0);
+    ctx.section_functions.push_back(std::vector<size_t>{0});
+    ctx.use_lookup_for_all_function_calls = true;
+
+    // 5. Persistent per-JIT section-address array (generated code may bake
+    //    its address). One section; address = its runtime vram.
+    auto section_addrs = std::make_unique<int32_t[]>(1);
+    section_addrs[0] = (int32_t)vram;
+
+    LiveGeneratorInputs inputs{};
+    inputs.base_event_index = 0;
+    inputs.cop0_status_write = cop0_status_write;
+    inputs.cop0_status_read = cop0_status_read;
+    inputs.switch_error = switch_error;
+    inputs.do_break = do_break;
+    inputs.get_function = get_function;
+    inputs.syscall_handler = nullptr;
+    inputs.pause_self = nullptr;     // vanilla overlay funcs don't pause_self
+    inputs.trigger_event = nullptr;  // ...or trigger mod events
+    inputs.reference_section_addresses = section_addrs.get();
+    inputs.local_section_addresses = section_addrs.get();
+    inputs.run_hook = nullptr;
+    inputs.original_section_indices = std::vector<size_t>{0};
+
+    LiveGenerator generator{ ctx.functions.size(), inputs };
+    std::ostringstream dummy_ostream;
+    std::vector<std::vector<uint32_t>> dummy_static_funcs;
+    if (!recompile_function_live(generator, ctx, 0, dummy_ostream,
+                                 dummy_static_funcs, false)) {
+        err = "recompile_function_live failed (unsupported instruction / "
+              "jump table / reference symbol)";
+        return nullptr;
+    }
+    auto output = std::make_unique<LiveGeneratorOutput>(generator.finish());
+    if (!output->good || output->functions.empty() ||
+        output->functions[0] == nullptr) {
+        err = "live generator produced no usable function";
+        return nullptr;
+    }
+
+    recomp_func_t* jitted = output->functions[0];
+    if (out_func_size) *out_func_size = func_size;
+    if (out_code_size) *out_code_size = output->code_size;
+    if (!keep_and_register) {
+        // Validation path: proven good; discard (output + section_addrs freed
+        // here). Return a non-null sentinel meaning "compiled OK, not kept".
+        // The caller must NOT call it.
+        return reinterpret_cast<recomp_func_t*>(0x1);
+    }
+    // 6. Keep output + section-addr array alive for the program lifetime and
+    //    register so all future calls hit the static fast path.
+    {
+        std::unique_lock<std::shared_mutex> lock(func_map_mutex);
+        g_jit_entries.push_back(
+            JitEntry{ std::move(output), std::move(section_addrs) });
+        func_map[(int32_t)vram] = jitted;
+    }
+    return jitted;
+}
+
 static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
     // ── Interior-return self-heal (tier 2 before the loud abort) ─────────
     // The dominant miss class is a return address interior to a resident
@@ -2155,6 +2333,30 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
         }
     }
     g_tier_self_heal_misses.fetch_add(1, std::memory_order_relaxed);
+
+    // ── B3: runtime JIT tier (tier 3 before the loud abort) ──────────────
+    // No registered function and no resident enclosing function — a TRUE gap.
+    // JIT the function from its resident rdram image, register it, and run it.
+    {
+        std::string jit_err;
+        recomp_func_t* jitted =
+            jit_compile_function((uint32_t)g_self_heal_addr, rdram, jit_err);
+        if (jitted != nullptr) {
+            g_tier_jit_compiles.fetch_add(1, std::memory_order_relaxed);
+            fprintf(stderr,
+                "[recomp] JIT-compiled missing function 0x%08X — registered; "
+                "future calls take the static fast path\n",
+                (uint32_t)g_self_heal_addr);
+            fflush(stderr);
+            jitted(rdram, ctx);
+            return;
+        }
+        g_tier_jit_failures.fetch_add(1, std::memory_order_relaxed);
+        fprintf(stderr,
+            "[recomp] JIT of 0x%08X not possible (%s) — aborting\n",
+            (uint32_t)g_self_heal_addr, jit_err.c_str());
+        fflush(stderr);
+    }
 
     fprintf(stderr,
         "[recomp] lookup-miss trampoline reached — aborting\n"
@@ -2896,6 +3098,44 @@ extern "C" void recomp_debug_dump_loaded_sections(void) {
 extern "C" int recomp_debug_probe_lookup(uint32_t addr) {
     recomp_func_t* f = get_function((int32_t)addr);
     return (f == unhandled_lookup_trampoline) ? 1 : 0;
+}
+
+// Forced-JIT validation hook (B3). Compile-only: exercises the full runtime
+// JIT pipeline (rdram read -> discover bounds -> Context -> LiveRecomp ->
+// native code) on a RESIDENT function without registering it, so the live
+// func_map is untouched. Returns 0 on success, 1 on failure; writes the
+// discovered function size, generated code size, and any error to *out_*.
+// Pick a resident main-RDRAM function (0x80000000-0x807FFFFF) — overlay link
+// addresses have no loaded image and are (correctly) rejected.
+extern "C" unsigned char* recomp_runtime_get_rdram(void);
+extern "C" int recomp_debug_jit_test(uint32_t vram,
+                                     uint32_t* out_func_size,
+                                     uint32_t* out_code_size,
+                                     char* out_err, size_t out_err_cap) {
+    uint8_t* rdram = recomp_runtime_get_rdram();
+    if (out_func_size) *out_func_size = 0;
+    if (out_code_size) *out_code_size = 0;
+    if (out_err && out_err_cap) out_err[0] = '\0';
+    if (rdram == nullptr) {
+        if (out_err && out_err_cap) {
+            std::strncpy(out_err, "rdram not available", out_err_cap - 1);
+        }
+        return 1;
+    }
+    std::string err;
+    size_t func_size = 0, code_size = 0;
+    recomp_func_t* res = jit_compile_function(
+        vram, rdram, err, /*keep_and_register=*/false, &func_size, &code_size);
+    if (out_func_size) *out_func_size = (uint32_t)func_size;
+    if (out_code_size) *out_code_size = (uint32_t)code_size;
+    if (res == nullptr) {
+        if (out_err && out_err_cap) {
+            std::strncpy(out_err, err.c_str(), out_err_cap - 1);
+            out_err[out_err_cap - 1] = '\0';
+        }
+        return 1;
+    }
+    return 0;
 }
 
 // Pick a CURRENTLY-loaded section with a reloc offset that is not a

@@ -2227,12 +2227,20 @@ static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
         return nullptr;
     }
 
-    // 3. Big-endian word array the recompiler consumes.
+    // 3. Word array the recompiler consumes. Function::words is host
+    //    little-endian: recompile_function_impl byteswaps each word back to
+    //    big-endian before handing it to rabbitizer (matching how the offline
+    //    path and the live-recompiler test populate words). So we must store
+    //    the host-native read of the four big-endian bytes here, NOT a
+    //    big-endian-packed value — packing big-endian made byteswap produce
+    //    garbage instructions (e.g. a real `sw` decoded as a bogus `jal`),
+    //    which silently compiled wrong code and crashed the generator on
+    //    float-heavy functions.
     std::vector<uint32_t> words(func_size / 4);
     for (size_t w = 0; w < words.size(); w++) {
         const uint8_t* p = body.data() + w * 4;
-        words[w] = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
-                   (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+        words[w] = uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+                   (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
     }
 
     // 4. Minimal single-section, single-function, no-reloc context. The
@@ -2274,7 +2282,11 @@ static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
 
     LiveGenerator generator{ ctx.functions.size(), inputs };
     std::ostringstream dummy_ostream;
-    std::vector<std::vector<uint32_t>> dummy_static_funcs;
+    // Must have one entry per section: recompile_function_impl writes
+    // jal/jalr link targets into static_funcs_out[section_index]. An empty
+    // span here is an out-of-bounds write (crash) on the first in-section
+    // call. We discard the contents, but the storage must exist.
+    std::vector<std::vector<uint32_t>> dummy_static_funcs(ctx.sections.size());
     if (!recompile_function_live(generator, ctx, 0, dummy_ostream,
                                  dummy_static_funcs, false)) {
         err = "recompile_function_live failed (unsupported instruction / "

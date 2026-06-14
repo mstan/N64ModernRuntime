@@ -2336,54 +2336,95 @@ static recomp_func_t* jit_compile_seh(uint32_t vram, uint8_t* rdram,
 #endif
 }
 
-// Watchdog (hang safety) + the only entry point callers use. The N64Recomp
-// live recompiler can both SEGFAULT (caught by the SEH guard above) AND
-// INFINITE-LOOP on pathological/unsupported functions; neither may freeze or
-// kill the game thread. So the compile runs on a worker thread with a time
-// budget. On timeout the worker is detached — on a true hang it keeps spinning
-// until process exit (a bounded, rare cost; in the real tier the trampoline
-// aborts immediately after, ending the process), and we report failure so the
-// caller falls through to the loud abort. The worker registers func_map under
-// its own lock on success; the game thread holds no lock here, so no deadlock.
+// Shared state between the watchdog and its big-stack worker.
+struct JitWorkerShared {
+    recomp_func_t* fn = nullptr;
+    std::string err;
+    size_t fs = 0, cs = 0;
+    std::atomic<bool> done{false};
+    uint32_t vram = 0;
+    uint8_t* rdram = nullptr;
+    bool keep = true;
+};
+
+#ifdef _WIN32
+static DWORD WINAPI jit_worker_proc(LPVOID param) {
+    std::shared_ptr<JitWorkerShared>* holder =
+        reinterpret_cast<std::shared_ptr<JitWorkerShared>*>(param);
+    std::shared_ptr<JitWorkerShared> s = *holder;
+    delete holder;
+    std::string e;
+    size_t fs = 0, cs = 0;
+    recomp_func_t* fn = jit_compile_seh(s->vram, s->rdram, e, s->keep, &fs, &cs);
+    s->fn = fn;
+    s->err = std::move(e);
+    s->fs = fs;
+    s->cs = cs;
+    s->done.store(true, std::memory_order_release);
+    return 0;
+}
+#endif
+
+// Watchdog + the only entry point callers use. The N64Recomp live recompiler
+// can (a) recurse deeply in its sljit codegen — overflowing a normal thread
+// stack and crashing — (b) infinite-loop, or (c) segfault on pathological
+// functions. None may freeze or kill the game thread. So the compile runs on a
+// dedicated worker with a LARGE reserved stack (kills the deep-recursion
+// overflow → it completes or hits the watchdog), under the SEH guard (catches
+// AVs), with a wall-clock budget (catches a true infinite loop: on timeout the
+// worker is abandoned — bounded, rare; in the real tier the trampoline aborts
+// right after, ending the process). The worker registers func_map under its
+// own lock on success; the game thread holds no lock here, so no deadlock.
 static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
                                            std::string& err,
                                            bool keep_and_register = true,
                                            size_t* out_func_size = nullptr,
                                            size_t* out_code_size = nullptr) {
-    struct Shared {
-        recomp_func_t* fn = nullptr;
-        std::string err;
-        size_t fs = 0, cs = 0;
-        std::atomic<bool> done{false};
-    };
-    auto sh = std::make_shared<Shared>();
-    std::thread worker([sh, vram, rdram, keep_and_register]() {
-        std::string e;
-        size_t fs = 0, cs = 0;
-        recomp_func_t* fn = jit_compile_seh(vram, rdram, e,
-                                            keep_and_register, &fs, &cs);
-        sh->fn = fn;
-        sh->err = std::move(e);
-        sh->fs = fs;
-        sh->cs = cs;
-        sh->done.store(true, std::memory_order_release);
-    });
+    auto sh = std::make_shared<JitWorkerShared>();
+    sh->vram = vram;
+    sh->rdram = rdram;
+    sh->keep = keep_and_register;
 
-    constexpr int BUDGET_MS = 750;
+#ifdef _WIN32
+    // 256 MiB reserved (not committed) stack — address space only; pages
+    // commit lazily as the recursion descends.
+    constexpr SIZE_T JIT_STACK_RESERVE = SIZE_T(256) * 1024 * 1024;
+    auto* holder = new std::shared_ptr<JitWorkerShared>(sh);
+    HANDLE h = CreateThread(nullptr, JIT_STACK_RESERVE, jit_worker_proc,
+                            holder, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (h == nullptr) {
+        delete holder;
+        err.assign("JIT worker thread creation failed");
+        if (out_func_size) *out_func_size = 0;
+        if (out_code_size) *out_code_size = 0;
+        return nullptr;
+    }
+
+    constexpr int BUDGET_MS = 2000;
     bool finished = false;
     for (int i = 0; i < BUDGET_MS / 5; i++) {
         if (sh->done.load(std::memory_order_acquire)) { finished = true; break; }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (!finished) {
-        worker.detach();  // abandon a hung/runaway compile
+        CloseHandle(h);  // abandon a hung/runaway compile (true infinite loop)
         err.assign("JIT compile exceeded time budget (watchdog) — function "
                    "triggers a live-recompiler hang");
         if (out_func_size) *out_func_size = 0;
         if (out_code_size) *out_code_size = 0;
         return nullptr;
     }
+    CloseHandle(h);
+#else
+    std::thread worker([sh]() {
+        std::string e; size_t fs = 0, cs = 0;
+        recomp_func_t* fn = jit_compile_seh(sh->vram, sh->rdram, e,
+                                            sh->keep, &fs, &cs);
+        sh->fn = fn; sh->err = std::move(e); sh->fs = fs; sh->cs = cs;
+        sh->done.store(true, std::memory_order_release);
+    });
     worker.join();
+#endif
     err = sh->err;
     if (out_func_size) *out_func_size = sh->fs;
     if (out_code_size) *out_code_size = sh->cs;

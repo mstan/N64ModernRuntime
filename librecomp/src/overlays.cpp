@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -56,6 +57,8 @@
 #include "sections.h"
 #include <memory>
 #include <sstream>
+#include <thread>
+#include <chrono>
 
 // B3 runtime-JIT tier dependencies. discover_function_bounds lives in
 // N64Recomp's private src/analysis.h (not on librecomp's include path) but
@@ -2176,11 +2179,17 @@ extern "C" recomp_func_t* get_function(int32_t addr);
 // retaining the result (used by the validation hook so it can prove the
 // pipeline on a resident function without swapping the live func_map entry);
 // it returns a non-null success sentinel (never call it) and fills out_sizes.
-static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
-                                           std::string& err,
-                                           bool keep_and_register = true,
-                                           size_t* out_func_size = nullptr,
-                                           size_t* out_code_size = nullptr) {
+//
+// NOTE: this is the *inner* worker. It can hard-fault (segfault) inside the
+// sljit/LiveGenerator codegen on a malformed or unsupported function — the
+// input is untrusted guest bytes. It is ALWAYS called through the SEH-guarded
+// jit_compile_function wrapper below, never directly, so such a fault becomes
+// a graceful failure instead of taking down the process.
+static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
+                                         std::string& err,
+                                         bool keep_and_register,
+                                         size_t* out_func_size,
+                                         size_t* out_code_size) {
     using namespace N64Recomp;
 
     // Eligibility: code must be physically resident in kseg0 rdram.
@@ -2299,6 +2308,106 @@ static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
     return jitted;
 }
 
+// SEH guard (crash safety). jit_compile_inner compiles untrusted guest bytes
+// through sljit and can hard-fault; this frame holds only reference/pointer/
+// POD locals (no C++ object unwinding), so __try/__except is legal here. A
+// structured exception (access violation, illegal instruction, etc.) becomes
+// a graceful failure. On a guarded fault the inner frame's C++ objects (sljit
+// compiler, vectors) leak (SEH skips C++ unwinding under /EHsc); acceptable on
+// this rare path. NOTE: SEH cannot catch a HANG — see the watchdog below.
+static recomp_func_t* jit_compile_seh(uint32_t vram, uint8_t* rdram,
+                                      std::string& err, bool keep_and_register,
+                                      size_t* out_func_size,
+                                      size_t* out_code_size) {
+#ifdef _WIN32
+    __try {
+        return jit_compile_inner(vram, rdram, err, keep_and_register,
+                                 out_func_size, out_code_size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        err.assign("JIT compile hard-faulted (SEH-guarded; unsupported "
+                   "function shape)");
+        if (out_func_size) *out_func_size = 0;
+        if (out_code_size) *out_code_size = 0;
+        return nullptr;
+    }
+#else
+    return jit_compile_inner(vram, rdram, err, keep_and_register,
+                             out_func_size, out_code_size);
+#endif
+}
+
+// Watchdog (hang safety) + the only entry point callers use. The N64Recomp
+// live recompiler can both SEGFAULT (caught by the SEH guard above) AND
+// INFINITE-LOOP on pathological/unsupported functions; neither may freeze or
+// kill the game thread. So the compile runs on a worker thread with a time
+// budget. On timeout the worker is detached — on a true hang it keeps spinning
+// until process exit (a bounded, rare cost; in the real tier the trampoline
+// aborts immediately after, ending the process), and we report failure so the
+// caller falls through to the loud abort. The worker registers func_map under
+// its own lock on success; the game thread holds no lock here, so no deadlock.
+static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
+                                           std::string& err,
+                                           bool keep_and_register = true,
+                                           size_t* out_func_size = nullptr,
+                                           size_t* out_code_size = nullptr) {
+    struct Shared {
+        recomp_func_t* fn = nullptr;
+        std::string err;
+        size_t fs = 0, cs = 0;
+        std::atomic<bool> done{false};
+    };
+    auto sh = std::make_shared<Shared>();
+    std::thread worker([sh, vram, rdram, keep_and_register]() {
+        std::string e;
+        size_t fs = 0, cs = 0;
+        recomp_func_t* fn = jit_compile_seh(vram, rdram, e,
+                                            keep_and_register, &fs, &cs);
+        sh->fn = fn;
+        sh->err = std::move(e);
+        sh->fs = fs;
+        sh->cs = cs;
+        sh->done.store(true, std::memory_order_release);
+    });
+
+    constexpr int BUDGET_MS = 750;
+    bool finished = false;
+    for (int i = 0; i < BUDGET_MS / 5; i++) {
+        if (sh->done.load(std::memory_order_acquire)) { finished = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!finished) {
+        worker.detach();  // abandon a hung/runaway compile
+        err.assign("JIT compile exceeded time budget (watchdog) — function "
+                   "triggers a live-recompiler hang");
+        if (out_func_size) *out_func_size = 0;
+        if (out_code_size) *out_code_size = 0;
+        return nullptr;
+    }
+    worker.join();
+    err = sh->err;
+    if (out_func_size) *out_func_size = sh->fs;
+    if (out_code_size) *out_code_size = sh->cs;
+    return sh->fn;
+}
+
+// The runtime JIT tier is OPT-IN, default OFF (PSR_JIT_TIER=1 to enable). The
+// underlying N64Recomp live recompiler can stack-overflow or hang on certain
+// functions when driven as a standalone single-function compile, and a
+// stack-overflow crash on the worker thread cannot be isolated in-process (it
+// terminates the whole program; only the SEH-catchable AVs and detachable
+// hangs are guarded). So by default a true gap falls through to the proven,
+// safe loud abort. A game that has validated its gap functions JIT cleanly
+// (via the jit_test hook) opts in. Hardening the live recompiler itself
+// (bounding its control-flow walk) is the path to default-on; tracked
+// separately.
+static bool jit_tier_enabled() {
+    static const bool enabled = [](){
+        const char* v = std::getenv("PSR_JIT_TIER");
+        return v != nullptr && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+    }();
+    return enabled;
+}
+
 static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
     // ── Interior-return self-heal (tier 2 before the loud abort) ─────────
     // The dominant miss class is a return address interior to a resident
@@ -2337,7 +2446,10 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
     // ── B3: runtime JIT tier (tier 3 before the loud abort) ──────────────
     // No registered function and no resident enclosing function — a TRUE gap.
     // JIT the function from its resident rdram image, register it, and run it.
-    {
+    // OPT-IN (default off): the live recompiler isn't yet hang/crash-safe on
+    // arbitrary functions, so unless a game enables it (PSR_JIT_TIER=1) we go
+    // straight to the loud abort below.
+    if (jit_tier_enabled()) {
         std::string jit_err;
         recomp_func_t* jitted =
             jit_compile_function((uint32_t)g_self_heal_addr, rdram, jit_err);

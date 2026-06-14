@@ -1887,6 +1887,14 @@ struct LookupCapture {
 // the coverage report stays forward-compatible.
 static std::atomic<uint64_t> g_tier_static_hits{0};
 static std::atomic<uint64_t> g_tier_lookup_misses{0};
+// Misses resolved by the interior-return self-heal (dispatched into the
+// resident enclosing function via ctx->dispatch_entry_target instead of
+// aborting). A miss can recur (the interior point is never registered in
+// func_map), so self_heals >> unique_missed_addrs is expected and healthy.
+static std::atomic<uint64_t> g_tier_self_heals{0};
+// Misses that could NOT be self-healed (no resident enclosing function) and
+// fell through to the loud abort.
+static std::atomic<uint64_t> g_tier_self_heal_misses{0};
 
 static std::mutex g_lookup_capture_mutex;
 static std::map<uint32_t, LookupCapture> g_lookup_captures;
@@ -1981,6 +1989,8 @@ static void write_runtime_captures_locked() {
     fprintf(f, "  \"coverage\": {\n");
     fprintf(f, "    \"static_dispatch_hits\": %llu,\n", (unsigned long long)g_tier_static_hits.load());
     fprintf(f, "    \"lookup_misses\": %llu,\n", (unsigned long long)g_tier_lookup_misses.load());
+    fprintf(f, "    \"self_heals\": %llu,\n", (unsigned long long)g_tier_self_heals.load());
+    fprintf(f, "    \"self_heal_misses\": %llu,\n", (unsigned long long)g_tier_self_heal_misses.load());
     fprintf(f, "    \"unique_missed_addrs\": %zu\n", g_lookup_captures.size());
     fprintf(f, "  },\n");
     fprintf(f, "  \"misses\": [\n");
@@ -2045,7 +2055,107 @@ extern "C" {
     void psr_post_mortem_dump(const char* reason, void* fault_info);
 }
 
+// Set by get_function immediately before returning the trampoline, read by
+// the trampoline on the SAME thread's immediate call. Thread-local so two
+// threads missing concurrently can't cross their self-heal targets (the
+// shared g_last_lookup_miss_addr is kept for the abort-path diagnostics).
+static thread_local uint32_t g_self_heal_addr = 0;
+
+// Interior-return self-heal lookup: a get_function miss on an address
+// INTERIOR to a resident fragment function (never a registered start) is
+// resolvable by dispatching into that function via ctx->dispatch_entry_target.
+// The N64Recomp jal-return pass guarantees every return point has a
+// `case <link_vram>: goto L_<link_vram>` in the enclosing function's body, so
+// the resume is exact. Returns true + fills host / link_target (the LINK vram
+// the dispatch switch is keyed on) / func_start_link if a resident enclosing
+// function is found. Caller must hold >= a shared lock on func_map_mutex
+// (reads loaded_sections + sections_info). O(total loaded funcs); misses are
+// rare so the linear scan is acceptable.
+static bool find_resident_enclosing_function(uint32_t addr,
+                                             recomp_func_t*& host_out,
+                                             uint32_t& link_target_out,
+                                             uint32_t& func_start_link_out) {
+    if (sections_info.code_sections == nullptr) {
+        return false;
+    }
+    for (const auto& ls : loaded_sections) {
+        const SectionTableEntry& sec =
+            sections_info.code_sections[ls.section_table_index];
+        const uint32_t runtime_base = (uint32_t)ls.loaded_ram_addr;
+        const uint32_t synth_base = (uint32_t)sec.ram_addr;
+        uint32_t link_base = synth_base;
+        if (is_synthetic_addr(synth_base)) {
+            uint32_t orig = 0;
+            if (section_original_fragment_base(sec, orig)) {
+                link_base = orig;
+            }
+        }
+        // The miss address may be expressed in the section's link, runtime,
+        // or synthetic base; pick whichever range contains it.
+        uint32_t base = 0;
+        bool matched = false;
+        if (addr >= link_base && addr < link_base + sec.size) {
+            base = link_base; matched = true;
+        } else if (addr >= runtime_base && addr < runtime_base + sec.size) {
+            base = runtime_base; matched = true;
+        } else if (addr >= synth_base && addr < synth_base + sec.size) {
+            base = synth_base; matched = true;
+        }
+        if (!matched) {
+            continue;
+        }
+        const uint32_t offset = addr - base;
+        for (size_t i = 0; i < sec.num_funcs; i++) {
+            const FuncEntry& fe = sec.funcs[i];
+            if (fe.func == nullptr) {
+                continue;
+            }
+            if (offset >= fe.offset && offset < fe.offset + fe.rom_size) {
+                host_out = fe.func;
+                link_target_out = link_base + offset;
+                func_start_link_out = link_base + fe.offset;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
+    // ── Interior-return self-heal (tier 2 before the loud abort) ─────────
+    // The dominant miss class is a return address interior to a resident
+    // fragment function (the tailcall-bubble dispatcher re-enters via
+    // get_function(return_addr); mid-function points are never registered).
+    // Resolve by dispatching into the enclosing function instead of aborting.
+    // get_function already captured this miss (deduped, loud-once) for
+    // fold-back telemetry, so the self-heal stays silent.
+    {
+        const uint32_t addr = g_self_heal_addr;
+        recomp_func_t* host = nullptr;
+        uint32_t link_target = 0;
+        uint32_t func_start_link = 0;
+        bool found = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(func_map_mutex);
+            found = find_resident_enclosing_function(
+                addr, host, link_target, func_start_link);
+        }
+        if (found && host != nullptr) {
+            g_tier_self_heals.fetch_add(1, std::memory_order_relaxed);
+            // Resume at the interior link vram via the generated dispatch
+            // switch; if the miss was actually a function start, enter
+            // normally (dispatch_entry_target = 0). Release the func_map
+            // lock before calling host — it may re-enter get_function.
+            const uint32_t saved = ctx->dispatch_entry_target;
+            ctx->dispatch_entry_target =
+                (link_target == func_start_link) ? 0u : link_target;
+            host(rdram, ctx);
+            ctx->dispatch_entry_target = saved;
+            return;
+        }
+    }
+    g_tier_self_heal_misses.fetch_add(1, std::memory_order_relaxed);
+
     fprintf(stderr,
         "[recomp] lookup-miss trampoline reached — aborting\n"
         "  bad function pointer: 0x%08X\n",
@@ -2699,7 +2809,10 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         }
         // Stash for the trampoline so post-call diagnostics print
         // *which* address was missing, not just "something bad happened".
+        // g_self_heal_addr is thread-local (race-free across concurrent
+        // missing threads); g_last_lookup_miss_addr stays for the abort dump.
         g_last_lookup_miss_addr = addr;
+        g_self_heal_addr = (uint32_t)addr;
         return unhandled_lookup_trampoline;
     }
     g_tier_static_hits.fetch_add(1, std::memory_order_relaxed);

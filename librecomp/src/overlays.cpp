@@ -1930,6 +1930,15 @@ struct JitEntry {
 };
 static std::vector<JitEntry> g_jit_entries;
 
+// ── B3 in-game execution test harness ────────────────────────────────────
+// Functions deliberately evicted from func_map (recomp_debug_jit_evict_all_
+// resident) so their next INDIRECT call lookup-misses and routes through the
+// dispatch tiers (self-heal → B3). Saves the original static func so that if
+// B3 can't recover a given function, the trampoline restores + runs the static
+// version instead of aborting — keeping the test non-destructive. Guarded by
+// func_map_mutex (same lock as func_map).
+static std::unordered_map<int32_t, recomp_func_t*> g_evicted_funcs;
+
 static std::mutex g_lookup_capture_mutex;
 static std::map<uint32_t, LookupCapture> g_lookup_captures;
 
@@ -2107,6 +2116,41 @@ static thread_local uint32_t g_self_heal_addr = 0;
 // function is found. Caller must hold >= a shared lock on func_map_mutex
 // (reads loaded_sections + sections_info). O(total loaded funcs); misses are
 // rare so the linear scan is acceptable.
+// B3 eligibility (POSITIVE allowlist). True only if `addr` lies inside an
+// always-resident STATIC code section — one whose link base (ram_addr) is its
+// fixed runtime home in resident kseg0 and is not synthetic. That is the only
+// place B3's literal-compile model holds ("resident code, link==runtime, all
+// relocations baked as absolute addresses"). Runtime-loaded overlay fragments
+// (link bases like 0x82xxxxxx / 0xC0xxxxxx, or synthetic, loaded into the
+// overlay arena above the static section) violate that model — JITing one
+// produces wrong code and crashed the process in testing. We deliberately use
+// the STABLE section table (not the dynamic loaded_sections list) so the check
+// can't be defeated by a fragment that is transiently absent from
+// loaded_sections during a load/unload race. Caller must hold func_map_mutex.
+static bool addr_in_resident_static_section(uint32_t addr) {
+    if (sections_info.code_sections == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < sections_info.num_code_sections; i++) {
+        const SectionTableEntry& sec = sections_info.code_sections[i];
+        const uint32_t base = (uint32_t)sec.ram_addr;
+        // Resident static section: non-synthetic, link base in resident kseg0,
+        // address inside its link range. Overlay sections have high/synthetic
+        // link bases and are excluded; overlay-arena runtime addresses fall in
+        // no static section's link range and are likewise excluded.
+        if (is_synthetic_addr(base)) {
+            continue;
+        }
+        if (base < 0x80000000u || base >= 0x80800000u) {
+            continue;
+        }
+        if (addr >= base && addr < base + sec.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool find_resident_enclosing_function(uint32_t addr,
                                              recomp_func_t*& host_out,
                                              uint32_t& link_target_out,
@@ -2444,19 +2488,25 @@ static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
 }
 
 // The runtime JIT tier is DEFAULT ON (set PSR_JIT_TIER=0 to force-disable).
-// The historical "live recompiler hangs/crashes on certain functions" was a
-// red herring: the real cause was a byte-order bug in jit_compile_inner's word
-// array (it packed Function::words big-endian, but recompile_function_impl
-// byteswaps each word back to big-endian for rabbitizer, so every function was
-// compiled from garbage instructions — a real `sw` decoded as a `jal` — and the
-// sljit generator crashed on float-heavy functions). With that fixed (plus the
-// empty static_funcs_out span), 32/32 sampled resident functions JIT cleanly.
-//
-// Default-on is strictly >= the old loud-abort behavior for a true gap: B3
-// either recompiles + runs the missing function (recovery) or fails and falls
-// through to the same loud abort as before. JIT work runs on a 256 MiB-reserved
-// worker thread guarded by SEH + a 2 s watchdog, so a pathological function
-// still can't take down the process. PSR_JIT_TIER=0 restores the opt-out.
+// Two classes of bug were found and fixed:
+//   1. Compile-correctness: the historical "live recompiler hangs/crashes" was
+//      a red herring — jit_compile_inner packed Function::words big-endian, but
+//      recompile_function_impl byteswaps each word back for rabbitizer, so every
+//      function compiled from garbage; plus an empty static_funcs_out span. With
+//      those fixed, 32/32 sampled resident functions JIT cleanly and sqrt
+//      executes numerically correct.
+//   2. Eligibility: a forced-eviction torture test showed B3 would also attempt
+//      OVERLAY-ARENA addresses (relocated/loaded fragments living above the
+//      static section), whose runtime image violates B3's literal-compile model
+//      — JITing one crashed the process. Fixed by the positive allowlist in
+//      addr_in_resident_static_section (B3 eligible ONLY inside the always-
+//      resident static code section). With it, the same torture test no longer
+//      hard-crashes: overlay gaps take the graceful loud abort, exactly as the
+//      pre-B3 era did.
+// So default-on is strictly >= the old loud-abort behavior for a true gap: a
+// STATIC-section gap is recompiled + run (recovery); an overlay gap falls through
+// to the same graceful abort as before. JIT work runs on a 256 MiB-reserved
+// worker thread guarded by SEH + a 2 s watchdog. PSR_JIT_TIER=0 restores opt-out.
 static bool jit_tier_enabled() {
     static const bool enabled = [](){
         const char* v = std::getenv("PSR_JIT_TIER");
@@ -2506,9 +2556,30 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
     // ── B3: runtime JIT tier (tier 3 before the loud abort) ──────────────
     // No registered function and no resident enclosing function — a TRUE gap.
     // JIT the function from its resident rdram image, register it, and run it.
-    // DEFAULT ON (PSR_JIT_TIER=0 to force-disable): on success we recover; on
-    // failure we fall through to the same loud abort as before.
+    // DEFAULT ON (PSR_JIT_TIER=0 to force-disable). Eligible ONLY for static-
+    // section gaps (addr_in_resident_static_section); overlay-arena addresses
+    // are excluded and fall through to the graceful loud abort. On success we
+    // recover; on failure we fall through to the same loud abort as before.
+    bool jit_eligible = false;
     if (jit_tier_enabled()) {
+        // Eligibility: B3 only handles genuine STATIC-section gaps. Overlay
+        // arena / loaded-fragment addresses violate its literal-compile model
+        // (see addr_in_resident_static_section) and JITing one crashes — those
+        // fall through to the graceful loud abort below.
+        {
+            std::shared_lock<std::shared_mutex> lock(func_map_mutex);
+            jit_eligible =
+                addr_in_resident_static_section((uint32_t)g_self_heal_addr);
+        }
+        if (!jit_eligible) {
+            fprintf(stderr,
+                "[recomp] 0x%08X is not in a resident static section — B3 not "
+                "eligible (overlay/fragment gap), skipping JIT\n",
+                (uint32_t)g_self_heal_addr);
+            fflush(stderr);
+        }
+    }
+    if (jit_tier_enabled() && jit_eligible) {
         std::string jit_err;
         recomp_func_t* jitted =
             jit_compile_function((uint32_t)g_self_heal_addr, rdram, jit_err);
@@ -2527,6 +2598,31 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
             "[recomp] JIT of 0x%08X not possible (%s) — aborting\n",
             (uint32_t)g_self_heal_addr, jit_err.c_str());
         fflush(stderr);
+    }
+
+    // B3 in-game test harness: if this address was deliberately evicted and
+    // B3 couldn't recover it (above), restore the saved static function and
+    // run it instead of aborting — so the evict-all test can never crash the
+    // game. (B3 SUCCESS already returned above, having re-registered vram.)
+    {
+        recomp_func_t* restore = nullptr;
+        {
+            std::unique_lock<std::shared_mutex> lock(func_map_mutex);
+            auto it = g_evicted_funcs.find((int32_t)g_self_heal_addr);
+            if (it != g_evicted_funcs.end()) {
+                restore = it->second;
+                func_map[(int32_t)g_self_heal_addr] = restore;  // re-register
+                g_evicted_funcs.erase(it);
+            }
+        }
+        if (restore != nullptr) {
+            fprintf(stderr,
+                "[jit-evict-test] 0x%08X not handled by B3 — restored static "
+                "func (no abort)\n", (uint32_t)g_self_heal_addr);
+            fflush(stderr);
+            restore(rdram, ctx);
+            return;
+        }
     }
 
     fprintf(stderr,
@@ -3307,6 +3403,33 @@ extern "C" int recomp_debug_jit_test(uint32_t vram,
         return 1;
     }
     return 0;
+}
+
+// B3 in-game execution test: evict every RESIDENT kseg0 function from func_map
+// (saving each so the trampoline can restore it on B3 failure). Direct jal
+// calls in static code are direct C calls and bypass func_map, so they keep
+// working; only INDIRECT calls (jalr / function-pointer dispatch) lookup-miss
+// and route through the dispatch tiers — for a resident whole-function miss
+// self-heal returns false, so B3 JITs + runs + re-registers it. If after this
+// the game keeps running correctly, B3's successful compiles all EXECUTE
+// correctly on real gameplay call sites. Returns the number evicted.
+extern "C" int recomp_debug_jit_evict_all_resident(void) {
+    int n = 0;
+    std::unique_lock<std::shared_mutex> lock(func_map_mutex);
+    for (auto it = func_map.begin(); it != func_map.end(); ) {
+        const uint32_t a = (uint32_t)it->first;
+        if (a >= 0x80000000u && a < 0x80800000u) {
+            g_evicted_funcs[it->first] = it->second;
+            it = func_map.erase(it);
+            n++;
+        } else {
+            ++it;
+        }
+    }
+    fprintf(stderr, "[jit-evict-test] evicted %d resident functions from "
+                    "func_map; indirect calls will now route through B3\n", n);
+    fflush(stderr);
+    return n;
 }
 
 // Pick a CURRENTLY-loaded section with a reloc offset that is not a

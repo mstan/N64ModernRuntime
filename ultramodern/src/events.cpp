@@ -386,8 +386,23 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
         }
 
         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
-            fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
-            ULTRAMODERN_QUICK_EXIT();
+            // No host microcode for this task (e.g. an audio task on a game whose
+            // aspMain hasn't been recompiled yet). Degrade gracefully instead of
+            // killing the process: warn once per task type, signal SP completion
+            // so the waiting game thread doesn't hang, and drop the task. Audio /
+            // other RSP work is silently skipped; graphics tasks return success
+            // and are unaffected. (Set PSR-side aspMain to restore real audio.)
+            static std::atomic<bool> s_warned[64] = {};
+            uint32_t t = task->t.type & 63u;
+            if (!s_warned[t].exchange(true)) {
+                fprintf(stderr,
+                    "[ultramodern] no RSP microcode for task type %" PRIu32
+                    " — dropping task (not fatal; further drops of this type are "
+                    "silent)\n", task->t.type);
+                fflush(stderr);
+            }
+            sp_complete(task->t.type);
+            continue;
         }
 
         // Tell the game that the RSP has completed

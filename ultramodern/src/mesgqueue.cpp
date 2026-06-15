@@ -76,6 +76,34 @@ namespace mesg_log {
     static std::atomic<uint64_t> next_seq{0};
     static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
 
+    // Never-evict per-QUEUE table: keeps the last few events for every queue the
+    // game ever touched, keyed by queue address (linear-probe hash). The 64K
+    // event ring wraps under the steady-state retrace/audio flood, so a queue
+    // that went silent early (e.g. a parked thread's reply queue) scrolls out
+    // before a probe looks. This table answers "after thread X blocked on recv,
+    // did anyone ever SEND to its queue?" regardless of how long ago that was.
+    struct QState {
+        uint32_t queue;        // 0 = empty slot
+        uint32_t count;        // total events recorded for this queue
+        Event     last[4];     // ring of the last 4 events on this queue
+    };
+    constexpr size_t QCAP = 1024;
+    static QState qstates[QCAP];
+
+    inline void qstate_push(uint32_t mq, const Event& e) {
+        if (mq == 0) return;
+        const size_t h = (mq >> 3) % QCAP;
+        for (size_t probe = 0; probe < QCAP; probe++) {
+            QState& q = qstates[(h + probe) % QCAP];
+            if (q.queue == 0 || q.queue == mq) {
+                q.queue = mq;
+                q.last[q.count & 3] = e;
+                q.count++;
+                return;
+            }
+        }
+    }
+
     static inline uint64_t now_ms() {
         return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count());
@@ -119,6 +147,7 @@ namespace mesg_log {
         e.game_thread = game_thread ? 1 : 0;
         e.pad = 0;
         e.reserved = 0;
+        qstate_push(mq, e);
     }
 }
 
@@ -148,6 +177,29 @@ extern "C" void ultramodern_mesg_recent_copy(
 
 extern "C" size_t ultramodern_mesg_event_size(void) {
     return sizeof(mesg_log::Event);
+}
+
+extern "C" size_t ultramodern_mesg_qstate_size(void) {
+    return sizeof(mesg_log::QState);
+}
+
+// Copy the never-evict per-queue table (every queue ever touched, each with its
+// last 4 events). Lets a probe see a parked thread's reply-queue history even
+// after the event ring has wrapped.
+extern "C" void ultramodern_mesg_qstates_copy(
+    void* out_void, size_t cap, size_t* n_written)
+{
+    using namespace mesg_log;
+    size_t w = 0;
+    if (out_void != nullptr) {
+        QState* out = static_cast<QState*>(out_void);
+        for (size_t i = 0; i < QCAP && w < cap; i++) {
+            if (qstates[i].queue != 0) {
+                out[w++] = qstates[i];
+            }
+        }
+    }
+    if (n_written) *n_written = w;
 }
 
 struct QueuedMessage {

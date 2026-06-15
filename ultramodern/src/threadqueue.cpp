@@ -84,6 +84,29 @@ namespace sched_log {
         return static_cast<int16_t>(TO_PTR(OSThread, t_)->priority);
     }
 
+    // Never-evict per-thread state table (indexed by OSThread id). The event
+    // ring wraps under the idle/audio cycle's high event rate, so an early
+    // park (a thread's last blocked_on_recv) scrolls out before a probe looks.
+    // This table keeps each thread's LAST event + last message-queue block
+    // permanently, so the full thread state is always queryable regardless of
+    // how long the cycle has flooded the ring. (Doctrine: fix the ring to cover
+    // the window, never arm-then-capture.)
+    struct ThreadState {
+        uint32_t valid;
+        uint32_t id;
+        uint32_t thread;
+        int32_t  priority;
+        uint32_t last_op;
+        uint32_t last_queue;
+        uint32_t last_head_after;
+        uint64_t last_ms;
+        uint32_t last_mq;     // last INSERT into a real msg queue (blocked_on_recv)
+        uint64_t last_mq_ms;
+        uint64_t count;
+    };
+    constexpr size_t MAX_TID = 1024;
+    static ThreadState thread_states[MAX_TID];
+
     void record(RDRAM_ARG uint32_t op,
                 PTR(PTR(OSThread)) queue_,
                 PTR(OSThread) thread_,
@@ -102,6 +125,26 @@ namespace sched_log {
         e.current_thread_id = thread_id(PASS_RDRAM ultramodern::this_thread());
         e.priority = thread_priority(PASS_RDRAM thread_);
         e.pad = 0;
+
+        if (e.thread_id < MAX_TID && !(e.thread_id == 0 && thread_ == NULLPTR)) {
+            ThreadState& ts = thread_states[e.thread_id];
+            ts.valid = 1;
+            ts.id = e.thread_id;
+            ts.thread = e.thread;
+            ts.priority = e.priority;
+            ts.last_op = op;
+            ts.last_queue = e.queue;
+            ts.last_head_after = e.head_after;
+            ts.last_ms = e.ms;
+            ts.count++;
+            // INSERT into a queue that is neither the running queue (0xFFFFFFFF,
+            // the running_queue sentinel) nor NULL == blocking on a real msg
+            // queue's blocked_on_recv list: that is what the thread is waiting on.
+            if (op == OP_INSERT && e.queue != 0xFFFFFFFFu && e.queue != 0) {
+                ts.last_mq = e.queue;
+                ts.last_mq_ms = e.ms;
+            }
+        }
     }
 }
 
@@ -127,6 +170,28 @@ extern "C" void ultramodern_sched_recent_copy(
 
 extern "C" size_t ultramodern_sched_event_size(void) {
     return sizeof(sched_log::Event);
+}
+
+extern "C" size_t ultramodern_sched_thread_state_size(void) {
+    return sizeof(sched_log::ThreadState);
+}
+
+// Copy the never-evict per-thread state table. Returns every thread the
+// scheduler has ever touched, each with its last event + last msg-queue block.
+extern "C" void ultramodern_sched_thread_states_copy(
+    void* out_void, size_t cap, size_t* n_written)
+{
+    using namespace sched_log;
+    size_t w = 0;
+    if (out_void != nullptr) {
+        ThreadState* out = static_cast<ThreadState*>(out_void);
+        for (size_t i = 0; i < MAX_TID && w < cap; i++) {
+            if (thread_states[i].valid) {
+                out[w++] = thread_states[i];
+            }
+        }
+    }
+    if (n_written) *n_written = w;
 }
 
 static PTR(OSThread)* queue_to_ptr(RDRAM_ARG PTR(PTR(OSThread)) queue) {

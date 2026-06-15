@@ -179,6 +179,19 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
     }
 }
 
+// Observability: expose the message-queue addresses registered for hardware
+// events (osSetEventMesg / osViSetEvent). Lets a probe correlate a parked
+// thread's blocked_on_recv queue against the SP/DP/AI/SI/VI event whose
+// producer it is waiting on -> identifies which hardware-event delivery died.
+// Order: [0]=SP [1]=DP [2]=AI [3]=SI [4]=VI(retrace).
+extern "C" void ultramodern_get_event_queues(uint32_t* out, int count) {
+    if (count > 0) out[0] = (uint32_t)events_context.sp.mq;
+    if (count > 1) out[1] = (uint32_t)events_context.dp.mq;
+    if (count > 2) out[2] = (uint32_t)events_context.ai.mq;
+    if (count > 3) out[3] = (uint32_t)events_context.si.mq;
+    if (count > 4) out[4] = (uint32_t)events_context.vi.get_cur_state()->mq;
+}
+
 extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 retrace_count) {
     std::lock_guard lock{ events_context.message_mutex };
     ViState* next_state = events_context.vi.get_next_state();

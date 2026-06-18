@@ -1954,6 +1954,12 @@ static std::atomic<uint64_t> g_tier_frag_candidates{0};
 // and candidates written out to it this session.
 static std::atomic<uint64_t> g_tier_frag_reloaded{0};
 static std::atomic<uint64_t> g_tier_frag_persisted{0};
+// Slice 3 (native fragment exec + shadow-diff gate, FRAGMENT_TIERS.md §8.4).
+static std::atomic<uint64_t> g_tier_frag_diff_clean{0};   // diff passes that matched the interpreter
+static std::atomic<uint64_t> g_tier_frag_diff_diverge{0}; // diff passes that diverged (trust reset)
+static std::atomic<uint64_t> g_tier_frag_device_touch{0}; // candidates pinned to interp (made a native call)
+static std::atomic<uint64_t> g_tier_frag_promoted{0};     // candidates that reached BUDGET clean passes
+static std::atomic<uint64_t> g_tier_frag_native_runs{0};  // live native executions of a promoted candidate
 
 // R4300i interpreter entry (librecomp/src/mips_interp.cpp). Runs the function at
 // start_pc against the live ctx/rdram; returns true on a clean return, false if
@@ -2199,6 +2205,11 @@ static void write_runtime_captures_locked() {
     fprintf(f, "    \"frag_candidates\": %llu,\n", (unsigned long long)g_tier_frag_candidates.load());
     fprintf(f, "    \"frag_reloaded\": %llu,\n", (unsigned long long)g_tier_frag_reloaded.load());
     fprintf(f, "    \"frag_persisted\": %llu,\n", (unsigned long long)g_tier_frag_persisted.load());
+    fprintf(f, "    \"frag_diff_clean\": %llu,\n", (unsigned long long)g_tier_frag_diff_clean.load());
+    fprintf(f, "    \"frag_diff_diverge\": %llu,\n", (unsigned long long)g_tier_frag_diff_diverge.load());
+    fprintf(f, "    \"frag_device_touch\": %llu,\n", (unsigned long long)g_tier_frag_device_touch.load());
+    fprintf(f, "    \"frag_promoted\": %llu,\n", (unsigned long long)g_tier_frag_promoted.load());
+    fprintf(f, "    \"frag_native_runs\": %llu,\n", (unsigned long long)g_tier_frag_native_runs.load());
     fprintf(f, "    \"unique_missed_addrs\": %zu\n", g_lookup_captures.size());
     fprintf(f, "  },\n");
     fprintf(f, "  \"misses\": [\n");
@@ -2409,6 +2420,197 @@ static void load_fragment_manifest() {
     }
 }
 
+// ── Slice 3: native fragment execution + shadow-diff validation gate ───────
+// (FRAGMENT_TIERS.md §8.4) A content-keyed candidate is JIT'd but NEVER trusted
+// blindly. Before it runs live it must pass the same-state differential vs the
+// interpreter oracle BUDGET consecutive times; until then the *interpreter*
+// result is what's committed, so an unvalidated/wrong shard never affects the
+// game. Gated OFF; PSR_FRAG_NATIVE=1 arms it (requires PSR_FRAG_JIT). This is
+// additive on top of slice 1-2: with PSR_FRAG_NATIVE unset, the tier behaves
+// exactly as before (discover + key + persist; execution interprets).
+static bool frag_native_enabled() {
+    static const bool enabled = []{
+        const char* v = std::getenv("PSR_FRAG_NATIVE");
+        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' ||
+                     v[0] == 'y' || v[0] == 'Y');
+    }();
+    return enabled;
+}
+static uint32_t frag_diff_budget() {
+    static const uint32_t budget = []{
+        const char* v = std::getenv("PSR_FRAG_DIFF_BUDGET");
+        uint32_t b = v ? (uint32_t)strtoul(v, nullptr, 10) : 0;
+        return b ? b : 8u;   // default: 8 consecutive clean passes before live-native
+    }();
+    return budget;
+}
+
+// Device-touch detector. While a shadow diff's PASS 1 interprets the candidate,
+// the interpreter bumps this whenever it makes a NATIVE call (jal/jalr/j into a
+// recompiled function — see mips_interp.cpp). Such a call can mutate host-side
+// state OUTSIDE the rdram block (scheduler / gfx submit / save) that we cannot
+// snapshot-restore, so any candidate that touches one is pinned to the
+// interpreter forever. Thread-local: two threads may diff concurrently.
+static thread_local bool t_shadow_active = false;
+static thread_local bool t_shadow_touched_native = false;
+extern "C" int  recomp_shadow_diff_active(void)           { return t_shadow_active ? 1 : 0; }
+extern "C" void recomp_shadow_diff_note_native_call(void) { t_shadow_touched_native = true; }
+
+// Eligibility: a candidate may only ever run native if its body contains NO
+// outgoing control transfer — no jal/jalr (call), no j to outside its own
+// bounds (tail call), and no computed jr (only `jr $ra` = return is allowed).
+// Such a "safe leaf" is a pure register+RAM transformation on ALL inputs, so
+// the same-state differential fully captures its behavior and a promoted shard
+// can never reach an unvalidated, side-effecting path. Conservative on purpose
+// (precision over recall): a jumptable (computed jr) or any call keeps the
+// fragment on the interpreter floor. The dynamic PASS-1 detector is the
+// backstop for anything this static scan can't see (e.g. data misread as code).
+static bool fragment_is_safe_leaf(uint8_t* rdram, uint32_t code_lo, uint32_t code_len) {
+    const uint32_t pbase = code_lo & 0x1FFFFFFFu;
+    for (uint32_t off = 0; off + 4 <= code_len; off += 4) {
+        uint32_t w = 0;
+        for (int b = 0; b < 4; b++) {
+            w = (w << 8) | rdram[((pbase + off + b) ^ 3)];
+        }
+        const uint32_t op = w >> 26;
+        if (op == 0x03) {                       // jal
+            return false;
+        }
+        if (op == 0x02) {                        // j — local jump or tail call
+            const uint32_t pcv = code_lo + off;
+            const uint32_t tgt = (pcv & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
+            if (tgt < code_lo || tgt >= code_lo + code_len) {
+                return false;                    // j out of bounds = tail call
+            }
+        }
+        if (op == 0x00) {
+            const uint32_t fn = w & 0x3F;
+            if (fn == 0x09) {                    // jalr = call
+                return false;
+            }
+            if (fn == 0x08) {                    // jr
+                const uint32_t rs = (w >> 21) & 0x1F;
+                if (rs != 31) {                  // computed jr (jumptable/tailcall)
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Compare the architectural state two passes produced (GPRs r1..r31, FPRs by
+// raw bits, hi/lo). The host-side scaffolding (tailcall_*, dispatch/return
+// targets, f_odd, cop0) is intentionally excluded — it is control-plane plumbing
+// that legitimately differs and is not part of the function's data result.
+static bool shadow_regs_equal(const recomp_context* a, const recomp_context* b) {
+    const gpr* ra = &a->r0; const gpr* rb = &b->r0;
+    for (int i = 1; i < 32; i++) {               // r0 is hardwired 0
+        if (ra[i] != rb[i]) return false;
+    }
+    const fpr* fa = &a->f0; const fpr* fb = &b->f0;
+    for (int i = 0; i < 32; i++) {
+        if (fa[i].u64 != fb[i].u64) return false;
+    }
+    return a->hi == b->hi && a->lo == b->lo;
+}
+
+// One same-state differential pass (FRAGMENT_TIERS.md §8.4). PASS 1 interprets
+// (authoritative) with the device detector armed; PASS 2 runs the native shard
+// from the identical input; we compare GPR/FPR/hi-lo + the full 8 MiB RAM region
+// and ALWAYS commit the interpreter result (the native pass is discarded). The
+// caller holds NO lock (this interprets + runs guest code). rdram[0,0x800000)
+// is the kseg0 RAM region — every interpreter memory access stays inside the
+// mapped block, so snapshotting that region captures all restorable state.
+struct ShadowDiffOutcome { bool interp_ok; bool device_touch; bool ran_native; bool clean; };
+static ShadowDiffOutcome run_shadow_diff(uint8_t* rdram, recomp_context* ctx,
+                                         uint32_t addr, recomp_func_t* fn) {
+    constexpr size_t RAM = 0x800000;
+    static thread_local std::vector<uint8_t> ram0, ramI;
+    ram0.resize(RAM);
+    ramI.resize(RAM);
+    ShadowDiffOutcome o{};
+
+    const recomp_context ctx0 = *ctx;
+    std::memcpy(ram0.data(), rdram, RAM);
+
+    // PASS 1 — interpreter first (authoritative), device detector armed.
+    t_shadow_touched_native = false;
+    t_shadow_active = true;
+    const bool ok = recomp_interpret_function(rdram, ctx, addr);
+    t_shadow_active = false;
+    o.interp_ok = ok;
+    if (!ok) {
+        // Could not even interpret: undo our mutations and let the normal interp
+        // tier re-run it and abort loudly with the proper diagnostics.
+        *ctx = ctx0;
+        std::memcpy(rdram, ram0.data(), RAM);
+        return o;
+    }
+    if (t_shadow_touched_native) {
+        // Touched a native call -> possible unrestorable side effect. Keep the
+        // interpreter result live (already applied) and pin the candidate.
+        o.device_touch = true;
+        return o;
+    }
+
+    // Clean leaf: save the interp result, restore the start state, run native.
+    const recomp_context ctxI = *ctx;
+    std::memcpy(ramI.data(), rdram, RAM);
+    *ctx = ctx0;
+    std::memcpy(rdram, ram0.data(), RAM);
+
+    // PASS 2 — native shard from the identical input.
+    fn(rdram, ctx);
+    o.ran_native = true;
+    o.clean = shadow_regs_equal(ctx, &ctxI) &&
+              (std::memcmp(rdram, ramI.data(), RAM) == 0);
+
+    // COMMIT the interpreter result; the native pass is discarded entirely.
+    *ctx = ctxI;
+    std::memcpy(rdram, ramI.data(), RAM);
+    return o;
+}
+
+// Apply a differential outcome to the candidate at (faddr, content_hash), under
+// the write lock. Updates trust (diff_passes), pins device-touchers, and bumps
+// the surfaced counters. Re-finds by content hash because the chain may have
+// changed while the diff ran unlocked.
+static void frag_apply_diff_outcome(uint32_t faddr, uint64_t content_hash,
+                                    const ShadowDiffOutcome& o) {
+    const uint32_t budget = frag_diff_budget();
+    std::unique_lock<std::shared_mutex> lock(func_map_mutex);
+    auto it = g_frag_cands.find(faddr);
+    if (it == g_frag_cands.end()) {
+        return;
+    }
+    for (auto& c : it->second) {
+        if (c.content_hash != content_hash) {
+            continue;
+        }
+        if (o.device_touch) {
+            if (!c.device_touch) {
+                g_tier_frag_device_touch.fetch_add(1, std::memory_order_relaxed);
+            }
+            c.device_touch = true;
+        } else if (o.ran_native) {
+            if (o.clean) {
+                g_tier_frag_diff_clean.fetch_add(1, std::memory_order_relaxed);
+                if (c.diff_passes < budget) {
+                    c.diff_passes++;
+                    if (c.diff_passes == budget) {
+                        g_tier_frag_promoted.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } else {
+                g_tier_frag_diff_diverge.fetch_add(1, std::memory_order_relaxed);
+                c.diff_passes = 0;   // an intermittently-wrong shard never accrues trust
+            }
+        }
+        return;
+    }
+}
+
 // Trace-ring queries (defined in extras.c — game-side instrumentation).
 extern "C" {
     uint64_t pkmnstadium_trace_write_idx(void);
@@ -2551,10 +2753,16 @@ extern "C" recomp_func_t* get_function(int32_t addr);
 // only place a loaded code image exists to read. Overlay link addresses
 // (e.g. PMS 0x82xxxxxx) are out of that range and are rejected (no OOB read).
 // Returns the native function and registers it, or nullptr + err on failure.
-// keep_and_register=false compiles and validates without registering or
-// retaining the result (used by the validation hook so it can prove the
-// pipeline on a resident function without swapping the live func_map entry);
-// it returns a non-null success sentinel (never call it) and fills out_sizes.
+// Two orthogonal flags:
+//   keep=false  compiles + validates then DISCARDS (frees output); returns a
+//               non-null success sentinel (never call it). Used by the pipeline
+//               validation probe.
+//   keep=true, register_in_map=false  keeps the code alive (in g_jit_entries)
+//               and returns a CALLABLE function, but does NOT touch func_map.
+//               Used by the content-keyed fragment tier (slice 3): a fragment
+//               shard must never sit in the address-keyed fast path.
+//   keep=true, register_in_map=true   the B3 resident-static path: kept alive
+//               AND registered so all future calls hit the static fast path.
 //
 // NOTE: this is the *inner* worker. It can hard-fault (segfault) inside the
 // sljit/LiveGenerator codegen on a malformed or unsupported function — the
@@ -2563,7 +2771,7 @@ extern "C" recomp_func_t* get_function(int32_t addr);
 // a graceful failure instead of taking down the process.
 static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
                                          std::string& err,
-                                         bool keep_and_register,
+                                         bool keep, bool register_in_map,
                                          size_t* out_func_size,
                                          size_t* out_code_size) {
     using namespace N64Recomp;
@@ -2679,19 +2887,24 @@ static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
     recomp_func_t* jitted = output->functions[0];
     if (out_func_size) *out_func_size = func_size;
     if (out_code_size) *out_code_size = output->code_size;
-    if (!keep_and_register) {
+    if (!keep) {
         // Validation path: proven good; discard (output + section_addrs freed
         // here). Return a non-null sentinel meaning "compiled OK, not kept".
         // The caller must NOT call it.
         return reinterpret_cast<recomp_func_t*>(0x1);
     }
-    // 6. Keep output + section-addr array alive for the program lifetime and
-    //    register so all future calls hit the static fast path.
+    // 6. Keep output + section-addr array alive for the program lifetime.
+    //    register_in_map=true (B3) also puts it in func_map so all future calls
+    //    hit the static fast path; the fragment tier (slice 3) keeps it alive
+    //    but OUT of func_map (it is reached only through the content-keyed,
+    //    per-dispatch-validated path).
     {
         std::unique_lock<std::shared_mutex> lock(func_map_mutex);
         g_jit_entries.push_back(
             JitEntry{ std::move(output), std::move(section_addrs) });
-        func_map[(int32_t)vram] = jitted;
+        if (register_in_map) {
+            func_map[(int32_t)vram] = jitted;
+        }
     }
     return jitted;
 }
@@ -2704,12 +2917,12 @@ static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
 // compiler, vectors) leak (SEH skips C++ unwinding under /EHsc); acceptable on
 // this rare path. NOTE: SEH cannot catch a HANG — see the watchdog below.
 static recomp_func_t* jit_compile_seh(uint32_t vram, uint8_t* rdram,
-                                      std::string& err, bool keep_and_register,
+                                      std::string& err, bool keep, bool register_in_map,
                                       size_t* out_func_size,
                                       size_t* out_code_size) {
 #ifdef _WIN32
     __try {
-        return jit_compile_inner(vram, rdram, err, keep_and_register,
+        return jit_compile_inner(vram, rdram, err, keep, register_in_map,
                                  out_func_size, out_code_size);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         err.assign("JIT compile hard-faulted (SEH-guarded; unsupported "
@@ -2719,7 +2932,7 @@ static recomp_func_t* jit_compile_seh(uint32_t vram, uint8_t* rdram,
         return nullptr;
     }
 #else
-    return jit_compile_inner(vram, rdram, err, keep_and_register,
+    return jit_compile_inner(vram, rdram, err, keep, register_in_map,
                              out_func_size, out_code_size);
 #endif
 }
@@ -2733,6 +2946,7 @@ struct JitWorkerShared {
     uint32_t vram = 0;
     uint8_t* rdram = nullptr;
     bool keep = true;
+    bool register_in_map = true;
 };
 
 #ifdef _WIN32
@@ -2743,7 +2957,7 @@ static DWORD WINAPI jit_worker_proc(LPVOID param) {
     delete holder;
     std::string e;
     size_t fs = 0, cs = 0;
-    recomp_func_t* fn = jit_compile_seh(s->vram, s->rdram, e, s->keep, &fs, &cs);
+    recomp_func_t* fn = jit_compile_seh(s->vram, s->rdram, e, s->keep, s->register_in_map, &fs, &cs);
     s->fn = fn;
     s->err = std::move(e);
     s->fs = fs;
@@ -2765,13 +2979,15 @@ static DWORD WINAPI jit_worker_proc(LPVOID param) {
 // own lock on success; the game thread holds no lock here, so no deadlock.
 static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
                                            std::string& err,
-                                           bool keep_and_register = true,
+                                           bool keep = true,
+                                           bool register_in_map = true,
                                            size_t* out_func_size = nullptr,
                                            size_t* out_code_size = nullptr) {
     auto sh = std::make_shared<JitWorkerShared>();
     sh->vram = vram;
     sh->rdram = rdram;
-    sh->keep = keep_and_register;
+    sh->keep = keep;
+    sh->register_in_map = register_in_map;
 
 #ifdef _WIN32
     // 256 MiB reserved (not committed) stack — address space only; pages
@@ -2807,7 +3023,7 @@ static recomp_func_t* jit_compile_function(uint32_t vram, uint8_t* rdram,
     std::thread worker([sh]() {
         std::string e; size_t fs = 0, cs = 0;
         recomp_func_t* fn = jit_compile_seh(sh->vram, sh->rdram, e,
-                                            sh->keep, &fs, &cs);
+                                            sh->keep, sh->register_in_map, &fs, &cs);
         sh->fn = fn; sh->err = std::move(e); sh->fs = fs; sh->cs = cs;
         sh->done.store(true, std::memory_order_release);
     });
@@ -2957,14 +3173,23 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
         }
     }
 
-    // ── Content-keyed fragment tier (FRAGMENT_TIERS.md §8, steps 1-2) ────
+    // ── Content-keyed fragment tier (FRAGMENT_TIERS.md §8) ───────────────
     // For a fragment (non-resident-static) miss, discover its bounds and track
-    // a content-keyed candidate in g_frag_cands. This proves discovery + keying
-    // + multi-candidate selection on the live workload. Execution still falls
-    // through to the interpreter floor below — no native shard, no differential
-    // yet (steps 3+) — so this can ONLY add bookkeeping; it never changes what
-    // runs. Gated OFF unless PSR_FRAG_JIT=1.
-    if (frag_jit_enabled()) {
+    // a content-keyed candidate in g_frag_cands. With PSR_FRAG_JIT alone (slice
+    // 1-2) this is pure bookkeeping (discover + key + persist) and execution
+    // falls through to the interpreter floor below. With PSR_FRAG_NATIVE also
+    // set (slice 3) a safe-leaf candidate is JIT'd (kept alive, NOT in func_map)
+    // and run through the same-state differential gate; once it passes BUDGET
+    // consecutive clean diffs vs the interpreter it runs native live. Until then
+    // the interpreter result is what's committed, so an unvalidated shard never
+    // affects the game. Gated OFF unless PSR_FRAG_JIT=1.
+    //
+    // !t_shadow_active: never re-enter the fragment tier from inside a shadow
+    // diff. A safe-leaf candidate makes no calls so its diff can't reach here,
+    // but if the static leaf check is ever wrong (data misread as code) the
+    // PASS-1 interpreter could make a native call that lookup-misses back into
+    // this trampoline — a nested miss during a diff just interprets instead.
+    if (frag_jit_enabled() && !t_shadow_active) {
         const uint32_t faddr = (uint32_t)g_self_heal_addr;
         if (faddr >= 0x80000000u && faddr < 0x80800000u) {
             bool resident_static;
@@ -2973,8 +3198,13 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                 resident_static = addr_in_resident_static_section(faddr);
             }
             if (!resident_static) {
-                // Already have a candidate whose content still matches live bytes?
-                bool have_live_match = false;
+                // Find a candidate whose content still matches the live bytes,
+                // copying out the fields we need so we can act WITHOUT the lock
+                // (the diff/native run must not hold func_map_mutex).
+                bool have_live = false, live_dt = false, live_bl = false;
+                uint64_t live_hash = 0;
+                uint32_t live_lo = 0, live_len = 0, live_passes = 0;
+                recomp_func_t* live_fn = nullptr;
                 {
                     std::shared_lock<std::shared_mutex> lock(func_map_mutex);
                     auto it = g_frag_cands.find(faddr);
@@ -2983,13 +3213,17 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                             if (c.code_len > 0 &&
                                 fragment_live_code_hash(rdram, c.code_lo, c.code_len)
                                     == c.content_hash) {
-                                have_live_match = true;
+                                have_live = true;   live_hash = c.content_hash;
+                                live_lo = c.code_lo; live_len = c.code_len;
+                                live_fn = c.fn;     live_passes = c.diff_passes;
+                                live_dt = c.device_touch; live_bl = c.blacklisted;
                                 break;
                             }
                         }
                     }
                 }
-                if (!have_live_match) {
+
+                if (!have_live) {
                     // New content at this address: discover bounds + key it.
                     const uint32_t pbase = faddr & 0x1FFFFFFFu;
                     constexpr uint32_t RDRAM_END = 0x00800000u;
@@ -3011,6 +3245,22 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                             c.code_len = (uint32_t)fsz;
                             c.content_hash =
                                 fragment_live_code_hash(rdram, faddr, (uint32_t)fsz);
+                            // Slice 3: JIT a safe-leaf candidate now (kept alive,
+                            // NOT registered in func_map). A non-leaf or JIT
+                            // failure leaves fn=null -> stays on the interpreter.
+                            if (frag_native_enabled()) {
+                                if (fragment_is_safe_leaf(rdram, faddr, (uint32_t)fsz)) {
+                                    std::string jerr; size_t js = 0, cs = 0;
+                                    recomp_func_t* fn = jit_compile_function(
+                                        faddr, rdram, jerr, /*keep=*/true,
+                                        /*register_in_map=*/false, &js, &cs);
+                                    if (fn) {
+                                        c.fn = fn;
+                                    }
+                                } else {
+                                    c.device_touch = true; // outgoing control -> never native
+                                }
+                            }
                             {
                                 std::unique_lock<std::shared_mutex> lock(func_map_mutex);
                                 g_frag_cands[faddr].push_back(c);
@@ -3022,6 +3272,77 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                             }
                             g_tier_frag_candidates.fetch_add(
                                 1, std::memory_order_relaxed);
+                            if (c.device_touch) {
+                                g_tier_frag_device_touch.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                            // Reflect the new candidate into the live_* locals so
+                            // the execution decision below uses it this dispatch.
+                            have_live = true; live_hash = c.content_hash;
+                            live_lo = c.code_lo; live_len = c.code_len;
+                            live_fn = c.fn; live_passes = 0;
+                            live_dt = c.device_touch; live_bl = false;
+                        }
+                    }
+                } else if (frag_native_enabled() && live_fn == nullptr &&
+                           !live_dt && !live_bl && live_len > 0) {
+                    // Live candidate with no native shard yet (e.g. reloaded from
+                    // the manifest, or a prior JIT was deferred): JIT it now.
+                    if (fragment_is_safe_leaf(rdram, live_lo, live_len)) {
+                        std::string jerr; size_t js = 0, cs = 0;
+                        recomp_func_t* fn = jit_compile_function(
+                            faddr, rdram, jerr, /*keep=*/true,
+                            /*register_in_map=*/false, &js, &cs);
+                        std::unique_lock<std::shared_mutex> lock(func_map_mutex);
+                        auto it = g_frag_cands.find(faddr);
+                        if (it != g_frag_cands.end()) {
+                            for (auto& c : it->second) {
+                                if (c.content_hash != live_hash) continue;
+                                if (fn) { c.fn = fn; live_fn = fn; }
+                                break;
+                            }
+                        }
+                    } else {
+                        std::unique_lock<std::shared_mutex> lock(func_map_mutex);
+                        auto it = g_frag_cands.find(faddr);
+                        if (it != g_frag_cands.end()) {
+                            for (auto& c : it->second) {
+                                if (c.content_hash != live_hash) continue;
+                                if (!c.device_touch) {
+                                    g_tier_frag_device_touch.fetch_add(
+                                        1, std::memory_order_relaxed);
+                                }
+                                c.device_touch = true; live_dt = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Slice 3 execution decision (only when native is armed).
+                if (frag_native_enabled() && have_live) {
+                    if (live_fn && !live_dt && !live_bl &&
+                        live_passes >= frag_diff_budget()) {
+                        // PROMOTED: BUDGET clean diffs passed — run native live.
+                        live_fn(rdram, ctx);
+                        g_tier_frag_native_runs.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    if (live_fn && !live_dt && !live_bl) {
+                        // Validating: one differential pass (interp result committed).
+                        ShadowDiffOutcome o = run_shadow_diff(rdram, ctx, faddr, live_fn);
+                        if (o.interp_ok) {
+                            frag_apply_diff_outcome(faddr, live_hash, o);
+                            g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+                            return;
+                        }
+                        // interp failed inside the diff -> fall through to the
+                        // interp tier below for the loud abort + diagnostics.
+                    } else if (live_dt || live_bl) {
+                        // Pinned to the interpreter (device touch / blacklisted).
+                        if (recomp_interpret_function(rdram, ctx, faddr)) {
+                            g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+                            return;
                         }
                     }
                 }
@@ -3829,7 +4150,7 @@ extern "C" int recomp_debug_jit_test(uint32_t vram,
     std::string err;
     size_t func_size = 0, code_size = 0;
     recomp_func_t* res = jit_compile_function(
-        vram, rdram, err, /*keep_and_register=*/false, &func_size, &code_size);
+        vram, rdram, err, /*keep=*/false, /*register_in_map=*/false, &func_size, &code_size);
     if (out_func_size) *out_func_size = (uint32_t)func_size;
     if (out_code_size) *out_code_size = (uint32_t)code_size;
     if (res == nullptr) {

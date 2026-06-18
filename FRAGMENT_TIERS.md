@@ -114,17 +114,18 @@ by content validation, not by exclusion.
 
 ## 5. Priority order (dependency-first)
 
-1. **Interpreter floor (#1)** — a fragment lookup-miss interprets from that PC
+1. ✅ **Interpreter floor (#1)** — a fragment lookup-miss interprets from that PC
    instead of aborting. *Backend-independent; unblocks the `0x801451A0` abort
-   today.* ← **in progress.**
-2. **Cache namespacing + mid-session manifest persistence (#3).**
-3. **Content-keyed, fragment-eligible sljit (#2 extension)** — replace B3's
-   allowlist with content-hash + multi-candidate + live-byte validation.
-4. **Release fold-back (Track C)** — re-run N64Recomp on accumulated coverage for
-   the optimized shipped baseline (already partially present via
+   today.*
+2. ✅ **Cache namespacing + mid-session manifest persistence (#3).** [§3, §9]
+3. ✅ **Content-keyed, fragment-eligible sljit (#2 extension)** — replace B3's
+   allowlist with content-hash + multi-candidate + live-byte validation +
+   shadow-diff gate. [slice 3, §8.7; gated `PSR_FRAG_NATIVE`, OFF by default]
+4. ◻️ **Release fold-back (Track C)** — re-run N64Recomp on accumulated coverage
+   for the optimized shipped baseline (already partially present via
    `force_function_vrams`).
-5. *(optional)* runtime spawn-clang→DLL dev backend + selection policy, mirroring
-   `SLJIT.md` §1.
+5. ◻️ *(optional)* runtime spawn-clang→DLL dev backend + selection policy,
+   mirroring `SLJIT.md` §1.
 
 ---
 
@@ -288,17 +289,58 @@ the reloaded range. Per-call live-byte revalidation (8.3 step 3) is the backstop
 
 ### 8.6 Rollout (additive, gated, measured — psx §7 mirror)
 
-1. Data structures + content hash + candidate registry (additive, dead until wired).
-2. Wire the tier behind `PSR_FRAG_JIT`, candidate path runs the **interpreter**
+1. ✅ Data structures + content hash + candidate registry (additive, dead until wired). [slice 1]
+2. ✅ Wire the tier behind `PSR_FRAG_JIT`, candidate path runs the **interpreter**
    result live (no native yet) — proves discovery/keying/invalidation with zero
-   risk.
-3. Add the differential gate (8.4); native runs only after BUDGET clean passes.
-4. Measure on Stadium 2's fragment workload (it's fragment-dominated): count
+   risk. [slice 1-2; + B4 manifest persistence, §9]
+3. ✅ **Add the differential gate (8.4); native runs only after BUDGET clean
+   passes. [slice 3, 2026-06-18 — see §8.7.]**
+4. ◻️ Measure on Stadium 2's fragment workload (it's fragment-dominated): count
    candidates, diff passes, divergences, native promotions vs interp.
-5. Re-verify PMS + Stadium 1 (engine change → fork branches) before default-on.
+5. ◻️ Re-verify PMS + Stadium 1 (engine change → fork branches) before default-on.
 
 Default-on is gated on step 4 showing 0 divergences over a substantial run +
 user sign-off — same bar psx used.
+
+### 8.7 Slice 3 as built (2026-06-18) — safe-leaf v1
+
+A second sub-gate `PSR_FRAG_NATIVE=1` (requires `PSR_FRAG_JIT`) arms native
+execution; with `PSR_FRAG_JIT` alone the tier is unchanged (slice 1-2 bookkeeping
++ interpreter floor). When armed:
+
+- A new candidate is JIT'd via `jit_compile_function(keep=true,
+  register_in_map=false)` — a new JIT mode that keeps the shard alive in
+  `g_jit_entries` but NEVER puts it in `func_map` (the address-keyed fast path is
+  exactly what's unsafe for reused fragment arenas). The shard is reached only
+  through the content-keyed, per-dispatch-validated tier.
+- **Safe-leaf eligibility** (`fragment_is_safe_leaf`): a candidate is JIT/native-
+  eligible only if its body has NO outgoing control transfer — no `jal`/`jalr`
+  (call), no `j` outside its own bounds (tail call), no computed `jr` (only
+  `jr $ra` = return). Such a function is a pure register+RAM transformation on
+  **all** inputs, so the diff fully captures it and a promoted shard can never
+  reach an unvalidated, side-effecting path. Non-leaf → pinned to interp
+  (`device_touch`), never JIT'd. Precision over recall.
+- `run_shadow_diff` ports psx verbatim but snapshots/compares only the 8 MiB
+  kseg0 RAM region (`rdram[0,0x800000)`) + GPR/FPR/hi-lo — sound because every
+  interpreter memory access (incl. MMIO) indexes the one mapped block
+  (`RECOMP_MEM_MASK`), there is no device handler in the mem path, and the only
+  non-restorable side effect is a native CALL. **Device-touch = any native call
+  during PASS 1**, detected via the `recomp_shadow_diff_active` /
+  `recomp_shadow_diff_note_native_call` hooks at `mips_interp.cpp`'s two
+  `recomp_lookup_function_or_null → nf` sites (a dynamic backstop to the static
+  leaf check). The whole tier is skipped while `t_shadow_active` (no nested diff).
+- Promotion = `PSR_FRAG_DIFF_BUDGET` (default 8) **consecutive** clean passes;
+  any divergence resets to 0. Until promoted the interpreter result is committed
+  (native discarded), so an un-promoted/wrong shard never affects the game.
+- Counters in `runtime_captures.json`: `frag_diff_clean` / `frag_diff_diverge` /
+  `frag_device_touch` / `frag_promoted` / `frag_native_runs`.
+
+**Known v1 limits** (broaden later, not blockers): only leaf fragments promote
+(non-leaf — most fragments that call helpers — stay on the interpreter, correct
+but unaccelerated); the 8 MiB snapshot is heavy but only on the rare un-promoted
+path. Broadening to non-leaf needs the psx `s_native_exec=0` model (route nested
+calls through the interpreter on both passes) + an HLE side-effect choke-point
+detector — deferred.
 
 ## 7. Open questions / risks
 

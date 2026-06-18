@@ -32,6 +32,16 @@
 // interpreter) and recurse unbounded -> host stack overflow.
 extern "C" recomp_func_t* recomp_lookup_function_or_null(int32_t vram);
 
+// Shadow-diff device-touch hooks (defined in overlays.cpp, FRAGMENT_TIERS.md
+// §8.4). While a content-keyed fragment shadow diff is validating a candidate,
+// ANY native call the interpreter makes is a potential out-of-rdram side effect
+// (scheduler / gfx submit / save) that cannot be snapshot-restored, so the
+// candidate is pinned to the interpreter and never promoted to native. Outside a
+// diff recomp_shadow_diff_active() is false (one predictable branch) — no effect
+// on normal interpretation.
+extern "C" int  recomp_shadow_diff_active(void);
+extern "C" void recomp_shadow_diff_note_native_call(void);
+
 namespace {
 
 // Coverage hook. No-op for now (step #1 is the correctness floor); a later step
@@ -280,6 +290,7 @@ bool interpret(uint8_t* rdram, recomp_context* ctx, uint32_t start_pc, int depth
             if (!exec_noncontrol(rdram, ctx, R, F, ifetch(rdram, pc + 4), pc + 4)) return false; // delay slot
             recomp_func_t* nf = recomp_lookup_function_or_null((int32_t)target);
             if (nf != nullptr) {
+                if (recomp_shadow_diff_active()) recomp_shadow_diff_note_native_call();
                 nf(rdram, ctx);                          // call native
                 if (op == 0x03) { pc = link; continue; } // jal: resume after
                 return true;                             // j to native = tail call
@@ -302,7 +313,10 @@ bool interpret(uint8_t* rdram, recomp_context* ctx, uint32_t start_pc, int depth
             if (!exec_noncontrol(rdram, ctx, R, F, ifetch(rdram, pc + 4), pc + 4)) return false; // delay slot
             if (!link && target == return_target) return true;           // jr $ra -> function return
             recomp_func_t* nf = recomp_lookup_function_or_null((int32_t)target);
-            if (nf != nullptr) { nf(rdram, ctx); if (link) { pc = ret; continue; } return true; }
+            if (nf != nullptr) {
+                if (recomp_shadow_diff_active()) recomp_shadow_diff_note_native_call();
+                nf(rdram, ctx); if (link) { pc = ret; continue; } return true;
+            }
             if (link) { if (!interpret(rdram, ctx, target, depth + 1)) return false; pc = ret; continue; }
             pc = target; continue;                                       // jr to unknown = tail
         }

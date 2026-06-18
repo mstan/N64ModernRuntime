@@ -146,6 +146,149 @@ A small R4300i interpreter in librecomp, invoked from the lookup-miss trampoline
 
 ---
 
+## 8. Content-keyed fragment dispatch — concrete implementation plan (2026-06-17)
+
+Grounded in the actual `librecomp/src/overlays.cpp` dispatch code. The current
+lookup-miss flow (`unhandled_lookup_trampoline`, ~line 2542) is:
+
+```
+get_function(addr) miss → trampoline:
+  tier 2  self-heal      find_resident_enclosing_function → dispatch interior   (resident recompiled fns)
+  tier 3  B3 JIT         addr_in_resident_static_section ONLY → jit + func_map   (resident-static gaps)
+  (evict-test restore)
+  tier 4  interpreter    recomp_interpret_function(addr)                         (FLOOR — fragments land here)
+  → loud abort
+```
+
+Fragments fall to **tier 4 (interpreter) forever** — correct but slow. Goal:
+let B3 JIT fragments **safely**, replacing `addr_in_resident_static_section`'s
+exclusion with psxrecomp's content-keyed model (§4). This is the n64 analogue of
+`overlay_loader.c`'s `Candidate` chain + `cand_crc` + `run_shadow_diff`.
+
+### 8.1 Why fragments can't just go in `func_map`
+
+n64 dispatch is `func_map[addr]` → direct call (no per-call validation). B3
+today *registers* its JIT in `func_map[vram]` (line 2383) → permanent direct
+fast path. That's **address-keyed** and unsafe for fragments: the overlay arena
+address is **reused by different content** over a session, so a func baked for
+content A runs when content B is loaded. (This is exactly why
+`addr_in_resident_static_section` excludes them — "JITing one produces wrong code
+and crashed.")
+
+**Fix:** fragment JITs are NOT put in `func_map`. They live in a separate
+candidate registry; fragment addresses therefore keep lookup-missing → re-enter
+the trampoline → the new content-keyed tier validates per call. (Same as psx:
+overlays never sit in a direct map; every dispatch goes through the validator.)
+
+### 8.2 New data structures (`overlays.cpp`)
+
+```cpp
+struct FragmentCandidate {
+    uint32_t  addr;          // runtime entry (overlay-arena vaddr)
+    uint64_t  content_hash;  // XXH3 of the live code bytes at [code_lo,code_lo+code_len)
+    uint32_t  code_lo;       // = addr (paddr of the JIT'd body)
+    uint32_t  code_len;      // discovered func_size
+    recomp_func_t* fn;       // JIT output (storage kept alive in g_jit_entries)
+    uint32_t  diff_passes;   // consecutive clean differentials vs interpreter
+    bool      blacklisted;   // self-mod / repeatedly-divergent → never run native
+};
+// chain per runtime address (the same addr legitimately hosts different content)
+static std::unordered_map<uint32_t, std::vector<FragmentCandidate>> g_frag_cands; // func_map_mutex
+```
+
+### 8.3 New tier in the trampoline (between tier 3 and tier 4), gated OFF by default
+
+`PSR_FRAG_JIT=1` arms it; unset → today's behavior (fragments interpret). Engages
+only when `!addr_in_resident_static_section(addr)` AND `addr` is inside a
+currently-loaded fragment section (so the bytes are valid and the range is known):
+
+```
+content-keyed fragment tier (addr = g_self_heal_addr):
+  1. discover_function_bounds(live rdram @ addr) → func_size           (reuse jit_compile_inner's walk)
+  2. h = XXH3(live code [addr, addr+func_size))
+  3. walk g_frag_cands[addr]:
+       for cand: if XXH3(cand range) == cand.content_hash == h:        (live-byte revalidation, cand_crc analogue)
+            if cand.blacklisted: skip
+            if cand.diff_passes >= BUDGET: cand.fn(rdram, ctx); return  (trusted → native)
+            else: run DIFFERENTIAL (8.4); return
+  4. no live match → JIT a fresh candidate (jit_compile_function, keep_and_register=FALSE so it
+       does NOT touch func_map), push {h, addr, func_size, fn, diff_passes=0}; run DIFFERENTIAL; return
+  (on any JIT failure → fall through to tier 4 interpreter, unchanged)
+```
+
+So `func_map` is never mutated for fragments; the fast path is "validated
+candidate → native," everything else is interpreter.
+
+### 8.4 The validation gate (the crux — differential vs the interpreter floor)
+
+Fragment-JIT correctness is **not proven** (unlike resident-static B3, which is
+32/32 verified). So a fresh candidate must pass the same-state differential vs
+`mips_interp` (the oracle, already present) before it runs live — precision over
+recall. **Fork RESOLVED 2026-06-17: port the proven psx `run_shadow_diff`
+verbatim** (`overlay_loader.c:1282`; it ran 0-divergence over hundreds of shadow
+calls and fixed the one open crash). It is option (A) but *simpler* — it snapshots
+the **whole** working RAM, not touched-ranges:
+
+```
+run_shadow_diff(ctx, cand, addr):                         # n64 port
+  snapshot: ctx0 = *ctx; copy ALL rdram (8 MiB) → ram0
+  PASS 1 — INTERPRETER FIRST (authoritative), device-detector armed:
+       recomp_interpret_function(rdram, ctx, addr)
+       if it touched device/HLE state (n64's "device touch", see below):
+           cand.device_touch = 1                          # pin to interpreter forever
+           keep interp result live; ABANDON native pass; return   # never double-exec HLE
+  device-free → save interp result: ctxI = *ctx; ram → ramI
+  restore: *ctx = ctx0; ram0 → rdram
+  PASS 2 — NATIVE shard from identical input: cand.fn(rdram, ctx)
+  save native result: ctxN = *ctx; rdram → ramN
+  compare ctxN vs ctxI (gprs/fprs/hi-lo) + memcmp(ramN, ramI):
+      clean    → cand.diff_passes++  (cap at BUDGET)
+      diverge  → cand.diff_passes = 0  (+record first divergence detail)
+  COMMIT interp result: *ctx = ctxI; ramI → rdram        # native always discarded here
+```
+
+Promotion = BUDGET **consecutive** clean passes (divergence resets to 0, so an
+intermittently-wrong shard never accumulates trust). Until promoted, the
+**interpreter result is the one committed**, so an un-validated/wrong candidate
+never affects the game. Per-function isolation: during the diff, nested fragment
+calls run via the interpreter on BOTH passes (n64 equivalent of psx's
+`s_native_exec=0`) so the diff isolates THIS shard's codegen, not the call tree.
+
+**n64's "device touch" = the HLE boundary.** psx watches MMIO; n64's analogue is
+the native↔interp boundary calling an HLE `osXxx` (scheduler/message-queue/gfx-
+submit/save-file side effects that live OUTSIDE rdram and can't be snapshot-
+restored). Detect it the same way: arm a counter that bumps whenever the
+interpreter's native-call boundary (`recomp_lookup_function_or_null` hit) invokes
+a function flagged as HLE/side-effecting during PASS 1; if it bumped, set
+`device_touch` and pin the candidate to the interpreter. Pure-compute fragments
+(geometry/math — the JIT-worthy majority) don't trip it; HLE-touching ones stay
+on the floor, safe by construction. (Cost: PASS 1+2 each snapshot/restore 8 MiB
+— heavy, but only on the rare not-yet-promoted path; a promoted candidate runs
+native directly with just the per-call XXH3 revalidation.)
+
+### 8.5 Write-invalidation (self-mod / fragment reload)
+
+Fragments are DMA-reloaded into the arena. The existing
+`Memmap_ClearFragmentMemmap` / `register_runtime_fragment` / eviction path
+(`overlays.cpp` ~1191 "EVICT") is the hook: when a fragment section is
+cleared/reloaded, drop `g_frag_cands` entries whose `[code_lo,code_len)` overlaps
+the reloaded range. Per-call live-byte revalidation (8.3 step 3) is the backstop
+— a stale candidate simply fails its hash and is skipped.
+
+### 8.6 Rollout (additive, gated, measured — psx §7 mirror)
+
+1. Data structures + content hash + candidate registry (additive, dead until wired).
+2. Wire the tier behind `PSR_FRAG_JIT`, candidate path runs the **interpreter**
+   result live (no native yet) — proves discovery/keying/invalidation with zero
+   risk.
+3. Add the differential gate (8.4); native runs only after BUDGET clean passes.
+4. Measure on Stadium 2's fragment workload (it's fragment-dominated): count
+   candidates, diff passes, divergences, native promotions vs interp.
+5. Re-verify PMS + Stadium 1 (engine change → fork branches) before default-on.
+
+Default-on is gated on step 4 showing 0 divergences over a substantial run +
+user sign-off — same bar psx used.
+
 ## 7. Open questions / risks
 
 - **Native↔interp call contract** correctness (returns, delay slots, tail calls).

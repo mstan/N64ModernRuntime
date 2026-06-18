@@ -1925,6 +1925,11 @@ static std::atomic<uint64_t> g_tier_jit_failures{0};
 // R4300i interpreter (mips_interp.cpp) instead of aborting — the correctness
 // floor (FRAGMENT_TIERS.md). interp_runs = times the interpreter carried a miss.
 static std::atomic<uint64_t> g_tier_interp_runs{0};
+// Content-keyed fragment tier (FRAGMENT_TIERS.md §8): distinct content-keyed
+// fragment candidates discovered. Steps 1-2 track them (execution stays on the
+// interpreter floor); native shards + the differential gate are steps 3+.
+// Counts unique (addr, content) pairs registered in g_frag_cands.
+static std::atomic<uint64_t> g_tier_frag_candidates{0};
 
 // R4300i interpreter entry (librecomp/src/mips_interp.cpp). Runs the function at
 // start_pc against the live ctx/rdram; returns true on a clean return, false if
@@ -1947,6 +1952,56 @@ static std::vector<JitEntry> g_jit_entries;
 // version instead of aborting — keeping the test non-destructive. Guarded by
 // func_map_mutex (same lock as func_map).
 static std::unordered_map<int32_t, recomp_func_t*> g_evicted_funcs;
+
+// ── Content-keyed fragment-JIT candidate registry (FRAGMENT_TIERS.md §8) ───
+// Makes B3 fragment-eligible SAFELY. Fragment (overlay-arena) addresses are
+// reused by different content over a session, so a JIT keyed by address alone
+// would run stale code (which is why addr_in_resident_static_section excludes
+// fragments today). Instead key each candidate by the fnv1a-64 hash of the live
+// code bytes it was built from, keep a candidate CHAIN per runtime address (the
+// same address legitimately hosts several distinct fragment contents — e.g. the
+// intro variants that share one arena slot), and pick per dispatch the candidate
+// whose hash still matches the live bytes. A content that stops recurring simply
+// stops matching and is skipped, so the chain is bounded by the number of
+// DISTINCT contents at that address, not by reload count. Fragment JITs are
+// NEVER placed in func_map (that is the unsafe address-keyed fast path) — they
+// live only here, reached through the content-keyed tier in the lookup-miss
+// trampoline. Guarded by func_map_mutex (same lock as func_map / g_jit_entries).
+struct FragmentCandidate {
+    uint32_t  addr = 0;            // runtime entry (overlay-arena vaddr)
+    uint64_t  content_hash = 0;    // fnv1a_64 of live code [code_lo, code_lo+code_len)
+    uint32_t  code_lo = 0;         // = addr
+    uint32_t  code_len = 0;        // discovered func_size (bytes)
+    recomp_func_t* fn = nullptr;   // JIT output (kept alive in g_jit_entries); null until step 3
+    uint32_t  diff_passes = 0;     // consecutive clean differentials vs interpreter (step 3+)
+    bool      device_touch = false;// touched HLE/side-effecting state -> interp-only (step 3+)
+    bool      blacklisted = false; // self-mod / repeatedly-divergent -> never native (step 3+)
+};
+static std::unordered_map<uint32_t, std::vector<FragmentCandidate>> g_frag_cands;
+
+// Default OFF; PSR_FRAG_JIT=1 arms the content-keyed fragment tier (steps 1-2:
+// discovery + keying only; execution stays on the interpreter floor).
+static bool frag_jit_enabled() {
+    static const bool enabled = []{
+        const char* v = std::getenv("PSR_FRAG_JIT");
+        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' ||
+                     v[0] == 'y' || v[0] == 'Y');
+    }();
+    return enabled;
+}
+
+// fnv1a_64 over the live code bytes at [addr, addr+len), read in the recompiler's
+// XOR-3 byte order — same algorithm/convention as fnv1a_64() and the section
+// content hash, computed inline to avoid a per-dispatch temp buffer.
+static uint64_t fragment_live_code_hash(uint8_t* rdram, uint32_t addr, uint32_t len) {
+    const uint32_t paddr = addr & 0x1FFFFFFFu;
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint32_t i = 0; i < len; i++) {
+        h ^= uint64_t(rdram[(paddr + i) ^ 3]);
+        h *= 0x00000100000001B3ull;
+    }
+    return h;
+}
 
 static std::mutex g_lookup_capture_mutex;
 static std::map<uint32_t, LookupCapture> g_lookup_captures;
@@ -2046,6 +2101,7 @@ static void write_runtime_captures_locked() {
     fprintf(f, "    \"jit_compiles\": %llu,\n", (unsigned long long)g_tier_jit_compiles.load());
     fprintf(f, "    \"jit_failures\": %llu,\n", (unsigned long long)g_tier_jit_failures.load());
     fprintf(f, "    \"interp_runs\": %llu,\n", (unsigned long long)g_tier_interp_runs.load());
+    fprintf(f, "    \"frag_candidates\": %llu,\n", (unsigned long long)g_tier_frag_candidates.load());
     fprintf(f, "    \"unique_missed_addrs\": %zu\n", g_lookup_captures.size());
     fprintf(f, "  },\n");
     fprintf(f, "  \"misses\": [\n");
@@ -2643,6 +2699,73 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
             fflush(stderr);
             restore(rdram, ctx);
             return;
+        }
+    }
+
+    // ── Content-keyed fragment tier (FRAGMENT_TIERS.md §8, steps 1-2) ────
+    // For a fragment (non-resident-static) miss, discover its bounds and track
+    // a content-keyed candidate in g_frag_cands. This proves discovery + keying
+    // + multi-candidate selection on the live workload. Execution still falls
+    // through to the interpreter floor below — no native shard, no differential
+    // yet (steps 3+) — so this can ONLY add bookkeeping; it never changes what
+    // runs. Gated OFF unless PSR_FRAG_JIT=1.
+    if (frag_jit_enabled()) {
+        const uint32_t faddr = (uint32_t)g_self_heal_addr;
+        if (faddr >= 0x80000000u && faddr < 0x80800000u) {
+            bool resident_static;
+            {
+                std::shared_lock<std::shared_mutex> lock(func_map_mutex);
+                resident_static = addr_in_resident_static_section(faddr);
+            }
+            if (!resident_static) {
+                // Already have a candidate whose content still matches live bytes?
+                bool have_live_match = false;
+                {
+                    std::shared_lock<std::shared_mutex> lock(func_map_mutex);
+                    auto it = g_frag_cands.find(faddr);
+                    if (it != g_frag_cands.end()) {
+                        for (const auto& c : it->second) {
+                            if (c.code_len > 0 &&
+                                fragment_live_code_hash(rdram, c.code_lo, c.code_len)
+                                    == c.content_hash) {
+                                have_live_match = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!have_live_match) {
+                    // New content at this address: discover bounds + key it.
+                    const uint32_t pbase = faddr & 0x1FFFFFFFu;
+                    constexpr uint32_t RDRAM_END = 0x00800000u;
+                    uint32_t window = 0x8000u;
+                    if (pbase + window > RDRAM_END) window = RDRAM_END - pbase;
+                    if (window >= 8) {
+                        std::vector<uint8_t> fbody(window);
+                        for (uint32_t i = 0; i < window; i++) {
+                            fbody[i] = rdram[(pbase + i) ^ 3];
+                        }
+                        size_t fsz = 0;
+                        std::string ferr;
+                        if (N64Recomp::discover_function_bounds(
+                                fbody.data(), fbody.size(), faddr, 0, fsz, ferr) &&
+                            fsz >= 8 && (fsz & 3u) == 0 && fsz <= window) {
+                            FragmentCandidate c;
+                            c.addr = faddr;
+                            c.code_lo = faddr;
+                            c.code_len = (uint32_t)fsz;
+                            c.content_hash =
+                                fragment_live_code_hash(rdram, faddr, (uint32_t)fsz);
+                            {
+                                std::unique_lock<std::shared_mutex> lock(func_map_mutex);
+                                g_frag_cands[faddr].push_back(c);
+                            }
+                            g_tier_frag_candidates.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
         }
     }
 

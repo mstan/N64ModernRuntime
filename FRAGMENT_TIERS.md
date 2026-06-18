@@ -68,8 +68,12 @@ spawn-clang→DLL dev backend later). Interpreter is always the floor.
 
 ```
 build/coverage/            # neutral, portable, contributable currency
-                           #   (evolve runtime_captures.json + the force_function_vrams fold manifest)
-build/jit/<arch>-<abi>/    # optional sljit blob cache (v2; v1 re-JITs from coverage — sub-ms)
+                           #   runtime_captures.json     (live session diagnostic + miss coverage)
+                           #   fragment_manifest.json    (content-keyed candidate currency; B4)
+                           #   (later: the force_function_vrams fold manifest)
+build/jit/<arch>-<abi>/    # RESERVED for a future v2 sljit blob cache. EMPTY in v1
+                           #   (a README.txt explains why); v1 re-JITs from the
+                           #   coverage manifest instead — sub-ms.
 generated/                 # the static fold-back C = the optimized/shipped tier
 ```
 
@@ -77,6 +81,13 @@ generated/                 # the static fold-back C = the optimized/shipped tier
 `generated/` is the optimized shipped form. Never crossed. (n64's blob-persistence
 caveat is identical to SLJIT.md §5.3: prefer re-JIT-from-manifest over persisting
 JIT bytes, to avoid the per-process relocation/symbol-rebind problem.)
+
+**Implemented 2026-06-18** (`librecomp/src/overlays.cpp`): `runtime_captures.json`
+moved into `coverage/` (readers `tools/ps2_drive.py` + `_verify_frag.ps1` updated,
+with read-fallback to the legacy `build/` and cwd paths). Host arch-abi tag
+(`N64_FRAG_ARCH_ABI`, e.g. `x86_64-win64`) + `N64_FRAG_CODEGEN_VER` namespace the
+derived cache. `cache_subdir()` (`std::filesystem::create_directories`) materializes
+each tree on demand.
 
 ---
 
@@ -300,3 +311,50 @@ user sign-off — same bar psx used.
   fragment should interpret only until it's compiled.
 - Everything in `SLJIT.md` §9 about content-keying, blob persistence, and arch
   coverage applies symmetrically.
+
+## 9. B4 disk persistence — re-JIT-from-manifest, NOT a blob cache (2026-06-18)
+
+**Decision (settles task #3 / §5 step 2): n64 persists a coverage manifest and
+re-JITs from it; it does NOT persist native JIT bytes.** psxrecomp's
+`persist_sljit_shard`/`scan_sljit_cache_dir` serialize sljit's
+position-independent *LIR* and regenerate native code per-process at load. The
+n64 `LiveRecomp` `LiveGenerator` does the opposite: `live_generator.cpp:150`
+calls `sljit_generate_code` immediately and produces **final, position-dependent
+machine code** with this-process pointers baked in — function entries
+(`sljit_get_label_addr`), jump-table targets, reference/import symbol jumps
+resolved by `sljit_set_jump_addr` to live host functions, string-literal heap
+addresses, and the `executable_offset`. Persisting those bytes and reloading them
+in a new process is a stale-pointer crash — exactly the relocation/symbol-rebind
+problem §3/§5.3 warns about. A verbatim psx byte-blob port is therefore *not
+viable* on n64; it is the broken option, not a shortcut.
+
+**What was built** (`librecomp/src/overlays.cpp`, gated `PSR_FRAG_JIT`, sub-switch
+`PSR_FRAG_CACHE=0` to disable just persistence):
+
+- `persist_fragment_manifest_locked()` rewrites `coverage/fragment_manifest.json`
+  from the in-memory `g_frag_cands` whenever a new candidate is keyed (cheap,
+  rewrite-on-new — same model as `write_runtime_captures_locked`). Each record is
+  arch-independent: `{addr, content_hash, code_lo, code_len}`. Stamped with
+  `format_ver` / `codegen_ver` / `arch_abi`.
+- `load_fragment_manifest()` (called from `init_overlays()` under its
+  `FuncMapWriteLock`) reloads the manifest into `g_frag_cands` as `fn=null`
+  candidates. A `format/codegen/arch` mismatch invalidates the whole file. The
+  existing per-dispatch live-byte revalidation (`have_live_match`) re-keys each
+  reloaded entry against live RAM before it can ever be used, so a reloaded
+  candidate is exactly as safe as a freshly discovered one — and `fn` is always
+  re-JIT'd, never trusted from disk.
+- `ensure_jit_cache_reserved()` creates `jit/<arch-abi>/README.txt` documenting
+  why the v2 blob slot is intentionally empty.
+- Counters `frag_reloaded` / `frag_persisted` surface in the
+  `runtime_captures.json` coverage block.
+
+**Value before native exec (slice 3) lands:** the coverage currency accumulates
+across sessions for Track C static fold-back, and warm-starts the validation
+budget once native promotion exists. It is pure additive bookkeeping today —
+execution still falls to the interpreter floor regardless.
+
+**If a future v2 blob cache is ever wanted**, it must serialize the sljit LIR
+(requires exposing the pre-`generate_code` compiler in `LiveGenerator` + a
+deserialize-time rebind pass for the baked host pointers), keyed under
+`jit/<arch-abi>/cg<N>/`. That is a large N64Recomp change with no clear win over
+sub-ms re-JIT — deferred, possibly indefinitely.

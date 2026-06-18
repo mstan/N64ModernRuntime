@@ -35,6 +35,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -55,6 +57,7 @@
 #include "recompiler/live_recompiler.h"
 #include "overlays.hpp"
 #include "sections.h"
+#include "json/json.hpp"
 #include <memory>
 #include <sstream>
 #include <thread>
@@ -1585,6 +1588,12 @@ extern "C" int recomp_debug_runtime_fragment(uint32_t id,
     return 1;
 }
 
+// Defined later in this file; init_overlays warm-starts the fragment tier from
+// the persisted coverage manifest (FRAGMENT_TIERS.md §3/§9).
+static bool frag_jit_enabled();
+static void ensure_jit_cache_reserved();
+static void load_fragment_manifest();
+
 void recomp::overlays::init_overlays() {
     FuncMapWriteLock _fml;
     func_map.clear();
@@ -1601,10 +1610,20 @@ void recomp::overlays::init_overlays() {
         SectionTableEntry* code_section = &sections_info.code_sections[section_index];
 
         section_addresses[sections_info.code_sections[section_index].index] = code_section->ram_addr;
-        code_sections_by_rom[code_section->rom_addr] = section_index;        
+        code_sections_by_rom[code_section->rom_addr] = section_index;
     }
 
     load_patch_functions();
+
+    // B4: warm-start the content-keyed fragment tier from the persisted coverage
+    // manifest (no-ops unless PSR_FRAG_JIT is armed). Pre-seeds g_frag_cands with
+    // fn=null candidates that re-key lazily against live RAM at first dispatch.
+    // FuncMapWriteLock above already holds func_map_mutex, so g_frag_cands writes
+    // are safe here.
+    if (frag_jit_enabled()) {
+        ensure_jit_cache_reserved();
+        load_fragment_manifest();
+    }
 }
 
 // Finds a function given a section's index and the function's offset into the section.
@@ -1930,6 +1949,11 @@ static std::atomic<uint64_t> g_tier_interp_runs{0};
 // interpreter floor); native shards + the differential gate are steps 3+.
 // Counts unique (addr, content) pairs registered in g_frag_cands.
 static std::atomic<uint64_t> g_tier_frag_candidates{0};
+// B4 manifest persistence (FRAGMENT_TIERS.md §3/§9): candidates re-loaded from
+// the on-disk coverage manifest at init (pre-seeded fn=null, re-keyed lazily),
+// and candidates written out to it this session.
+static std::atomic<uint64_t> g_tier_frag_reloaded{0};
+static std::atomic<uint64_t> g_tier_frag_persisted{0};
 
 // R4300i interpreter entry (librecomp/src/mips_interp.cpp). Runs the function at
 // start_pc against the live ctx/rdram; returns true on a clean return, false if
@@ -2075,7 +2099,78 @@ static void classify_lookup_capture(uint32_t addr, LookupCapture& out) {
     out.classification = "outside-loaded";
 }
 
+// ── Fragment-JIT cache layout (FRAGMENT_TIERS.md §3/§9) ───────────────────
+// Three never-comingled trees under the build dir:
+//   coverage/            portable, arch-independent coverage currency
+//                        (runtime_captures.json + the fragment manifest).
+//   jit/<arch>-<abi>/    RESERVED for a future v2 sljit blob cache. n64 v1
+//                        does NOT persist JIT bytes: the LiveGenerator emits
+//                        final, position-dependent machine code (host pointers
+//                        for funcs / jump tables / string literals baked in by
+//                        sljit_generate_code), so a blob can't be reloaded into
+//                        another process. v1 re-JITs from the coverage manifest
+//                        instead — see §5.3 / §9. The dir is created with a
+//                        README so its reserved purpose is self-documenting.
+//   generated/           the static fold-back C (the optimized shipped tier).
+// The arch-abi tag namespaces any per-arch derived cache so a blob built for
+// one target can never load on another.
+#if defined(_M_X64) || defined(__x86_64__)
+  #if defined(_WIN32)
+    #define N64_FRAG_ARCH_ABI "x86_64-win64"
+  #else
+    #define N64_FRAG_ARCH_ABI "x86_64-sysv"
+  #endif
+#elif defined(_M_ARM64) || defined(__aarch64__)
+  #if defined(_WIN32)
+    #define N64_FRAG_ARCH_ABI "aarch64-win64"
+  #else
+    #define N64_FRAG_ARCH_ABI "aarch64-sysv"
+  #endif
+#else
+  #define N64_FRAG_ARCH_ABI "unknown-arch"
+#endif
+// Bump when a LiveGenerator codegen change would invalidate a persisted
+// manifest's bounds/hash assumptions (the manifest stamps this; a mismatch
+// makes the loader ignore a stale manifest rather than re-key against it).
+#define N64_FRAG_CODEGEN_VER 1u
+
+// Cache root: "build" if that directory exists (the normal run layout), else
+// "." (exe-relative fallback). Computed once.
+static const std::string& cache_root() {
+    static const std::string root = []{
+        std::error_code ec;
+        if (std::filesystem::is_directory("build", ec)) {
+            return std::string("build");
+        }
+        return std::string(".");
+    }();
+    return root;
+}
+
+// Ensure <root>/<sub> exists and return its path. <sub> may contain '/'.
+static std::string cache_subdir(const std::string& sub) {
+    std::string dir = cache_root() + "/" + sub;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 static FILE* open_runtime_captures(const char* mode) {
+    const bool writing = (mode[0] == 'w' || mode[0] == 'a');
+    if (writing) {
+        std::string path = cache_subdir("coverage") + "/runtime_captures.json";
+        FILE* f = fopen(path.c_str(), mode);
+        if (f != nullptr) {
+            return f;
+        }
+        // coverage/ unwritable — fall back to the legacy locations.
+    } else {
+        std::string covpath = cache_root() + "/coverage/runtime_captures.json";
+        FILE* f = fopen(covpath.c_str(), mode);
+        if (f != nullptr) {
+            return f;
+        }
+    }
     FILE* f = fopen("build/runtime_captures.json", mode);
     if (f == nullptr) {
         f = fopen("runtime_captures.json", mode);
@@ -2102,6 +2197,8 @@ static void write_runtime_captures_locked() {
     fprintf(f, "    \"jit_failures\": %llu,\n", (unsigned long long)g_tier_jit_failures.load());
     fprintf(f, "    \"interp_runs\": %llu,\n", (unsigned long long)g_tier_interp_runs.load());
     fprintf(f, "    \"frag_candidates\": %llu,\n", (unsigned long long)g_tier_frag_candidates.load());
+    fprintf(f, "    \"frag_reloaded\": %llu,\n", (unsigned long long)g_tier_frag_reloaded.load());
+    fprintf(f, "    \"frag_persisted\": %llu,\n", (unsigned long long)g_tier_frag_persisted.load());
     fprintf(f, "    \"unique_missed_addrs\": %zu\n", g_lookup_captures.size());
     fprintf(f, "  },\n");
     fprintf(f, "  \"misses\": [\n");
@@ -2152,6 +2249,164 @@ static void write_runtime_captures_locked() {
     }
     fprintf(f, "  ]\n}\n");
     fclose(f);
+}
+
+// ── B4: fragment coverage manifest persistence (FRAGMENT_TIERS.md §3/§9) ───
+// Cross-session persistence of the content-keyed fragment candidate set. We do
+// NOT persist native JIT bytes (the LiveGenerator emits position-dependent code
+// — see the jit/ note above); instead we persist the arch-independent coverage
+// currency (entry addr + content hash + discovered bounds) and RE-JIT lazily
+// from it. At init the manifest pre-seeds g_frag_cands with fn=null candidates;
+// the existing per-dispatch live-byte revalidation (have_live_match) re-keys
+// each entry against live RAM before it is ever used, so a reloaded candidate is
+// exactly as safe as a freshly discovered one. Value before native exec lands
+// (slice 3): coverage accumulates across sessions for Track C static fold-back,
+// and warm-starts the validation budget once native promotion exists.
+#define N64_FRAG_MANIFEST_FORMAT_VER 1u
+
+// Persistence sub-switch: on by default whenever the fragment tier is armed;
+// PSR_FRAG_CACHE=0 keeps the live tier but disables disk read/write (A/B).
+static bool frag_cache_enabled() {
+    static const bool enabled = []{
+        const char* v = std::getenv("PSR_FRAG_CACHE");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+
+// Rewrite the whole manifest from the in-memory g_frag_cands. Cheap (a handful
+// of entries) and mirrors write_runtime_captures_locked's rewrite-on-new model.
+// Caller holds func_map_mutex (read access to g_frag_cands).
+static void persist_fragment_manifest_locked() {
+    if (!frag_cache_enabled()) {
+        return;
+    }
+    std::string path = cache_subdir("coverage") + "/fragment_manifest.json";
+    FILE* f = fopen(path.c_str(), "w");
+    if (f == nullptr) {
+        return;
+    }
+    size_t total = 0;
+    for (const auto& kv : g_frag_cands) {
+        total += kv.second.size();
+    }
+    fprintf(f, "{\n");
+    fprintf(f, "  \"format_ver\": %u,\n", (unsigned)N64_FRAG_MANIFEST_FORMAT_VER);
+    fprintf(f, "  \"codegen_ver\": %u,\n", (unsigned)N64_FRAG_CODEGEN_VER);
+    fprintf(f, "  \"arch_abi\": \"%s\",\n", N64_FRAG_ARCH_ABI);
+    fprintf(f, "  \"candidates\": [\n");
+    size_t i = 0;
+    for (const auto& kv : g_frag_cands) {
+        for (const auto& c : kv.second) {
+            ++i;
+            fprintf(f,
+                "    {\"addr\": \"0x%08X\", \"content_hash\": \"0x%016llX\", "
+                "\"code_lo\": \"0x%08X\", \"code_len\": %u}%s\n",
+                c.addr, (unsigned long long)c.content_hash,
+                c.code_lo, c.code_len, (i < total) ? "," : "");
+        }
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+    g_tier_frag_persisted.store((uint64_t)total, std::memory_order_relaxed);
+}
+
+// Create the reserved jit/<arch-abi>/ blob-cache dir + a self-documenting
+// README explaining why n64 v1 leaves it empty. Idempotent; called once at init.
+static void ensure_jit_cache_reserved() {
+    std::string dir = cache_subdir(std::string("jit/") + N64_FRAG_ARCH_ABI);
+    std::string readme = dir + "/README.txt";
+    std::error_code ec;
+    if (std::filesystem::exists(readme, ec)) {
+        return;
+    }
+    FILE* f = fopen(readme.c_str(), "w");
+    if (f == nullptr) {
+        return;
+    }
+    fprintf(f,
+        "Reserved for a future v2 sljit blob cache (arch-abi: %s).\n\n"
+        "n64 v1 intentionally does NOT persist JIT bytes here. The LiveRecomp\n"
+        "LiveGenerator emits final, position-dependent machine code (host pointers\n"
+        "for functions, jump tables, string literals, and the executable offset are\n"
+        "baked in by sljit_generate_code), so a serialized blob cannot be reloaded\n"
+        "into another process. Fragment coverage is persisted instead as the\n"
+        "arch-independent manifest in ../../coverage/fragment_manifest.json, and the\n"
+        "JIT is regenerated from it on demand. See FRAGMENT_TIERS.md sections 3/9.\n",
+        N64_FRAG_ARCH_ABI);
+    fclose(f);
+}
+
+// Reload the persisted fragment manifest at init: pre-seed g_frag_cands with
+// fn=null candidates (re-keyed lazily against live RAM at first dispatch). Stale
+// manifests (format/codegen/arch mismatch) are ignored wholesale. Caller holds
+// the func_map write lock (init_overlays' FuncMapWriteLock) so the g_frag_cands
+// writes are safe.
+static void load_fragment_manifest() {
+    if (!frag_jit_enabled() || !frag_cache_enabled()) {
+        return;
+    }
+    std::string path = cache_root() + "/coverage/fragment_manifest.json";
+    std::ifstream in(path);
+    if (!in.good()) {
+        return;
+    }
+    // Whole parse+validate+load is wrapped: the manifest is a contributable,
+    // potentially hand-edited file, so a wrong-typed field must be tolerated
+    // (ignore the manifest), never crash the boot. Next session rewrites it.
+    try {
+    nlohmann::json j;
+    in >> j;
+    if (!j.is_object()) {
+        return;
+    }
+    if (j.value("format_ver", 0u) != N64_FRAG_MANIFEST_FORMAT_VER ||
+        j.value("codegen_ver", 0u) != N64_FRAG_CODEGEN_VER ||
+        j.value("arch_abi", std::string{}) != std::string(N64_FRAG_ARCH_ABI)) {
+        return; // stale — a codegen/arch change invalidates the discovered bounds.
+    }
+    auto cands_it = j.find("candidates");
+    if (cands_it == j.end() || !cands_it->is_array()) {
+        return;
+    }
+    for (const auto& e : *cands_it) {
+        if (!e.is_object()) {
+            continue;
+        }
+        auto get_u64 = [&](const char* key, uint64_t def) -> uint64_t {
+            auto it = e.find(key);
+            if (it == e.end()) return def;
+            if (it->is_string()) {
+                return strtoull(it->get<std::string>().c_str(), nullptr, 0);
+            }
+            if (it->is_number_unsigned()) return it->get<uint64_t>();
+            if (it->is_number_integer())  return (uint64_t)it->get<int64_t>();
+            return def;
+        };
+        FragmentCandidate c;
+        c.addr         = (uint32_t)get_u64("addr", 0);
+        c.content_hash = get_u64("content_hash", 0);
+        c.code_lo      = (uint32_t)get_u64("code_lo", c.addr);
+        c.code_len     = (uint32_t)get_u64("code_len", 0);
+        c.fn           = nullptr; // re-JIT'd lazily; never trust a reloaded ptr.
+        if (c.addr == 0 || c.code_len == 0 || c.content_hash == 0) {
+            continue;
+        }
+        // De-dup: skip if an identical (addr, content_hash) is already present.
+        auto& chain = g_frag_cands[c.addr];
+        bool dup = false;
+        for (const auto& existing : chain) {
+            if (existing.content_hash == c.content_hash) { dup = true; break; }
+        }
+        if (dup) {
+            continue;
+        }
+        chain.push_back(c);
+        g_tier_frag_reloaded.fetch_add(1, std::memory_order_relaxed);
+    }
+    } catch (...) {
+        return; // malformed manifest — ignore wholesale, never crash the boot.
+    }
 }
 
 // Trace-ring queries (defined in extras.c — game-side instrumentation).
@@ -2759,6 +3014,11 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                             {
                                 std::unique_lock<std::shared_mutex> lock(func_map_mutex);
                                 g_frag_cands[faddr].push_back(c);
+                                // Persist the updated candidate set to the
+                                // coverage manifest (cross-session re-JIT
+                                // currency). Done under the lock since it reads
+                                // g_frag_cands; cheap (rewrite of a handful).
+                                persist_fragment_manifest_locked();
                             }
                             g_tier_frag_candidates.fetch_add(
                                 1, std::memory_order_relaxed);

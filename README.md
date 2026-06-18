@@ -28,6 +28,15 @@ correctly:
 - **Stops out-of-range memory reads from crashing the game** — bad reads
   return zeroes and get logged instead.
 - **Lets the game detect the Transfer Pak** accessory being plugged in.
+- **Live, hot-reloadable English translation** (consumer-implemented on this
+  runtime's trace + guest-memory surface). A Japanese-only game is rendered in
+  English at runtime with no ROM edits or asset re-packing, and the translation
+  table is reloaded **on the fly** — edit a string in the JSON and it updates in
+  the running game within a frame, no rebuild or restart. Coverage spans menus,
+  battle and overlay text (it hooks the game's universal text formatter, not
+  just one draw routine), and each line auto-fits the original Japanese footprint
+  so longer English never overflows the text boxes. See
+  [Runtime text-translation hook](#runtime-text-translation-hook).
 - **Always-on diagnostic rings + a guest-memory access surface.** The fork
   records libultra calls, message-queue and scheduler events, SP/graphics
   tasks and (with `trace_mode`) per-function entries into always-on ring
@@ -63,27 +72,37 @@ what the diagnostic/trace surface enables, so the mechanism is documented here.
 
 **How the translation works, end to end:**
 
-1. **Find the text routine, empirically.** A per-function census (built on the
+1. **Find the text routines, empirically.** A per-function census (built on the
    trace hook) records every function entered with arguments that look like a
    string draw — small x/y plus a pointer to NUL-terminated bytes — so the
-   game's single string-draw routine is identified from runtime behaviour, not
-   guessed from addresses (recompiled code is laid out differently than any
-   source oracle).
+   game's text routines are identified from runtime behaviour, not guessed from
+   addresses (recompiled code is laid out differently than any source oracle).
+   Text is drawn through *many* routines, so coverage centres on the game's
+   universal `_Printf`-style formatter chokepoint (every formatted string passes
+   through it) plus the sibling draw routines — menus, battle and overlay text
+   are all reached, not just one routine. A targeted watchlist (scanning arg
+   registers and stack slots for known byte sequences) pins down routines whose
+   calling convention differs.
 2. **Key by content hash.** On each call to that routine the hook reads the
    source glyph bytes from guest RDRAM (the game's text is a 2-byte EUC-JP-like
    encoding; ASCII is single-byte) and hashes them (FNV-1a). The hash is the
    translation key — robust to the game reusing text buffers.
-3. **Look up + replace.** Keys map to English strings in a small JSON table
-   loaded next to the executable and hot-reloaded on change. On a miss, the
-   original text is drawn unchanged.
+3. **Look up + replace, hot-reloaded on the fly.** Keys map to English strings
+   in a small JSON table loaded next to the executable. The table is re-read
+   whenever its modification time changes, so **editing a string updates the
+   running game within a frame — no rebuild, no restart**: author translations
+   live while the game is open. On a miss, the original text is drawn unchanged.
 4. **Render English through the game's own font.** The font sheets already
    contain Latin glyphs, so a hit re-drives the game's glyph drawer over the
    English bytes — no glyph injection. Because the replacement never writes
    back into game memory, it is **not bounded by the original length**.
    Latin advance widths are measured from the resident font (or fall back to a
    tight uniform advance for fonts streamed per-draw) so English is spaced
-   proportionally and fits the original text boxes. Format strings (`%d`/`%s`)
-   keep the game's own formatting path so dynamic values still work.
+   proportionally. Each line then **auto-fits to the original Japanese footprint**
+   — if the English is wider, its inter-glyph advance is condensed so the text
+   stays within the box the Japanese occupied, so longer translations don't spill
+   over. Format strings (`%d`/`%s`) keep the game's own formatting path so dynamic
+   values still work.
 
 The translation logic itself lives in the consumer
 ([`src/main/diagnostics.cpp`](https://github.com/mstan/PocketMonstersStadiumRecomp/blob/main/src/main/diagnostics.cpp),

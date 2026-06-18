@@ -302,6 +302,18 @@ the reloaded range. Per-call live-byte revalidation (8.3 step 3) is the backstop
 Default-on is gated on step 4 showing 0 divergences over a substantial run +
 user sign-off — same bar psx used.
 
+**FLIPPED DEFAULT-ON 2026-06-18 (user-directed).** `frag_jit_enabled()` and
+`frag_native_enabled()` now default ON; `PSR_FRAG_JIT=0` / `PSR_FRAG_NATIVE=0`
+are debug kill-switches. Validated across all three games with no env vars set:
+Stadium 2 discovers + content-keys 2 candidates and pins both (non-leaf), 0
+divergences, manifest persisted, self-test 8/8; PMS (frame 11249) and Stadium 1
+(frame 1299) boot clean with 0 misses (benign — full static coverage). Safe by
+construction: the shadow-diff commits the interpreter result until BUDGET clean
+passes, only safe-leaf candidates are eligible, device-touchers are pinned.
+CAVEAT: no REAL game fragment has been promoted+run native yet (Stadium 2's are
+non-leaf; the siblings have 0 misses), so the live-native path is proven only by
+the synthetic self-test leaf — the shadow-diff guards the first real one.
+
 ### 8.7 Slice 3 as built (2026-06-18) — safe-leaf v1
 
 A second sub-gate `PSR_FRAG_NATIVE=1` (requires `PSR_FRAG_JIT`) arms native

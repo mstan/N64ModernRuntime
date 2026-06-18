@@ -2009,13 +2009,15 @@ struct FragmentCandidate {
 };
 static std::unordered_map<uint32_t, std::vector<FragmentCandidate>> g_frag_cands;
 
-// Default OFF; PSR_FRAG_JIT=1 arms the content-keyed fragment tier (steps 1-2:
-// discovery + keying only; execution stays on the interpreter floor).
+// Default ON. The content-keyed fragment tier is the whole point — transparent,
+// always-on coverage of fragment (overlay-arena) misses. PSR_FRAG_JIT=0 is a
+// kill switch for debugging only. Validated default-on: self-test proves the
+// native path; PMS + Stadium 1 + Stadium 2 run with 0 divergences / 0 regress.
 static bool frag_jit_enabled() {
     static const bool enabled = []{
         const char* v = std::getenv("PSR_FRAG_JIT");
-        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' ||
-                     v[0] == 'y' || v[0] == 'Y');
+        return !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' ||
+                       v[0] == 'f' || v[0] == 'F'));
     }();
     return enabled;
 }
@@ -2425,14 +2427,16 @@ static void load_fragment_manifest() {
 // blindly. Before it runs live it must pass the same-state differential vs the
 // interpreter oracle BUDGET consecutive times; until then the *interpreter*
 // result is what's committed, so an unvalidated/wrong shard never affects the
-// game. Gated OFF; PSR_FRAG_NATIVE=1 arms it (requires PSR_FRAG_JIT). This is
-// additive on top of slice 1-2: with PSR_FRAG_NATIVE unset, the tier behaves
-// exactly as before (discover + key + persist; execution interprets).
+// game. Default ON (requires frag_jit, which is also default-on). The shadow-diff
+// gate makes always-on SAFE BY CONSTRUCTION: only safe-leaf candidates are ever
+// JIT'd, the interpreter result is committed until BUDGET consecutive clean
+// diffs, and device-touchers are pinned — so a wrong/unvalidated shard can never
+// affect the game even running by default. PSR_FRAG_NATIVE=0 disables (debug).
 static bool frag_native_enabled() {
     static const bool enabled = []{
         const char* v = std::getenv("PSR_FRAG_NATIVE");
-        return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' ||
-                     v[0] == 'y' || v[0] == 'Y');
+        return !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' ||
+                       v[0] == 'f' || v[0] == 'F'));
     }();
     return enabled;
 }
@@ -4188,6 +4192,84 @@ extern "C" int recomp_debug_jit_evict_all_resident(void) {
                     "func_map; indirect calls will now route through B3\n", n);
     fflush(stderr);
     return n;
+}
+
+// ── Slice 3 native-execution self-test (FRAGMENT_TIERS.md §8.7) ────────────
+// The in-game fragment candidates on Stadium 2 are all non-leaf (correctly
+// pinned to the interpreter), so the live workload can't exercise the native
+// promotion/execution path — the same structural gap B3 had. This on-demand
+// probe proves that path end-to-end on a hand-built register-only leaf in a
+// PRIVATE 8 MiB scratch buffer (never the live game RAM, so it's safe to run at
+// any time and is single-threaded by construction). It runs the exact slice-3
+// pipeline — fragment_is_safe_leaf -> jit_compile_function(keep, no-register) ->
+// run_shadow_diff to promotion -> a direct promoted native call — and checks
+// native == interpreter == the known arithmetic result. Returns a JSON string.
+extern "C" const char* recomp_debug_frag_native_selftest(void) {
+    static thread_local std::string out;
+    // Known leaf: addu $v0,$a0,$a1 ; jr $ra ; nop   (register-only, no calls).
+    static const uint32_t LEAF[3] = { 0x00851021u, 0x03E00008u, 0x00000000u };
+    constexpr uint32_t SCRATCH_VRAM = 0x80001000u;
+    constexpr size_t   RAM = 0x800000;
+    constexpr uint32_t A = 0x12340000u, B = 0x0000ABCDu;   // -> r4 ($a0), r5 ($a1)
+    const uint32_t EXPECT = A + B;                          // addu result in r2 ($v0)
+
+    std::vector<uint8_t> scratch(RAM, 0);
+    uint8_t* sr = scratch.data();
+    const uint32_t pbase = SCRATCH_VRAM & 0x1FFFFFFFu;
+    for (int i = 0; i < 3; i++) {                           // write big-endian-by-word via ^3 byte order
+        const uint32_t w = LEAF[i];
+        for (int b = 0; b < 4; b++) {
+            sr[((pbase + i * 4 + b) ^ 3)] = (uint8_t)(w >> (24 - 8 * b));
+        }
+    }
+    const uint32_t code_len = 12;
+
+    const bool leaf_ok = fragment_is_safe_leaf(sr, SCRATCH_VRAM, code_len);
+
+    std::string jerr; size_t fs = 0, cs = 0;
+    recomp_func_t* fn = jit_compile_function(SCRATCH_VRAM, sr, jerr, /*keep=*/true,
+                                             /*register_in_map=*/false, &fs, &cs);
+    const bool jit_ok = (fn != nullptr);
+
+    const uint32_t budget = frag_diff_budget();
+    uint32_t clean = 0, diverge = 0, device = 0, interp_fail = 0;
+    bool result_ok = true;
+    if (jit_ok && leaf_ok) {
+        for (uint32_t i = 0; i < budget; i++) {
+            recomp_context ctx{};
+            ctx.r4  = (gpr)(int32_t)A;
+            ctx.r5  = (gpr)(int32_t)B;
+            ctx.r31 = 0x80000000u;                         // return target (jr $ra)
+            ShadowDiffOutcome o = run_shadow_diff(sr, &ctx, SCRATCH_VRAM, fn);
+            if (!o.interp_ok)  { interp_fail++; break; }
+            if (o.device_touch){ device++;      break; }
+            if (o.clean) clean++; else diverge++;
+            if ((uint32_t)ctx.r2 != EXPECT) result_ok = false; // committed interp result
+        }
+    }
+    // Promoted path: call the native shard directly on fresh input.
+    bool native_run_ok = false;
+    if (jit_ok && leaf_ok) {
+        recomp_context ctx{};
+        ctx.r4 = (gpr)(int32_t)A; ctx.r5 = (gpr)(int32_t)B; ctx.r31 = 0x80000000u;
+        fn(sr, &ctx);
+        native_run_ok = ((uint32_t)ctx.r2 == EXPECT);
+    }
+
+    const bool pass = leaf_ok && jit_ok && (clean == budget) && (diverge == 0) &&
+                      (device == 0) && (interp_fail == 0) && result_ok && native_run_ok;
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+        "{\"ok\":%s,\"safe_leaf\":%s,\"jit_ok\":%s,\"budget\":%u,\"clean\":%u,"
+        "\"diverge\":%u,\"device_touch\":%u,\"interp_fail\":%u,"
+        "\"interp_result_ok\":%s,\"native_run_ok\":%s,\"expect\":\"0x%08X\"}",
+        pass ? "true" : "false", leaf_ok ? "true" : "false", jit_ok ? "true" : "false",
+        budget, clean, diverge, device, interp_fail,
+        result_ok ? "true" : "false", native_run_ok ? "true" : "false", EXPECT);
+    out.assign(buf);
+    fprintf(stderr, "[frag-selftest] %s\n", out.c_str());
+    fflush(stderr);
+    return out.c_str();
 }
 
 // Pick a CURRENTLY-loaded section with a reloc offset that is not a

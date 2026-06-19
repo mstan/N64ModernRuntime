@@ -145,5 +145,11 @@ extern "C" void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
     if (direction == 0 /* OS_READ */) {
         run_joybus(rdram, dram_addr);
     }
+    // The real SI DMA raises an SI interrupt on completion; the game does
+    // osRecvMesg on the SI event queue after EVERY __osSiRawStartDma — both the
+    // write that sends the command and the read that receives the response.
+    // Deliver that completion message (as osContStartReadData does); without it
+    // osRecvMesg blocks forever and the boot-time accessory probe soft-locks.
+    ultramodern::send_si_message(PASS_RDRAM1);
     _return<s32>(ctx, 0);
 }

@@ -32,6 +32,13 @@
 // interpreter) and recurse unbounded -> host stack overflow.
 extern "C" recomp_func_t* recomp_lookup_function_or_null(int32_t vram);
 
+// Discovery-sweep capture (FRAGMENT_TIERS.md #2). Records a computed-jump target
+// that has no native recompiled function into the deduped coverage manifest, so
+// a single interpreted run surfaces the COMPLETE set of indirect-only dispatch
+// misses (folded into force_function_vrams) instead of crash-looping one per
+// build. No-op unless PSR_INTERP_DISCOVERY is set (defined in overlays.cpp).
+extern "C" void recomp_capture_interp_target(uint32_t addr);
+
 // Shadow-diff device-touch hooks (defined in overlays.cpp, FRAGMENT_TIERS.md
 // §8.4). While a content-keyed fragment shadow diff is validating a candidate,
 // ANY native call the interpreter makes is a potential out-of-rdram side effect
@@ -295,6 +302,7 @@ bool interpret(uint8_t* rdram, recomp_context* ctx, uint32_t start_pc, int depth
                 if (op == 0x03) { pc = link; continue; } // jal: resume after
                 return true;                             // j to native = tail call
             }
+            recomp_capture_interp_target(target);        // unknown target = dispatch miss; record (discovery)
             if (op == 0x03) { if (!interpret(rdram, ctx, target, depth + 1)) return false; pc = link; continue; }
             pc = target; continue;                       // j to unknown = tail (same frame)
         }
@@ -317,6 +325,7 @@ bool interpret(uint8_t* rdram, recomp_context* ctx, uint32_t start_pc, int depth
                 if (recomp_shadow_diff_active()) recomp_shadow_diff_note_native_call();
                 nf(rdram, ctx); if (link) { pc = ret; continue; } return true;
             }
+            recomp_capture_interp_target(target);                        // unknown target = dispatch miss; record (discovery)
             if (link) { if (!interpret(rdram, ctx, target, depth + 1)) return false; pc = ret; continue; }
             pc = target; continue;                                       // jr to unknown = tail
         }

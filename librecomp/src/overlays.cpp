@@ -173,6 +173,80 @@ extern "C" {
 int32_t* section_addresses = nullptr;
 }
 
+// Element count of section_addresses[] (set in init_overlays). Lets the
+// integrity scanner sweep the whole table.
+static size_t section_addresses_count = 0;
+
+// Centralized writer for section_addresses[] so EVERY mutation goes through one
+// guard. This fixes (and diagnoses) the GB-mode crash: func_81103C40 computes an
+// operator pointer via RELOC_HI16/LO16 over section_addresses[]; at crash time
+// that base was a misaligned value (~0x8038DAFA) -> garbage jalr target
+// 0x803916AE -> abort. A section reloc base is MIPS code and must be 4-byte
+// aligned, so a misaligned base is ALWAYS a bug (a writer computed it wrong, e.g.
+// load_overlay_by_id's prev+ram_addr, or a stale/aliased base). GUARD: reject the
+// misaligned write — keep the last good (aligned) base — so reloc-driven RELOC_*
+// never resolves to garbage and the operator dispatcher can't tailcall into junk.
+// We log the culprit op so a recurrence still pins the source. PSR_SECADDR_CATCH=1
+// aborts instead (capture the caller backtrace). PSR_SECADDR_TRACE=1 logs every
+// write (verbose; can perturb timing).
+static inline void secaddr_set(size_t index, int32_t value, const char* op) {
+    const int32_t old = (section_addresses != nullptr) ? section_addresses[index] : 0;
+    const bool misaligned = (value & 3) != 0;
+    static const bool trace = std::getenv("PSR_SECADDR_TRACE") != nullptr;
+    if (trace || misaligned) {
+        fprintf(stderr, "[secaddr] %-10s idx=%zu old=0x%08X new=0x%08X%s\n",
+            op, index, (uint32_t)old, (uint32_t)value,
+            misaligned ? "  *** MISALIGNED ***" : "");
+        fflush(stderr);
+    }
+    if (misaligned) {
+        static const bool catch_it = std::getenv("PSR_SECADDR_CATCH") != nullptr;
+        if (catch_it) {
+            fprintf(stderr, "[secaddr] FATAL: misaligned section base written "
+                "(idx=%zu = 0x%08X) by '%s' -- aborting to capture the corrupting "
+                "caller (PSR_SECADDR_CATCH)\n",
+                index, (uint32_t)value, op);
+            fflush(stderr);
+            std::abort();
+        }
+        // GUARD: drop the bogus write, keep the last aligned base.
+        fprintf(stderr, "[secaddr] GUARD: rejected misaligned section base "
+            "(idx=%zu new=0x%08X by '%s') — kept 0x%08X\n",
+            index, (uint32_t)value, op, (uint32_t)old);
+        fflush(stderr);
+        return;
+    }
+    if (section_addresses != nullptr) {
+        section_addresses[index] = value;
+    }
+}
+
+// Sweep the whole table for any misaligned entry. Catches a corruption that
+// arrives via an out-of-bounds / neighboring write that bypasses secaddr_set
+// (ChatGPT's candidate #4). Called after each fragment register/unregister so
+// the offending OPERATION is pinned even if the bad value never went through a
+// tracked write. Always logs loudly; PSR_SECADDR_CATCH=1 aborts for a backtrace.
+static void secaddr_verify(const char* where) {
+    if (section_addresses == nullptr) return;
+    // Opt-in (PSR_SECADDR_VERIFY=1): the full sweep after every register/unregister
+    // adds work in the exact fragment-churn path that races, so it can mask the
+    // corruption (Heisenbug). Off by default — the per-write check in secaddr_set
+    // is near-free and catches a misaligned value written by any of the 6 writers.
+    static const bool verify = std::getenv("PSR_SECADDR_VERIFY") != nullptr;
+    if (!verify) return;
+    for (size_t i = 0; i < section_addresses_count; i++) {
+        if ((section_addresses[i] & 3) != 0) {
+            fprintf(stderr, "[secaddr] CORRUPT after %s: idx=%zu = 0x%08X "
+                "(misaligned section base)\n",
+                where, i, (uint32_t)section_addresses[i]);
+            fflush(stderr);
+            static const bool catch_it = std::getenv("PSR_SECADDR_CATCH") != nullptr;
+            if (catch_it) std::abort();
+            return;
+        }
+    }
+}
+
 void recomp::overlays::register_overlays(const overlay_section_table_data_t& sections, const overlays_by_index_t& overlays) {
     FuncMapWriteLock _fml;
     sections_info = sections;
@@ -384,7 +458,7 @@ void load_overlay(size_t section_table_index, int32_t ram) {
     }
 
     loaded_sections.emplace_back(ram, section_table_index);
-    section_addresses[section.index] = ram;
+    secaddr_set(section.index, ram, "load");
     record_load_order(section_table_index);
 }
 
@@ -1233,7 +1307,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         // Without this the stale runtime base corrupts fragment-id math
         // (((addr & 0x0FF00000) >> 20) - 0x10) for the evicted fragment.
         if (section_addresses != nullptr) {
-            section_addresses[old_section.index] = old_section.ram_addr;
+            secaddr_set(old_section.index, old_section.ram_addr, "evict-rst");
         }
         // Remove from loaded_sections so subsequent registrations
         // don't see this entry as a "ghost" still occupying the
@@ -1262,7 +1336,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     // Update section_addresses so reloc-driven RELOC_HI16/LO16 macros
     // resolve to the runtime base.
     if (section_addresses != nullptr) {
-        section_addresses[section.index] = fragment_ptr;
+        secaddr_set(section.index, fragment_ptr, "register");
     }
 
     // Per-variant synthetic-vram registration: if this section has a
@@ -1333,6 +1407,14 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     // Pending trampolines may now resolve.
     retry_pending_trampolines();
     probe_func_map_entry("retry_pending");
+
+    // Did this registration leave any section base misaligned? (catches an
+    // OOB/neighboring write that bypassed secaddr_set.)
+    {
+        char where[64];
+        std::snprintf(where, sizeof(where), "register id=0x%X sec=%zu", id, found_index);
+        secaddr_verify(where);
+    }
 }
 
 static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {
@@ -1471,7 +1553,7 @@ static void unload_overlay_by_section_index(uint32_t section_table_index) {
             erase_section_func_aliases(section, find_it->loaded_ram_addr, func);
         }
         // Reset the section's address in the address table
-        section_addresses[section.index] = section.ram_addr;
+        secaddr_set(section.index, section.ram_addr, "unload-idx");
         // Remove the section from the loaded section map
         loaded_sections.erase(find_it);
     }
@@ -1522,7 +1604,7 @@ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
                 erase_section_func_aliases(section, it->loaded_ram_addr, func);
             }
             // Reset the section's address in the address table
-            section_addresses[section.index] = section.ram_addr;
+            secaddr_set(section.index, section.ram_addr, "unload-rng");
             // Remove the section from the loaded section map
             it = loaded_sections.erase(it);
             // Skip incrementing the iterator
@@ -1560,6 +1642,11 @@ void recomp::overlays::unregister_runtime_fragment(uint32_t id) {
     // literal, which is harmless. The id->section entry is intentionally
     // retained as "last section for this id" (re-register overwrites it).
     unload_overlay_by_section_index((uint32_t)it->second);
+    {
+        char where[48];
+        std::snprintf(where, sizeof(where), "unregister id=0x%X", id);
+        secaddr_verify(where);
+    }
 }
 
 extern "C" void recomp_unregister_runtime_fragment(uint32_t id) {
@@ -1598,6 +1685,7 @@ void recomp::overlays::init_overlays() {
     FuncMapWriteLock _fml;
     func_map.clear();
     section_addresses = (int32_t *)calloc(sections_info.total_num_sections, sizeof(int32_t));
+    section_addresses_count = sections_info.total_num_sections;
 
     // Sort the executable sections by rom address
     std::sort(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections],
@@ -1609,7 +1697,7 @@ void recomp::overlays::init_overlays() {
     for (size_t section_index = 0; section_index < sections_info.num_code_sections; section_index++) {
         SectionTableEntry* code_section = &sections_info.code_sections[section_index];
 
-        section_addresses[sections_info.code_sections[section_index].index] = code_section->ram_addr;
+        secaddr_set(sections_info.code_sections[section_index].index, code_section->ram_addr, "init");
         code_sections_by_rom[code_section->rom_addr] = section_index;
     }
 
@@ -1934,6 +2022,11 @@ static std::atomic<uint64_t> g_tier_self_heals{0};
 // Misses that could NOT be self-healed (no resident enclosing function) and
 // fell through to the B3 JIT tier / loud abort.
 static std::atomic<uint64_t> g_tier_self_heal_misses{0};
+// Self-heal dispatches REJECTED by the enclosing function (requested entry PC is
+// not one of its emitted dispatch labels — an indirect-only function-START), then
+// recovered by interpreting from the exact PC. Folding the discovered starts into
+// force_function_vrams should drive this toward zero (the convergence assertion).
+static std::atomic<uint64_t> g_tier_dispatch_entry_rejects{0};
 // B3 runtime-JIT tier: functions compiled live from their resident rdram
 // image when neither static dispatch nor self-heal could resolve them (a
 // TRUE gap — genuinely unrecompiled code). jit_compiles succeed; jit_failures
@@ -1965,6 +2058,11 @@ static std::atomic<uint64_t> g_tier_frag_native_runs{0};  // live native executi
 // start_pc against the live ctx/rdram; returns true on a clean return, false if
 // it hit an unimplemented opcode (logged) so the caller aborts loudly.
 extern "C" bool recomp_interpret_function(uint8_t* rdram, recomp_context* ctx, uint32_t start_pc);
+// Discovery sweep (defined after get_function): record an interp dispatch miss /
+// non-fatally skip an unrunnable target so one run surfaces the complete miss
+// set. Forward-declared here for the lookup-miss trampoline (above the defs).
+extern "C" int  recomp_interp_discovery_enabled(void);
+extern "C" void recomp_capture_interp_target(uint32_t addr);
 // JIT outputs MUST outlive the program: the native code address is baked into
 // func_map and the generated code bakes in its string/jumptable/section-addr
 // pointers. Freeing any of these would UAF. Guarded by func_map_mutex.
@@ -2201,6 +2299,7 @@ static void write_runtime_captures_locked() {
     fprintf(f, "    \"lookup_misses\": %llu,\n", (unsigned long long)g_tier_lookup_misses.load());
     fprintf(f, "    \"self_heals\": %llu,\n", (unsigned long long)g_tier_self_heals.load());
     fprintf(f, "    \"self_heal_misses\": %llu,\n", (unsigned long long)g_tier_self_heal_misses.load());
+    fprintf(f, "    \"dispatch_entry_rejects\": %llu,\n", (unsigned long long)g_tier_dispatch_entry_rejects.load());
     fprintf(f, "    \"jit_compiles\": %llu,\n", (unsigned long long)g_tier_jit_compiles.load());
     fprintf(f, "    \"jit_failures\": %llu,\n", (unsigned long long)g_tier_jit_failures.load());
     fprintf(f, "    \"interp_runs\": %llu,\n", (unsigned long long)g_tier_interp_runs.load());
@@ -2632,6 +2731,17 @@ extern "C" {
 // threads missing concurrently can't cross their self-heal targets (the
 // shared g_last_lookup_miss_addr is kept for the abort-path diagnostics).
 static thread_local uint32_t g_self_heal_addr = 0;
+
+// Dispatch-entry REJECT path (the general fix for indirect-only function-STARTS):
+// when self-heal dispatches a miss into the resident enclosing function but the
+// requested entry PC is not one of that function's emitted dispatch labels, the
+// generated default arm now sets ctx->dispatch_entry_rejected and returns WITHOUT
+// running the wrong prologue (recompilation.cpp). Self-heal then interprets the
+// function from the exact missed runtime PC. This thread-local bounds nested
+// reject->interp->native->reject chains so a pathological bounce can't overflow
+// the host stack (interpret()'s own kMaxInterpDepth only bounds a single call).
+static thread_local int g_reject_interp_depth = 0;
+static constexpr int kMaxRejectInterpDepth = 96;
 
 // Expose the current in-flight lookup-miss RUNTIME address (this thread).
 // A graceful-skip stub (generated by recompile_or_stub; it calls
@@ -3098,9 +3208,43 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
             const uint32_t saved = ctx->dispatch_entry_target;
             ctx->dispatch_entry_target =
                 (link_target == func_start_link) ? 0u : link_target;
+            ctx->dispatch_entry_rejected = 0;
+            ctx->dispatch_entry_rejected_target = 0;
             host(rdram, ctx);
-            ctx->dispatch_entry_target = saved;
-            return;
+            // REJECT: the enclosing function's dispatch switch had no label for
+            // this entry PC — it returned without running guest code rather than
+            // mis-running from its prologue. Recover by INTERPRETING the function
+            // from the exact missed RUNTIME PC (g_self_heal_addr). This is the
+            // "safe, not fatal" floor finally covering indirect-only function-
+            // STARTS (not just return points), so an undiscovered GB-CPU handler
+            // runs correctly instead of producing a garbage computed pointer.
+            if (ctx->dispatch_entry_rejected) {
+                ctx->dispatch_entry_rejected = 0;
+                ctx->dispatch_entry_rejected_target = 0;
+                ctx->dispatch_entry_target = saved;
+                g_tier_dispatch_entry_rejects.fetch_add(1, std::memory_order_relaxed);
+                if (g_reject_interp_depth < kMaxRejectInterpDepth) {
+                    g_reject_interp_depth++;
+                    const bool ok =
+                        recomp_interpret_function(rdram, ctx, (uint32_t)addr);
+                    g_reject_interp_depth--;
+                    if (ok) {
+                        g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    // interp couldn't carry it (unimplemented op / garbage) —
+                    // fall through to B3/fragment/interp-floor/abort below.
+                } else {
+                    fprintf(stderr,
+                        "[recomp] reject->interp depth cap (%d) hit at 0x%08X — "
+                        "falling through\n", kMaxRejectInterpDepth, (uint32_t)addr);
+                    fflush(stderr);
+                }
+                // not recovered here; continue to the lower tiers.
+            } else {
+                ctx->dispatch_entry_target = saved;
+                return;
+            }
         }
     }
     g_tier_self_heal_misses.fetch_add(1, std::memory_order_relaxed);
@@ -3376,9 +3520,23 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
         }
     }
 
+    // Discovery sweep (PSR_INTERP_DISCOVERY): the interp floor couldn't run this
+    // target (a real miss the interpreter can't carry, or a garbage/misaligned
+    // pointer left by an upstream skipped op). We still want the FULL diagnostic
+    // dump below (host backtrace = the recompiled function that computed/called
+    // the bad pointer), so DON'T return here — fall through, dump, then skip the
+    // abort at the end. Lets one run surface the complete miss set AND pin each
+    // bad-pointer producer instead of crash-looping. Off by default.
+    const bool discovery_nonfatal = recomp_interp_discovery_enabled() != 0;
+    if (discovery_nonfatal) {
+        recomp_capture_interp_target(g_last_lookup_miss_addr);
+    }
+
     fprintf(stderr,
-        "[recomp] lookup-miss trampoline reached — aborting\n"
-        "  bad function pointer: 0x%08X\n",
+        discovery_nonfatal
+            ? "[discovery] lookup-miss 0x%08X — dumping backtrace, continuing (non-fatal)\n"
+            : "[recomp] lookup-miss trampoline reached — aborting\n"
+              "  bad function pointer: 0x%08X\n",
         g_last_lookup_miss_addr);
     FILE* f = open_last_error_log("a");
     if (f) {
@@ -3450,6 +3608,18 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
     // this the lookup-miss path is invisible to the diagnostic tools
     // and we lose the input history needed to replay-repro.
     psr_post_mortem_dump("lookup-miss-trampoline", nullptr);
+    // Discovery sweep: the diagnostic dump above (host backtrace = the recompiled
+    // function that computed/called this bad pointer) is now in the last-error
+    // log. Return instead of aborting so the run continues and we collect every
+    // miss + every bad-pointer producer in ONE run. Guest state is unreliable
+    // past here — capture mode, not correctness. Default (no env) still aborts.
+    if (discovery_nonfatal) {
+        fprintf(stderr,
+            "[discovery] non-fatal: 0x%08X dumped (see last-error log backtrace), "
+            "continuing\n", g_last_lookup_miss_addr);
+        fflush(stderr);
+        return;
+    }
     std::abort();
 }
 
@@ -4048,6 +4218,46 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     }
     g_tier_static_hits.fetch_add(1, std::memory_order_relaxed);
     return func_find->second;
+}
+
+// Discovery-sweep capture (FRAGMENT_TIERS.md #2 — the coverage hook that was
+// stubbed as a no-op in mips_interp.cpp). The interpreter floor calls this for
+// every function entry it dispatches to via a computed j/jal/jr/jalr whose
+// target has NO native recompiled function (recomp_lookup_function_or_null ==
+// null). Without it, the interpreter SILENTLY runs those indirect-only
+// fragment entries, so only the single get_function entry point is ever logged
+// and each build surfaces just one more miss => crash-loop. With it (gated by
+// PSR_INTERP_DISCOVERY), a SINGLE interpreted run records the COMPLETE set of
+// indirect-only dispatch misses into runtime_captures.json, to fold into
+// force_function_vrams in one regen. Same dedup + classify + manifest writer as
+// get_function; cheap after first sighting (map probe + counter), I/O only on
+// first sighting. Lock order mirrors get_function: func_map_mutex (shared)
+// then g_lookup_capture_mutex.
+extern "C" int recomp_interp_discovery_enabled(void) {
+    static const bool enabled = []{
+        const char* e = std::getenv("PSR_INTERP_DISCOVERY");
+        return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+    }();
+    return enabled ? 1 : 0;
+}
+
+extern "C" void recomp_capture_interp_target(uint32_t addr) {
+    if (!recomp_interp_discovery_enabled()) return;
+    std::shared_lock<std::shared_mutex> fmlock(func_map_mutex);
+    if (func_map.find((int32_t)addr) != func_map.end()) return;  // real func: not a miss
+    std::lock_guard<std::mutex> clk(g_lookup_capture_mutex);
+    auto emplaced = g_lookup_captures.try_emplace(addr);
+    LookupCapture& cap = emplaced.first->second;
+    bool first_sighting = emplaced.second;
+    if (first_sighting) classify_lookup_capture(addr, cap);
+    cap.hit_count++;
+    if (first_sighting) {
+        write_runtime_captures_locked();
+        fprintf(stderr,
+            "[discovery] interp dispatch miss captured: 0x%08X (%s)\n",
+            addr, cap.classification ? cap.classification : "?");
+        fflush(stderr);
+    }
 }
 
 // ---------------------------------------------------------------------

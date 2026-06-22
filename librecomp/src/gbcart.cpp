@@ -319,7 +319,13 @@ namespace {
                 const bool was_enabled = cart_enabled;
                 cart_enabled = (value & 1) != 0;
                 if (!was_enabled && cart_enabled) {
-                    reset_state = 3;
+                    // Settle to reset_state 2 = RSTB_DETECTION(0x08) SET, RSTB_STATUS(0x04)
+                    // CLEAR. On real HW the GB cart's reset line de-asserts (0x04 clears)
+                    // before the N64 reads status, while 0x08 latches "a reset happened".
+                    // The GB-Tower cart-check needs BOTH: FUN_8000bdc0 requires status&0x08
+                    // set, and the SRAM self-test verify (FUN_8000ba20) requires status&0x04
+                    // CLEAR. State 3 (both set) fails the self-test -> red-X "save corrupt".
+                    reset_state = 2;
                 }
                 return;
             }
@@ -335,6 +341,43 @@ namespace {
 
     std::array<Port, port_count> ports;
     std::mutex port_mutex;
+
+    // ---- Always-on diagnostic ring (Transfer Pak block I/O) -------------------
+    // Records every read_block/write_block with the cart's bank state so a probe
+    // can see exactly which ROM banks / addresses a feature walks (e.g. GB Tower's
+    // full-cart read for emulation) and where it stalls — WITHOUT perturbing boot
+    // timing the way per-event stderr logging does. Queried via ring_dump().
+    struct RingEntry {
+        uint32_t seq;
+        uint16_t block_addr;  // libultra block address (x32 = accessory byte addr)
+        uint16_t rom_bank;    // cart's currently-selected switchable ROM bank
+        uint8_t  port;
+        uint8_t  kind;        // 0 = read, 1 = write
+        uint8_t  addr_bank;   // Transfer Pak bank register (0..3)
+        uint8_t  flags;       // bit0 pak_enabled, bit1 cart_enabled, bit2 ram_enabled
+        uint8_t  ram_bank;
+        uint8_t  b0;          // first data byte read/written
+    };
+    constexpr size_t ring_cap = 65536;
+    RingEntry g_ring[ring_cap];
+    uint32_t g_ring_seq = 0;   // total appended (== next seq); guarded by port_mutex
+
+    // Caller holds port_mutex. `port` is valid + configured.
+    void ring_append(int port, uint8_t kind, uint16_t block_addr, uint8_t b0) {
+        const Port& p = ports[port];
+        RingEntry& e = g_ring[g_ring_seq % ring_cap];
+        e.seq = g_ring_seq;
+        e.block_addr = block_addr;
+        e.rom_bank = static_cast<uint16_t>(p.cart.selected_switchable_rom_bank());
+        e.port = static_cast<uint8_t>(port);
+        e.kind = kind;
+        e.addr_bank = p.address_bank;
+        e.flags = static_cast<uint8_t>((p.pak_enabled ? 1 : 0) | (p.cart_enabled ? 2 : 0) |
+                                       (p.cart.ram_enabled ? 4 : 0));
+        e.ram_bank = p.cart.ram_bank;
+        e.b0 = b0;
+        g_ring_seq++;
+    }
 }
 
 void set_cart(int port, const std::filesystem::path& rom, const std::filesystem::path& save) {
@@ -368,9 +411,25 @@ int read_block(int port, uint16_t block_address, uint8_t* out) {
         return pfs_err_invalid;
     }
     const uint16_t byte_address = static_cast<uint16_t>(block_address * block_size);
-    for (int i = 0; i < block_size; i++) {
-        out[i] = ports[port].read(static_cast<uint16_t>(byte_address + i));
+    // Transfer Pak control registers (enable/bank/status, accessory < 0xC000 =>
+    // masked <= 0x3FFF) are single-byte registers MIRRORED across the whole
+    // 32-byte block on real hardware, and reading the status register advances
+    // its reset-ack state machine exactly ONCE per read. Read once and replicate.
+    // Reading them per-byte would call status() 32x for a single status read,
+    // draining reset_state and clearing the 0x08 "reset-ready" bit by byte 0x1f
+    // -> PMS-J's GB-Tower cart-check (FUN_8000bdc0: redX if (status[0x1f]&8)==0)
+    // wrongly reports every cart "corrupt". The GB memory window stays per-byte.
+    if ((byte_address & transfer_pak_address_mask) <= 0x3FFF) {
+        const uint8_t v = ports[port].read(byte_address);
+        for (int i = 0; i < block_size; i++) {
+            out[i] = v;
+        }
+    } else {
+        for (int i = 0; i < block_size; i++) {
+            out[i] = ports[port].read(static_cast<uint16_t>(byte_address + i));
+        }
     }
+    ring_append(port, 0, block_address, out[0]);
     return 0;
 }
 
@@ -386,6 +445,7 @@ int write_block(int port, uint16_t block_address, const uint8_t* data) {
     for (int i = 0; i < block_size; i++) {
         ports[port].write(static_cast<uint16_t>(byte_address + i), data[i]);
     }
+    ring_append(port, 1, block_address, data[0]);
     ports[port].cart.flush_save();
     return 0;
 }
@@ -396,6 +456,64 @@ void flush_all() {
         if (p.configured) {
             p.cart.flush_save();
         }
+    }
+}
+
+void ring_dump(const char* path, int tail) {
+    std::scoped_lock lock(port_mutex);
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) {
+        return;
+    }
+    const uint32_t total = g_ring_seq;
+    const uint32_t avail = total < ring_cap ? total : static_cast<uint32_t>(ring_cap);
+    if (tail <= 0 || static_cast<uint32_t>(tail) > avail) {
+        tail = static_cast<int>(avail);
+    }
+
+    // Summary over the whole live window: which ROM banks were read (full-cart
+    // walk detection), read/write counts, and the cart-window byte-address span.
+    uint32_t reads = 0, writes = 0;
+    uint64_t bank_seen = 0;       // bitmask of rom_banks 0..63 touched by reads
+    uint32_t max_bank = 0;
+    uint32_t max_blk = 0;
+    const uint32_t start = total > ring_cap ? total - static_cast<uint32_t>(ring_cap) : 0;
+    for (uint32_t s = start; s < total; s++) {
+        const RingEntry& e = g_ring[s % ring_cap];
+        if (e.kind == 0) {
+            reads++;
+            if (e.rom_bank < 64) bank_seen |= (1ull << e.rom_bank);
+            if (e.rom_bank > max_bank) max_bank = e.rom_bank;
+            if (e.block_addr > max_blk) max_blk = e.block_addr;
+        } else {
+            writes++;
+        }
+    }
+    f << "=== gbcart block-I/O ring (total=" << total << " avail=" << avail
+      << " reads=" << reads << " writes=" << writes << ") ===\n";
+    f << "rom_banks_read (max=" << max_bank << "): ";
+    for (int b = 0; b < 64; b++) {
+        if (bank_seen & (1ull << b)) f << b << ' ';
+    }
+    f << "\nmax read block_addr=0x" << std::hex << max_blk << std::dec
+      << " (acc byte 0x" << std::hex << (max_blk * block_size) << std::dec << ")\n";
+    f << "--- last " << tail << " entries (acc=accessory byte addr, bus=GB bus addr) ---\n";
+    f << "seq port kind tpb rom_bank ram_bank acc     bus     b0 flags(P/C/R)\n";
+    const uint32_t first = total - static_cast<uint32_t>(tail);
+    for (uint32_t s = first; s < total; s++) {
+        const RingEntry& e = g_ring[s % ring_cap];
+        const uint32_t acc = static_cast<uint32_t>(e.block_addr) * block_size;
+        const uint32_t accm = acc & 0x7FFF;
+        const uint32_t bus = (accm >= 0x4000)
+            ? (0x4000u * e.addr_bank + accm - 0x4000u)
+            : accm;
+        char buf[176];
+        std::snprintf(buf, sizeof(buf),
+            "%u P%u %s tpb%u rom%-3u rb%u 0x%04x  0x%04x  %02x  %c%c%c\n",
+            e.seq, e.port, e.kind == 0 ? "RD" : "WR", e.addr_bank, e.rom_bank,
+            e.ram_bank, acc, bus, e.b0,
+            (e.flags & 1) ? 'P' : '-', (e.flags & 2) ? 'C' : '-', (e.flags & 4) ? 'R' : '-');
+        f << buf;
     }
 }
 

@@ -82,10 +82,21 @@ namespace mesg_log {
     // that went silent early (e.g. a parked thread's reply queue) scrolls out
     // before a probe looks. This table answers "after thread X blocked on recv,
     // did anyone ever SEND to its queue?" regardless of how long ago that was.
+    // Depth of the per-queue never-evict history. Bumped from 4 to 64 so a
+    // low-traffic handshake can be reconstructed in full: a boot-init pipeline
+    // (e.g. the t3->t5->t6->t10->t7 "DONE" chain) parks each thread on a
+    // reply queue with only a handful of lifetime events; 4 slots showed the
+    // tail but lost the ordering that led to the stall (which "go"/DONE send
+    // was dropped on a transiently-full queue). 64 captures every such queue
+    // in full (they have <64 lifetime events) and the recent tail of busy
+    // queues. MUST be a power of two (mask below) and MUST stay in sync with
+    // the consumer's QState in debug_server.cpp (the qstate_size guard there
+    // silently skips the table on a size mismatch).
+    constexpr uint32_t QEVENTS = 64;
     struct QState {
-        uint32_t queue;        // 0 = empty slot
-        uint32_t count;        // total events recorded for this queue
-        Event     last[4];     // ring of the last 4 events on this queue
+        uint32_t queue;            // 0 = empty slot
+        uint32_t count;            // total events recorded for this queue
+        Event     last[QEVENTS];   // ring of the last QEVENTS events on this queue
     };
     constexpr size_t QCAP = 1024;
     static QState qstates[QCAP];
@@ -97,7 +108,7 @@ namespace mesg_log {
             QState& q = qstates[(h + probe) % QCAP];
             if (q.queue == 0 || q.queue == mq) {
                 q.queue = mq;
-                q.last[q.count & 3] = e;
+                q.last[q.count & (QEVENTS - 1)] = e;
                 q.count++;
                 return;
             }
@@ -184,8 +195,8 @@ extern "C" size_t ultramodern_mesg_qstate_size(void) {
 }
 
 // Copy the never-evict per-queue table (every queue ever touched, each with its
-// last 4 events). Lets a probe see a parked thread's reply-queue history even
-// after the event ring has wrapped.
+// last QEVENTS events). Lets a probe see a parked thread's reply-queue history
+// even after the event ring has wrapped.
 extern "C" void ultramodern_mesg_qstates_copy(
     void* out_void, size_t cap, size_t* n_written)
 {

@@ -12,12 +12,15 @@
 #include "librecomp/gbcart.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <mutex>
 #include <vector>
+
+#include "ultramodern/ultramodern.hpp"
 
 namespace librecomp::gbcart {
 namespace {
@@ -349,6 +352,8 @@ namespace {
     // timing the way per-event stderr logging does. Queried via ring_dump().
     struct RingEntry {
         uint32_t seq;
+        uint32_t tstamp_us;   // microseconds since first ring op (timing / yield gaps)
+        uint32_t thread_ptr;  // OSThread* (guest addr) that issued this op (race attribution)
         uint16_t block_addr;  // libultra block address (x32 = accessory byte addr)
         uint16_t rom_bank;    // cart's currently-selected switchable ROM bank
         uint8_t  port;
@@ -356,17 +361,26 @@ namespace {
         uint8_t  addr_bank;   // Transfer Pak bank register (0..3)
         uint8_t  flags;       // bit0 pak_enabled, bit1 cart_enabled, bit2 ram_enabled
         uint8_t  ram_bank;
+        uint8_t  mbc1_mode;   // MBC1 banking mode (0 = ROM, 1 = RAM) — bank-race relevant
         uint8_t  b0;          // first data byte read/written
     };
     constexpr size_t ring_cap = 65536;
     RingEntry g_ring[ring_cap];
     uint32_t g_ring_seq = 0;   // total appended (== next seq); guarded by port_mutex
 
+    uint32_t ring_now_us() {
+        static const auto t0 = std::chrono::steady_clock::now();
+        return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+    }
+
     // Caller holds port_mutex. `port` is valid + configured.
     void ring_append(int port, uint8_t kind, uint16_t block_addr, uint8_t b0) {
         const Port& p = ports[port];
         RingEntry& e = g_ring[g_ring_seq % ring_cap];
         e.seq = g_ring_seq;
+        e.tstamp_us = ring_now_us();
+        e.thread_ptr = static_cast<uint32_t>(ultramodern::this_thread());
         e.block_addr = block_addr;
         e.rom_bank = static_cast<uint16_t>(p.cart.selected_switchable_rom_bank());
         e.port = static_cast<uint8_t>(port);
@@ -375,6 +389,7 @@ namespace {
         e.flags = static_cast<uint8_t>((p.pak_enabled ? 1 : 0) | (p.cart_enabled ? 2 : 0) |
                                        (p.cart.ram_enabled ? 4 : 0));
         e.ram_bank = p.cart.ram_bank;
+        e.mbc1_mode = static_cast<uint8_t>(p.cart.mbc1_mode);
         e.b0 = b0;
         g_ring_seq++;
     }
@@ -402,6 +417,15 @@ bool has_pak(int port) {
     return port >= 0 && port < port_count && ports[port].configured;
 }
 
+// Diagnostic: env-gated trace of the GB-Tower SRAM self-test (PSR_GBSELFTEST=1).
+static bool gbselftest_trace() {
+    static const bool on = [] {
+        const char* e = std::getenv("PSR_GBSELFTEST");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
 int read_block(int port, uint16_t block_address, uint8_t* out) {
     std::scoped_lock lock(port_mutex);
     if (port < 0 || port >= port_count || !ports[port].configured) {
@@ -424,9 +448,23 @@ int read_block(int port, uint16_t block_address, uint8_t* out) {
         for (int i = 0; i < block_size; i++) {
             out[i] = v;
         }
+        if (gbselftest_trace() && (byte_address & transfer_pak_address_mask) >= 0x3000) {
+            const Port& pp = ports[port];
+            std::fprintf(stderr,
+                "[gbself] RD STATUS val=0x%02x (08=%d 04=%d 80=%d 40=%d) cart=%d reset=%d\n",
+                v, (v&8)!=0, (v&4)!=0, (v&0x80)!=0, (v&0x40)!=0, pp.cart_enabled, pp.reset_state);
+        }
     } else {
         for (int i = 0; i < block_size; i++) {
             out[i] = ports[port].read(static_cast<uint16_t>(byte_address + i));
+        }
+        const Port& pp = ports[port];
+        if (gbselftest_trace() && pp.address_bank == 2) {  // SRAM window read (self-test read-back)
+            char hx[80]; int n = 0;
+            for (int i = 0; i < block_size; i++)
+                n += std::snprintf(hx + n, sizeof(hx) - n, "%02x", out[i]);
+            std::fprintf(stderr, "[gbself] RD SRAM ram_en=%d rb%u gb=0x%04x %s\n",
+                pp.cart.ram_enabled, pp.cart.ram_bank, byte_address, hx);
         }
     }
     ring_append(port, 0, block_address, out[0]);
@@ -444,6 +482,15 @@ int write_block(int port, uint16_t block_address, const uint8_t* data) {
     const uint16_t byte_address = static_cast<uint16_t>(block_address * block_size);
     for (int i = 0; i < block_size; i++) {
         ports[port].write(static_cast<uint16_t>(byte_address + i), data[i]);
+    }
+    const Port& wp = ports[port];
+    if (gbselftest_trace() && wp.address_bank == 2 &&
+        (byte_address & transfer_pak_address_mask) >= 0x4000) {  // SRAM window write (self-test)
+        char hx[80]; int n = 0;
+        for (int i = 0; i < block_size; i++)
+            n += std::snprintf(hx + n, sizeof(hx) - n, "%02x", data[i]);
+        std::fprintf(stderr, "[gbself] WR SRAM ram_en=%d rb%u gb=0x%04x %s\n",
+            wp.cart.ram_enabled, wp.cart.ram_bank, byte_address, hx);
     }
     ring_append(port, 1, block_address, data[0]);
     ports[port].cart.flush_save();
@@ -497,8 +544,9 @@ void ring_dump(const char* path, int tail) {
     }
     f << "\nmax read block_addr=0x" << std::hex << max_blk << std::dec
       << " (acc byte 0x" << std::hex << (max_blk * block_size) << std::dec << ")\n";
-    f << "--- last " << tail << " entries (acc=accessory byte addr, bus=GB bus addr) ---\n";
-    f << "seq port kind tpb rom_bank ram_bank acc     bus     b0 flags(P/C/R)\n";
+    f << "--- last " << tail << " entries (acc=accessory byte addr, bus=GB bus addr; "
+         "thr=OSThread* (map via dump_sched), us=microseconds, m=MBC1 mode) ---\n";
+    f << "seq us thr port kind tpb rom_bank ram_bank mbc1 acc bus b0 flags(P/C/R)\n";
     const uint32_t first = total - static_cast<uint32_t>(tail);
     for (uint32_t s = first; s < total; s++) {
         const RingEntry& e = g_ring[s % ring_cap];
@@ -507,11 +555,11 @@ void ring_dump(const char* path, int tail) {
         const uint32_t bus = (accm >= 0x4000)
             ? (0x4000u * e.addr_bank + accm - 0x4000u)
             : accm;
-        char buf[176];
+        char buf[224];
         std::snprintf(buf, sizeof(buf),
-            "%u P%u %s tpb%u rom%-3u rb%u 0x%04x  0x%04x  %02x  %c%c%c\n",
-            e.seq, e.port, e.kind == 0 ? "RD" : "WR", e.addr_bank, e.rom_bank,
-            e.ram_bank, acc, bus, e.b0,
+            "%u us=%u thr=%08x P%u %s tpb%u rom%-3u rb%u m%u 0x%04x  0x%04x  %02x  %c%c%c\n",
+            e.seq, e.tstamp_us, e.thread_ptr, e.port, e.kind == 0 ? "RD" : "WR",
+            e.addr_bank, e.rom_bank, e.ram_bank, e.mbc1_mode, acc, bus, e.b0,
             (e.flags & 1) ? 'P' : '-', (e.flags & 2) ? 'C' : '-', (e.flags & 4) ? 'R' : '-');
         f << buf;
     }

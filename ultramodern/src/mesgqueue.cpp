@@ -47,8 +47,9 @@ namespace mesg_log {
         OP_RECV_BLOCK      = 4,  // osRecvMesg blocked (queue empty + OS_MESG_BLOCK)
         OP_RECV_RETURN_OK  = 5,  // osRecvMesg returned with a message
         OP_EXT_DEQ_OK      = 6,  // dequeue_external_messages drained one
-        OP_EXT_DEQ_FULL    = 7,  // dequeue tried to send but target full → re-queued
+        OP_EXT_DEQ_FULL    = 7,  // dequeue tried to send but target full → re-queued (reliable)
         OP_DO_SEND_BLOCK   = 8,  // do_send blocked sender on queue-full
+        OP_EXT_DEQ_DROP    = 9,  // dequeue dropped a coalescible event (VI/PRENMI) on a full queue
     };
 
     struct Event {
@@ -217,20 +218,43 @@ struct QueuedMessage {
     PTR(OSMesgQueue) mq;
     OSMesg mesg;
     bool jam;
+    // false = reliable (re-queue until delivered); true = coalescible (may be
+    // dropped on a full target). See post_rcp_event(). Generic external posts
+    // default to reliable to preserve prior behavior.
+    bool coalescible = false;
 };
 
 static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
 static std::atomic<uint32_t> g_external_pending{0};
 
-void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
-    external_messages.enqueue({mq, msg, jam});
+bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+
+static void enqueue_external_tagged(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool coalescible) {
+    external_messages.enqueue({mq, msg, jam, coalescible});
     g_external_pending.fetch_add(1, std::memory_order_relaxed);
     mesg_log::record(nullptr, mesg_log::OP_SEND_EXTERNAL,
                      uint32_t(mq), uint32_t(uintptr_t(msg)),
                      0, 0, false, false);
 }
 
-bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
+    // Generic host posts are reliable (re-queued until delivered).
+    enqueue_external_tagged(mq, msg, jam, /*coalescible=*/false);
+}
+
+// RCP hardware-event bridge — see ultramodern.hpp. Runtime (host) producers call
+// this with the event's reliability class. Mirrors osSendMesg's host path
+// (always external; reliable events never lost, coalescible events droppable on
+// a full guest queue). If ever called from a game thread, fall back to a direct
+// send to keep ordering correct.
+s32 ultramodern::post_rcp_event(RDRAM_ARG PTR(OSMesgQueue) mq, OSMesg msg, bool coalescible) {
+    if (ultramodern::is_game_thread()) {
+        do_send(PASS_RDRAM mq, msg, false, false);
+        return 0;
+    }
+    enqueue_external_tagged(mq, msg, /*jam=*/false, coalescible);
+    return 0;
+}
 
 // Counter for how many external messages have been re-queued after a
 // transient target-queue-full failure. Surfaced via the runner's
@@ -247,40 +271,49 @@ void dequeue_external_messages(RDRAM_ARG1) {
         // Try non-blocking send first.
         bool ok = do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
         if (!ok) {
+            // Target OSMesgQueue is full. Behavior now depends on the event's
+            // reliability class (see post_rcp_event / ultramodern.hpp):
+            //
+            //  - COALESCIBLE (VI retrace / PRENMI): DROP it and keep draining.
+            //    A missed retrace is just a missed frame tick (hardware-accurate
+            //    on a full queue). Critically, this is what BREAKS the boot
+            //    lost-wakeup: a game that points OS_EVENT_SP/DP/VI at one shared
+            //    OSMesgQueue (PMS-J's osScheduler interruptQ) gets a 60Hz VI
+            //    flood; re-queuing those VIs to the tail perpetually starved the
+            //    SP/DP gfx-task-completion events behind them, so osScheduler
+            //    never marked the task done and the boot pipeline parked. VI must
+            //    not accumulate in the external queue.
+            //
+            //  - RELIABLE (SP/DP/SI/AI/PI completions + generic host posts):
+            //    NEVER drop. These release blocked tasks/threads; losing one
+            //    lost-wakeups the guest. Re-queue at the tail and bail this drain
+            //    pass (we must NOT spin re-enqueuing with no chance for the
+            //    receiver to drain). The caller (the game thread inside
+            //    osSendMesg/osRecvMesg) returns and runs, the receiver dequeues
+            //    and frees space, and the next dequeue_external_messages retries.
+            //    With VI now dropped instead of re-queued, the reliable event is
+            //    no longer starved.
+            //
+            // Historical context: Pokemon Stadium hit the reliable case on its
+            // gfx scheduler queue 0x800A6CD0 — audio SP DONE + VI ticks (~110
+            // events/sec) briefly filled a cap=16 queue and the gfx RDP DONE for
+            // the third boot-logo dlist was dropped, softlocking Game_Thread. The
+            // original fix re-queued EVERYTHING (incl. VI); this refines it so VI
+            // coalesces and only true completions are guaranteed.
+            //
+            // NB: doesn't apply to OS_MESG_BLOCK semantics — that path is direct
+            // (skips this external queue).
+            if (to_send.coalescible) {
+                mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_DROP,
+                                 uint32_t(to_send.mq),
+                                 uint32_t(uintptr_t(to_send.mesg)),
+                                 vb, vb, false, true);
+                continue;
+            }
             mesg_log::record(rdram, mesg_log::OP_EXT_DEQ_FULL,
                              uint32_t(to_send.mq),
                              uint32_t(uintptr_t(to_send.mesg)),
                              vb, vb, false, true);
-            // Target OSMesgQueue is full. The original code silently
-            // dropped the message here — see git blame on this line.
-            // That is wrong: callers (sp_complete / dp_complete /
-            // ai_complete / etc) treat enqueue_external_message as
-            // reliable delivery, and silent drops produce
-            // hard-to-diagnose softlocks when game-thread receivers
-            // can't keep up with the host-side event burst rate.
-            //
-            // Pokemon Stadium hits this on the gfx scheduler queue
-            // 0x800A6CD0: audio SP DONE + VI ticks generate ~110
-            // events/sec into a cap=16 queue, briefly filling it,
-            // and the gfx RDP DONE for Stadium's third boot-logo
-            // dlist gets dropped — Game_Thread softlocks waiting for
-            // a completion that never propagates.
-            //
-            // Fix: re-queue at the tail and bail out of this drain
-            // pass. We must NOT keep looping (we'd just dequeue and
-            // re-enqueue the same blocking message in a tight loop
-            // with no chance for the receiver to drain). Letting the
-            // caller (the game-thread inside osSendMesg/osRecvMesg)
-            // return and continue executing gives the receiver a
-            // chance to dequeue, freeing space; the next call into
-            // dequeue_external_messages will retry.
-            //
-            // NB: doesn't apply to OS_MESG_BLOCK semantics — sender
-            // explicitly opted-in to blocking, and that path is
-            // direct (skips this external queue). Externals are by
-            // design fire-and-forget posts from host threads, but
-            // "fire-and-forget" must mean "delivered eventually",
-            // not "occasionally lost."
             external_messages.enqueue(to_send);
             g_external_pending.fetch_add(1, std::memory_order_relaxed);
             g_external_requeues.fetch_add(1, std::memory_order_relaxed);

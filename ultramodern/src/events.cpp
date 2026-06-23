@@ -274,17 +274,22 @@ void vi_thread_func() {
             ViState* cur_state = events_context.vi.get_cur_state();
             if (remaining_retraces == 0) {
                 if (cur_state->mq != NULLPTR) {
-                    s32 sent = osSendMesg(PASS_RDRAM cur_state->mq, cur_state->msg, OS_MESG_NOBLOCK);
-                    // Always-on ring: runtime→guest VI retrace delivery
-                    // (a2 = result; -1 means the game's queue was full and
-                    // the retrace was dropped). See ultra_trace.hpp.
+                    // VI retrace is COALESCIBLE: droppable on a full guest queue.
+                    // This is what stops a 60Hz retrace flood from starving the
+                    // SP/DP gfx-completion events when a game shares one queue for
+                    // OS_EVENT_SP/DP/VI (the boot lost-wakeup). See post_rcp_event.
+                    s32 sent = ultramodern::post_rcp_event(PASS_RDRAM cur_state->mq, cur_state->msg, /*coalescible=*/true);
+                    // Always-on ring: runtime→guest VI retrace delivery (a2 = 0
+                    // when posted; the drop, if any, happens later in the external
+                    // drain and shows as OP_EXT_DEQ_DROP). See ultra_trace.hpp.
                     recomp_ultra_trace_record("~vi_retrace", 0,
                         (uint32_t)cur_state->mq, (uint32_t)cur_state->msg, (uint32_t)sent, 0);
                 }
                 remaining_retraces = cur_state->retrace_count;
             }
             if (events_context.ai.mq != NULLPTR) {
-                s32 sent = osSendMesg(PASS_RDRAM events_context.ai.mq, events_context.ai.msg, OS_MESG_NOBLOCK);
+                // AI (audio DMA) completion is RELIABLE (never dropped).
+                s32 sent = ultramodern::post_rcp_event(PASS_RDRAM events_context.ai.mq, events_context.ai.msg, /*coalescible=*/false);
                 recomp_ultra_trace_record("~ai_event", 0,
                     (uint32_t)events_context.ai.mq, (uint32_t)events_context.ai.msg, (uint32_t)sent, 0);
             }
@@ -365,7 +370,10 @@ void sp_complete(uint32_t task_type) {
     recomp_rsp_mark_sp_task_complete(rdram, task_type);
 
     std::lock_guard lock{ events_context.message_mutex };
-    s32 sent = osSendMesg(PASS_RDRAM events_context.sp.mq, events_context.sp.msg, OS_MESG_NOBLOCK);
+    // SP task completion is RELIABLE: it releases the gfx task in osScheduler.
+    // Losing it lost-wakeups the pipeline, so it is never dropped (re-queued
+    // until delivered) even if VI floods the shared queue. See post_rcp_event.
+    s32 sent = ultramodern::post_rcp_event(PASS_RDRAM events_context.sp.mq, events_context.sp.msg, /*coalescible=*/false);
     recomp_ultra_trace_record("~sp_done", 0,
         (uint32_t)events_context.sp.mq, (uint32_t)events_context.sp.msg, (uint32_t)sent, task_type);
     g_sp_complete_count.fetch_add(1, std::memory_order_relaxed);
@@ -376,7 +384,8 @@ void dp_complete(uint32_t task_type) {
     recomp_rsp_mark_sp_task_complete(rdram, task_type);
 
     std::lock_guard lock{ events_context.message_mutex };
-    s32 sent = osSendMesg(PASS_RDRAM events_context.dp.mq, events_context.dp.msg, OS_MESG_NOBLOCK);
+    // DP (RDP FullSync) completion is RELIABLE — same reasoning as SP above.
+    s32 sent = ultramodern::post_rcp_event(PASS_RDRAM events_context.dp.mq, events_context.dp.msg, /*coalescible=*/false);
     recomp_ultra_trace_record("~dp_done", 0,
         (uint32_t)events_context.dp.mq, (uint32_t)events_context.dp.msg, (uint32_t)sent, task_type);
     g_dp_complete_count.fetch_add(1, std::memory_order_relaxed);
@@ -740,7 +749,9 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
 }
 
 void ultramodern::send_si_message(RDRAM_ARG1) {
-    s32 sent = osSendMesg(PASS_RDRAM events_context.si.mq, events_context.si.msg, OS_MESG_NOBLOCK);
+    // SI (controller/PIF) completion is RELIABLE: a thread blocks on it after
+    // osContStartReadData / osPfs* ops. Never dropped. See post_rcp_event.
+    s32 sent = ultramodern::post_rcp_event(PASS_RDRAM events_context.si.mq, events_context.si.msg, /*coalescible=*/false);
     recomp_ultra_trace_record("~si_done", 0,
         (uint32_t)events_context.si.mq, (uint32_t)events_context.si.msg, (uint32_t)sent, 0);
 }

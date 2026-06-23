@@ -36,6 +36,12 @@ namespace librecomp::gbcart {
     // Persist any dirty cart RAM to disk. Writes are already write-through;
     // this is a shutdown backstop (call from the quit path).
     void flush_all();
+
+    // Diagnostic: dump the always-on block-I/O ring (last `tail` entries + a
+    // summary of which ROM banks were read) to `path`. Lets a probe see exactly
+    // which cart addresses/banks a feature (e.g. GB Tower's full-cart read) walks
+    // and where it stalls, without perturbing boot timing.
+    void ring_dump(const char* path, int tail);
 }
 
 #endif // LIBRECOMP_GBCART_HPP

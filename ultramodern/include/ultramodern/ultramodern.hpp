@@ -57,6 +57,24 @@ void wait_for_external_message_timed(RDRAM_ARG1, u32 millis);
 bool external_message_pending();
 void send_external_message_after(RDRAM_ARG PTR(OSMesgQueue) mq, OSMesg msg, u32 delay_us);
 
+// RCP hardware-event delivery (host -> guest), with a reliability class.
+// Runtime threads (RSP/RDP/VI/SI/AI emulation) post RCP events here instead of
+// calling osSendMesg directly, so the runtime can guarantee the right delivery
+// semantics per event kind:
+//   - RELIABLE   (coalescible == false): SP/DP/SI/AI/PI completion edges. These
+//     release blocked tasks/threads; losing one lost-wakeups the guest. They are
+//     NEVER dropped — if the guest queue is full they are re-queued until they
+//     land (delivered late is fine; lost is not).
+//   - COALESCIBLE (coalescible == true): VI retrace, PRENMI. Periodic/level-ish
+//     notifications; a missed one is just a missed frame tick. These MAY be
+//     dropped on a full queue, exactly like real hardware.
+// This is the general fix for the lost-wakeup where a 60Hz VI retrace flood on a
+// queue shared with SP/DP (the osScheduler interruptQ, when a game points
+// OS_EVENT_SP/DP/VI at the same OSMesgQueue) starves the gfx task-completion
+// events and parks the boot pipeline. Guest osSendMesg semantics are unchanged
+// (a guest cap-1 latch queue that ignores failed NOBLOCK sends still coalesces).
+s32 post_rcp_event(RDRAM_ARG PTR(OSMesgQueue) mq, OSMesg msg, bool coalescible);
+
 // Thread scheduling.
 void check_running_queue(RDRAM_ARG1);
 void run_next_thread_and_wait(RDRAM_ARG1);

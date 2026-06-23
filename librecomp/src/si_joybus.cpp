@@ -17,6 +17,8 @@
 // ---------------------------------------------------------------------
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -52,12 +54,37 @@ namespace {
         return static_cast<uint8_t>(crc);
     }
 
+    // Always-on (env-gated) joybus trace. Set PSR_JOYBUS_TRACE=1 to dump every
+    // 64-byte PIF block the shim processes + each parsed frame. Continuous from
+    // process start, so the boot-time Transfer Pak detect is captured.
+    bool joybus_trace() {
+        static const bool on = []{
+            const char* e = std::getenv("PSR_JOYBUS_TRACE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
+    }
+
+    void dump_block(const char* tag, const uint8_t* blk) {
+        std::fprintf(stderr, "[joybus] %s block:", tag);
+        for (int i = 0; i < 64; i++) {
+            if ((i & 15) == 0) std::fprintf(stderr, "\n[joybus]  %02x:", i);
+            std::fprintf(stderr, " %02x", blk[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     // Parse the 64-byte PIF command block at `pif` in RDRAM and fill the accessory
     // responses in place. Channel index = N64 controller port (0..3) = gbcart port.
     void run_joybus(uint8_t* rdram, gpr pif) {
         uint8_t blk[64];
         for (int i = 0; i < 64; i++) {
             blk[i] = MEM_BU(i, pif);
+        }
+
+        const bool trace = joybus_trace();
+        if (trace) {
+            dump_block("rx-in", blk);
         }
 
         int chan = 0;
@@ -124,12 +151,22 @@ namespace {
                 blk[p + 1] = static_cast<uint8_t>(blk[p + 1] | RX_NO_DEVICE);
             }
 
+            if (trace) {
+                std::fprintf(stderr,
+                    "[joybus]  frame p=%d chan=%d cmd=0x%02x tx=%d rx=%d has_pak=%d no_device=%d\n",
+                    p, chan, cmd, tx, rx, librecomp::gbcart::has_pak(chan) ? 1 : 0, no_device ? 1 : 0);
+            }
+
             p = rx_i + rx;
             chan++;
         }
 
         for (int i = 0; i < 64; i++) {
             MEM_B(i, pif) = static_cast<int8_t>(blk[i]);
+        }
+
+        if (trace) {
+            dump_block("tx-out", blk);
         }
     }
 }

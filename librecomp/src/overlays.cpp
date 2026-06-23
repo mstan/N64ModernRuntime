@@ -107,6 +107,46 @@ static std::vector<LoadedSection> loaded_sections{};
 // reset its section_addresses[] entry. Mirrors gFragments[]: one slot
 // per id. See unregister_runtime_fragment.
 static std::unordered_map<uint32_t, size_t> runtime_fragment_id_to_section{};
+
+// PSR issue #9 — historical fragment-INSTANCE registry. This is both ChatGPT's
+// confirmation probe AND step 1 of the multi-instance-residency fix. Each entry
+// is one concrete (re)load of a fragment: its id, link-time base, runtime base,
+// size, a monotonic generation, and a head-hash of the loaded bytes captured at
+// load time. At a geo-walk crash we recompute each instance's head-hash and
+// report intact/CHANGED — distinguishing "old-instance dispatch lost" (bytes
+// intact, recoverable by an address-range registry) from "guest graph genuinely
+// dangling" (bytes freed/overwritten, an allocator/lifetime problem).
+struct FragInstance {
+    uint64_t generation;   // monotonic across all (re)loads
+    uint32_t id;
+    uint32_t link_base;    // section.ram_addr (link-time vram)
+    uint32_t runtime_base; // fragment_ptr (where it landed this load)
+    uint32_t size;
+    uint64_t head_hash;    // fnv1a of first min(size,0x400) bytes at load
+};
+static constexpr uint32_t kFragInstCap = 128;  // ring of recent instances
+static FragInstance s_frag_inst[kFragInstCap] = {};
+static std::atomic<uint64_t> s_frag_reg_seq{0};
+static std::unordered_map<uint32_t, uint32_t> s_frag_reg_count{};
+// fnv1a-64 over the first `n` bytes at guest paddr, XOR-3 byte order.
+static uint64_t frag_head_hash(const uint8_t* rdram, uint32_t runtime_base, uint32_t size) {
+    uint32_t paddr = runtime_base & 0x1FFFFFFFu;
+    uint32_t n = size < 0x400u ? size : 0x400u;
+    if (paddr + n > (8u * 1024u * 1024u)) return 0;
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < n; i++) { h ^= rdram[(paddr + i) ^ 3]; h *= 1099511628211ull; }
+    return h;
+}
+static void frag_reg_record(const uint8_t* rdram, uint32_t id, uint32_t link_base,
+                            int32_t runtime_base, uint32_t size) {
+    uint64_t s = s_frag_reg_seq.fetch_add(1, std::memory_order_relaxed);
+    s_frag_inst[s % kFragInstCap] = {
+        s, id, link_base, (uint32_t)runtime_base, size,
+        frag_head_hash(rdram, (uint32_t)runtime_base, size)
+    };
+    s_frag_reg_count[id]++;
+}
+
 static std::unordered_map<int32_t, recomp_func_t*> func_map{};
 // Single-writer / multi-reader lock for func_map. get_function() runs
 // on every recompiled-function indirect call (audio thread, gfx thread,
@@ -159,6 +199,52 @@ private:
     static thread_local int s_write_depth;
 };
 thread_local int FuncMapWriteLock::s_write_depth = 0;
+
+// PSR #9 alias probe: count func_map entries whose key (runtime address) lands in [lo, hi).
+// At a geo crash this reveals whether an OLD fragment instance still has live func_map entries
+// (function starts / interior-entry aliases / computed-call aliases) after the slot reloaded —
+// i.e. the mid-function aliasing class. >0 for a superseded instance == incomplete unregister
+// (aliasing viable); 0 == unregister complete (the bad geo source is loader/extent/freshness).
+// func_map keys are int32_t; compare as uint32_t. Read under a shared lock (the crashing
+// thread holds no func_map write lock here, so no self-deadlock).
+static uint32_t frag_funcmap_entries_in_range(uint32_t lo, uint32_t hi) {
+    uint32_t n = 0;
+    std::shared_lock<std::shared_mutex> lk(func_map_mutex);
+    for (const auto& kv : func_map) {
+        uint32_t a = (uint32_t)kv.first;
+        if (a >= lo && a < hi) n++;
+    }
+    return n;
+}
+
+// ── Issue #9 Phase 1: precise unregister of a superseded fragment instance ──
+// The per-function erase_section_func_aliases only removes section.funcs entries; it MISSES
+// the fragment trampoline slots and interior-entry/computed-call aliases, so a superseded
+// instance left 2-N stale func_map entries that a computed call (func(0,0)) could resolve to
+// old code under the latest section base => stale data => the geo crash. This range-erases ALL
+// func_map keys in a dead instance's runtime [base,base+size), covering every registration path.
+// Caller holds FuncMapWriteLock (reentrant). Returns count erased.
+static bool frag_unreg_enabled() {
+    static const bool on = []{ const char* e = std::getenv("PSR_FRAG_UNREG"); return !(e && e[0] == '0'); }();
+    return on;
+}
+static uint32_t frag_range_erase(uint32_t base, uint32_t size) {
+    if (size == 0) return 0;
+    FuncMapWriteLock _fml;
+    const uint32_t lo = base, hi = base + size;
+    std::vector<int32_t> doomed;
+    for (const auto& kv : func_map) {
+        uint32_t a = (uint32_t)kv.first;
+        if (a >= lo && a < hi) doomed.push_back(kv.first);
+    }
+    for (int32_t k : doomed) func_map.erase(k);
+    return (uint32_t)doomed.size();
+}
+// Last live runtime range per fragment id (set in register_runtime_fragment). When the same id
+// reloads at a DIFFERENT base, the prior instance is superseded under the current single-latest
+// dispatch model, so its whole runtime range is unregistered (turns stale-wrong-code into a
+// visible miss; Phase 2/3 will instead keep prior live instances dispatchable by range).
+static std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> s_frag_live_range{};
 }  // anon namespace
 
 // Forward declarations — definitions live further down with the rest
@@ -974,6 +1060,164 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
         }
     }
 
+    // Issue #9: the loaded fragment's true resident extent is its FRAGMENT-header
+    // sizeInRam (+0x1C). A recompiled section can NEVER legitimately exceed it.
+    // Binding an oversized variant makes the wrong model's entry code run — recall
+    // func_80019328 does `temp_v0 = ((func)arg1)(0,0)`, dispatching the fragment's
+    // entry through func_map by its runtime address; the wrong variant's compiled
+    // code bakes a fragment-space literal past the loaded fragment, which
+    // Memmap_GetFragmentVaddr converts into the adjacent graph pool ->
+    // process_geo_layout walks it as bytecode -> OOB GeoLayoutJumpTable -> crash
+    // (Starmie / any switch-in, issue #9). So reject candidates whose section.size
+    // exceeds sizeInRam. When sizeInRam is unknown (0) we can't filter, so allow.
+    // Gated by PSR_FRAG_SIZEMATCH (default ON) for emergency A/B.
+    uint32_t frag_size_in_ram = 0;
+    {
+        const uint32_t hdr_paddr = uint32_t(fragment_ptr) & 0x1FFFFFFFu;
+        if (hdr_paddr + 0x20u <= (8u * 1024u * 1024u)) {
+            auto rd_be32_h = [&](uint32_t off) -> uint32_t {
+                return ((uint32_t)rdram[(hdr_paddr + off + 0) ^ 3] << 24) | ((uint32_t)rdram[(hdr_paddr + off + 1) ^ 3] << 16)
+                     | ((uint32_t)rdram[(hdr_paddr + off + 2) ^ 3] << 8)  |  (uint32_t)rdram[(hdr_paddr + off + 3) ^ 3];
+            };
+            // Only trust sizeInRam (+0x1C) when the FRAGMENT magic ("FRAGMENT" at
+            // +0x08/+0x0C) is present. Otherwise leave it 0 so extent filtering is a
+            // no-op and we never reject a section against a garbage size field.
+            if (rd_be32_h(0x08) == 0x46524147u && rd_be32_h(0x0C) == 0x4D454E54u) {
+                frag_size_in_ram = rd_be32_h(0x1C);
+            }
+        }
+    }
+    static const bool psr_size_filter_on = []{ const char* e = std::getenv("PSR_FRAG_SIZEMATCH"); return !(e && e[0] == '0'); }();
+    auto extent_ok = [&](size_t ci) -> bool {
+        if (!psr_size_filter_on) return true;
+        if (frag_size_in_ram == 0) return true;
+        return (uint32_t)sections_info.code_sections[ci].size <= frag_size_in_ram;
+    };
+
+    // Evict every prior recompiled occupant of this runtime base (skipping
+    // skip_index, the section we are about to (re)install, if any). Removes its
+    // runtime + link-time func_map aliases and trampoline-slot entries and resets
+    // its section_addresses entry to the link literal. Used both before installing
+    // a new section AND on the no-bind paths (issue #9): if we leave a fragment
+    // unregistered we MUST still evict the prior variant at this base, otherwise
+    // func(0,0) would dispatch to the stale prior variant's compiled code instead
+    // of missing func_map and falling through to the interpreter on the real bytes.
+    auto evict_prior_at_base = [&](size_t skip_index) {
+        auto evict_it = loaded_sections.begin();
+        while (evict_it != loaded_sections.end()) {
+            if (evict_it->loaded_ram_addr != fragment_ptr ||
+                evict_it->section_table_index == skip_index) {
+                ++evict_it;
+                continue;
+            }
+            const SectionTableEntry& old_section =
+                sections_info.code_sections[evict_it->section_table_index];
+            fprintf(stderr,
+                "[reg-frag] EVICTING old section index=%zu (ram_addr=0x%08X size=0x%X) "
+                "from runtime=0x%08X (installing index=%zd)\n",
+                evict_it->section_table_index, uint32_t(old_section.ram_addr), old_section.size,
+                (uint32_t)fragment_ptr, (ptrdiff_t)skip_index);
+            fflush(stderr);
+            for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
+                const FuncEntry& fe = old_section.funcs[fi];
+                if (fe.func == nullptr) continue;
+                erase_section_func_aliases(old_section, fragment_ptr, fe);
+                // Erase the OLD section's link-time alias too — for
+                // pattern-shared bucket vrams (e.g. 0x8FF00000) this
+                // is critical since multiple sections claim the same
+                // alias, and the freshly-evicted variant's leftover
+                // entries would shadow the new variant if it doesn't
+                // have a func at the same offset.
+                if ((int32_t)old_section.ram_addr != fragment_ptr) {
+                    int32_t link_alias = (int32_t)old_section.ram_addr + (int32_t)fe.offset;
+                    static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
+                    if (probe_s) {
+                        uint32_t probe_a = (uint32_t)std::strtoul(probe_s, nullptr, 0);
+                        if ((uint32_t)link_alias == probe_a) {
+                            fprintf(stderr,
+                                "[probe] EVICT erasing func_map[0x%08X] "
+                                "(old_section=%zu link=0x%08X runtime=0x%08X fe.offset=0x%X)\n",
+                                (uint32_t)link_alias,
+                                evict_it->section_table_index,
+                                (uint32_t)old_section.ram_addr,
+                                (uint32_t)fragment_ptr,
+                                (uint32_t)fe.offset);
+                            fflush(stderr);
+                        }
+                    }
+                    func_map.erase(link_alias);
+                }
+            }
+            // Also drop trampoline-scanner-installed entries (the J-slot
+            // dispatch range from 0x20 up to first real func offset).
+            // The scanner re-runs at the bottom of this function for
+            // the new section.
+            uint32_t first_func_offset = old_section.size;
+            for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
+                if (func_entry_may_be_fragment_jump_slot(old_section.funcs[fi])) {
+                    continue;
+                }
+                uint32_t off = old_section.funcs[fi].offset;
+                if (off > 0 && off < first_func_offset) first_func_offset = off;
+            }
+            for (uint32_t slot_off = 0x20; slot_off + 8 <= first_func_offset; slot_off += 8) {
+                erase_fragment_slot_aliases(old_section, fragment_ptr, slot_off);
+                if ((int32_t)old_section.ram_addr != fragment_ptr) {
+                    int32_t link_slot = (int32_t)old_section.ram_addr + (int32_t)slot_off;
+                    static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
+                    if (probe_s) {
+                        uint32_t probe_a = (uint32_t)std::strtoul(probe_s, nullptr, 0);
+                        if ((uint32_t)link_slot == probe_a) {
+                            fprintf(stderr,
+                                "[probe] EVICT erasing trampoline-slot func_map[0x%08X] "
+                                "(old_section=%zu link=0x%08X runtime=0x%08X slot=0x%X)\n",
+                                (uint32_t)link_slot,
+                                evict_it->section_table_index,
+                                (uint32_t)old_section.ram_addr,
+                                (uint32_t)fragment_ptr,
+                                slot_off);
+                            fflush(stderr);
+                        }
+                    }
+                    func_map.erase(link_slot);
+                }
+            }
+            // Reset the evicted section's address-table entry back to its
+            // link-time vram. The section is no longer resident at this
+            // runtime slot, so any reloc-driven RELOC_HI16/LO16 referencing
+            // it must fall back to the fragment-space literal — matching
+            // Memmap_GetFragmentVaddr. Without this the stale runtime base
+            // corrupts fragment-id math for the evicted fragment.
+            if (section_addresses != nullptr) {
+                secaddr_set(old_section.index, old_section.ram_addr, "evict-rst");
+            }
+            evict_it = loaded_sections.erase(evict_it);
+        }
+    };
+
+    // Issue #9 no-bind cleanup: evict the prior same-base occupant, run the Phase-1
+    // cross-base supersede, and record this instance's live extent — exactly the
+    // bookkeeping the bind path does, minus the func_map install. After this,
+    // func(0,0) at this base misses func_map and the interpreter runs the actual
+    // relocated bytes (the correct model), which never crashes.
+    auto leave_unregistered = [&]() {
+        evict_prior_at_base((size_t)-1);
+        if (frag_unreg_enabled()) {
+            auto prev = s_frag_live_range.find(id);
+            if (prev != s_frag_live_range.end() && prev->second.first != (uint32_t)fragment_ptr) {
+                uint32_t erased = frag_range_erase(prev->second.first, prev->second.second);
+                if (erased) {
+                    fprintf(stderr, "[frag-unreg] id=%u superseded 0x%08X(size0x%X): erased %u stale func_map entries (no-bind new base 0x%08X)\n",
+                            id, prev->second.first, prev->second.second, erased, (uint32_t)fragment_ptr);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (frag_size_in_ram != 0) {
+            s_frag_live_range[id] = { (uint32_t)fragment_ptr, frag_size_in_ram };
+        }
+    };
+
     size_t found_index = (size_t)-1;
     bool has_hashed_candidate = false;
     for (size_t ci : candidates) {
@@ -1005,7 +1249,10 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
 
         for (size_t ci : candidates) {
             const SectionTableEntry& sec = sections_info.code_sections[ci];
-            if (sec.content_hash != 0 && sec.content_hash == live_hash) {
+            // Require the matched variant to fit within the loaded fragment.
+            // A hash match that is oversized is a window collision, not the
+            // real variant — skip it (the final guard would reject it anyway).
+            if (sec.content_hash != 0 && sec.content_hash == live_hash && extent_ok(ci)) {
                 found_index = ci;
                 break;
             }
@@ -1047,7 +1294,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                     const SectionTableEntry& sec = sections_info.code_sections[ci];
                     uint32_t base = uint32_t(sec.ram_addr);
                     uint32_t end  = base + sec.size;
-                    if (hdr_link_vram >= base && hdr_link_vram < end) {
+                    if (hdr_link_vram >= base && hdr_link_vram < end && extent_ok(ci)) {
                         found_index = ci;
                         fprintf(stderr,
                             "[reg-frag] J-trampoline rescue: live link_vram=0x%08X "
@@ -1065,13 +1312,17 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                 // candidates with content_hash are content-addressed; a
                 // mismatch means the live fragment variant is unknown and
                 // must stay unregistered until the generator learns it.
+                size_t nonzero_hash = 0;
+                for (size_t ci : candidates) {
+                    if (sections_info.code_sections[ci].content_hash != 0) nonzero_hash++;
+                }
                 fprintf(stderr,
                     "[reg-frag] no content-hash match for id=0x%X "
-                    "fragment_ptr=0x%08X live_hash=0x%016llX "
-                    "(%zu candidates) — picking first\n",
+                    "fragment_ptr=0x%08X live_hash=0x%016llX sizeInRam=0x%X "
+                    "(%zu candidates, %zu hashed) — deferring to size-fit / unregister\n",
                     id, (uint32_t)fragment_ptr,
-                    (unsigned long long)live_hash,
-                    candidates.size());
+                    (unsigned long long)live_hash, frag_size_in_ram,
+                    candidates.size(), nonzero_hash);
                 for (size_t ci : candidates) {
                     const SectionTableEntry& sec = sections_info.code_sections[ci];
                     fprintf(stderr,
@@ -1110,9 +1361,12 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                     }
                     fclose(f);
                 }
-                if (!has_hashed_candidate) {
-                    found_index = candidates.front();
-                }
+                // Issue #9: do NOT "pick first" — that is exactly how an oversized
+                // wrong variant got bound (size 0x32120 onto a 0x136F0 fragment).
+                // Defer: the unique-size-fit last resort below decides, and if that
+                // is ambiguous the fragment is left UNREGISTERED so func(0,0) misses
+                // func_map and the interpreter executes the actual relocated bytes
+                // (the correct model). Leaving found_index == -1 here.
             }
         }
     }
@@ -1146,7 +1400,7 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                 uint32_t link_vram = j_target - entry_off;
                 for (size_t i = 0; i < sections_info.num_code_sections; i++) {
                     const SectionTableEntry& sec = sections_info.code_sections[i];
-                    if (uint32_t(sec.ram_addr) == link_vram) {
+                    if (uint32_t(sec.ram_addr) == link_vram && extent_ok(i)) {
                         found_index = i;
                         fprintf(stderr,
                             "[reg-frag] J-trampoline fallback rescued id=0x%X (signed=%d): "
@@ -1158,6 +1412,40 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
                     }
                 }
             }
+        }
+    }
+
+    // Issue #9 last resort: hash + J-trampoline both failed to identify the
+    // variant among same-id candidates (the model-slot case: the 0x100-window
+    // hash matched none of the 279 variants). Do NOT pick first. If EXACTLY ONE
+    // candidate fits within the loaded fragment extent, the choice is unambiguous
+    // — bind it. Otherwise leave the fragment UNREGISTERED: func(0,0) then misses
+    // func_map and the interpreter executes the actual relocated bytes (the
+    // correct model's geo code), which is correct (if slower) and never crashes.
+    if (found_index == (size_t)-1 && !candidates.empty() && psr_size_filter_on && frag_size_in_ram != 0) {
+        size_t sole = (size_t)-1; int n_fit = 0;
+        for (size_t ci : candidates) {
+            if ((uint32_t)sections_info.code_sections[ci].size <= frag_size_in_ram) {
+                ++n_fit;
+                if (n_fit == 1) sole = ci;
+            }
+        }
+        if (n_fit == 1) {
+            found_index = sole;
+            fprintf(stderr,
+                "[reg-frag] id=0x%X size-fit last resort: exactly 1 of %zu candidates fits "
+                "sizeInRam=0x%X -> bound section[%zu] size=0x%X\n",
+                id, candidates.size(), frag_size_in_ram, sole,
+                (uint32_t)sections_info.code_sections[sole].size);
+            fflush(stderr);
+        } else {
+            fprintf(stderr,
+                "[reg-frag] id=0x%X NO confident variant: %d of %zu candidates fit "
+                "sizeInRam=0x%X -> leaving UNREGISTERED (interpreter runs actual bytes)\n",
+                id, n_fit, candidates.size(), frag_size_in_ram);
+            fflush(stderr);
+            leave_unregistered();
+            return;
         }
     }
 
@@ -1192,10 +1480,37 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
             magic, hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7],
             hdr[5], hdr[7]);
         fflush(stderr);
+        // A new (if unrecompiled) fragment is being placed at this base, so any
+        // prior recompiled occupant here is now stale — evict it so it can't
+        // dispatch to overwritten code.
+        leave_unregistered();
+        return;
+    }
+
+    // Issue #9 final safety guard: never register a section whose recompiled extent
+    // exceeds the loaded fragment's sizeInRam. A recompiled section is the fragment's
+    // own code/data, so section.size <= sizeInRam is a hard physical invariant; a
+    // larger section means we identified the WRONG variant. Binding it would dispatch
+    // func(0,0) to the wrong model's entry code (the Starmie/switch-in crash). Catch
+    // any selection path that slipped an oversized section through and bail — the
+    // interpreter then runs the actual relocated bytes. (PSR_FRAG_SIZEMATCH=0 disables
+    // the whole size discipline for emergency A/B.)
+    if (psr_size_filter_on && frag_size_in_ram != 0 &&
+        (uint32_t)sections_info.code_sections[found_index].size > frag_size_in_ram) {
+        fprintf(stderr,
+            "[reg-frag] id=0x%X REJECT oversized section[%zu] size=0x%X > sizeInRam=0x%X "
+            "— leaving UNREGISTERED (interpreter runs actual bytes)\n",
+            id, found_index, (uint32_t)sections_info.code_sections[found_index].size, frag_size_in_ram);
+        fflush(stderr);
+        leave_unregistered();
         return;
     }
 
     const SectionTableEntry& section = sections_info.code_sections[found_index];
+
+    // PSR #9: record this concrete instance (size + head-hash now known) into
+    // the historical registry for the address-range / intact-check probe.
+    frag_reg_record(rdram, id, (uint32_t)section.ram_addr, fragment_ptr, (uint32_t)section.size);
 
     // Diagnostic: log every successful registration so we can correlate
     // load order with crash post-mortem. Single line per fragment, includes
@@ -1218,104 +1533,24 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     //
     // Evict the previous section's func_map entries (both runtime
     // alias at this fragment_ptr AND link-time alias) before
-    // registering the new section's. Iterate loaded_sections to
-    // find any prior occupant of this runtime address.
-    auto evict_it = loaded_sections.begin();
-    while (evict_it != loaded_sections.end()) {
-        if (evict_it->loaded_ram_addr != fragment_ptr ||
-            evict_it->section_table_index == found_index) {
-            ++evict_it;
-            continue;
-        }
-        const SectionTableEntry& old_section =
-            sections_info.code_sections[evict_it->section_table_index];
-        fprintf(stderr,
-            "[reg-frag] EVICTING old section index=%zu (ram_addr=0x%08X size=0x%X) "
-            "from runtime=0x%08X before installing new section index=%zu\n",
-            evict_it->section_table_index, uint32_t(old_section.ram_addr), old_section.size,
-            (uint32_t)fragment_ptr, found_index);
-        fflush(stderr);
-        for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
-            const FuncEntry& fe = old_section.funcs[fi];
-            if (fe.func == nullptr) continue;
-            erase_section_func_aliases(old_section, fragment_ptr, fe);
-            // Erase the OLD section's link-time alias too — for
-            // pattern-shared bucket vrams (e.g. 0x8FF00000) this
-            // is critical since multiple sections claim the same
-            // alias, and the freshly-evicted variant's leftover
-            // entries would shadow the new variant if it doesn't
-            // have a func at the same offset.
-            if ((int32_t)old_section.ram_addr != fragment_ptr) {
-                int32_t link_alias = (int32_t)old_section.ram_addr + (int32_t)fe.offset;
-                static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
-                if (probe_s) {
-                    uint32_t probe_a = (uint32_t)std::strtoul(probe_s, nullptr, 0);
-                    if ((uint32_t)link_alias == probe_a) {
-                        fprintf(stderr,
-                            "[probe] EVICT erasing func_map[0x%08X] "
-                            "(old_section=%zu link=0x%08X runtime=0x%08X fe.offset=0x%X)\n",
-                            (uint32_t)link_alias,
-                            evict_it->section_table_index,
-                            (uint32_t)old_section.ram_addr,
-                            (uint32_t)fragment_ptr,
-                            (uint32_t)fe.offset);
-                        fflush(stderr);
-                    }
-                }
-                func_map.erase(link_alias);
+    // registering the new section's. Skip the section we are about to
+    // install so a no-op re-register doesn't churn it.
+    evict_prior_at_base(found_index);
+
+    // Issue #9 Phase 1: if this fragment id previously loaded at a DIFFERENT runtime base,
+    // that prior instance is now superseded — completely unregister its runtime range so its
+    // function-start / trampoline / interior-entry aliases can't resolve to old code under the
+    // new section base. (Same-base reload just overwrites the same keys; no stale residue.)
+    if (frag_unreg_enabled()) {
+        auto prev = s_frag_live_range.find(id);
+        if (prev != s_frag_live_range.end() && prev->second.first != (uint32_t)fragment_ptr) {
+            uint32_t erased = frag_range_erase(prev->second.first, prev->second.second);
+            if (erased) {
+                fprintf(stderr, "[frag-unreg] id=%u superseded 0x%08X(size0x%X): erased %u stale func_map entries (new base 0x%08X)\n",
+                        id, prev->second.first, prev->second.second, erased, (uint32_t)fragment_ptr);
+                fflush(stderr);
             }
         }
-        // Also drop trampoline-scanner-installed entries (the J-slot
-        // dispatch range from 0x20 up to first real func offset).
-        // The scanner re-runs at the bottom of this function for
-        // the new section.
-        uint32_t first_func_offset = old_section.size;
-        for (size_t fi = 0; fi < old_section.num_funcs; fi++) {
-            if (func_entry_may_be_fragment_jump_slot(old_section.funcs[fi])) {
-                continue;
-            }
-            uint32_t off = old_section.funcs[fi].offset;
-            if (off > 0 && off < first_func_offset) first_func_offset = off;
-        }
-        for (uint32_t slot_off = 0x20; slot_off + 8 <= first_func_offset; slot_off += 8) {
-            erase_fragment_slot_aliases(old_section, fragment_ptr, slot_off);
-            if ((int32_t)old_section.ram_addr != fragment_ptr) {
-                int32_t link_slot = (int32_t)old_section.ram_addr + (int32_t)slot_off;
-                static const char* probe_s = std::getenv("PSR_FUNC_MAP_PROBE");
-                if (probe_s) {
-                    uint32_t probe_a = (uint32_t)std::strtoul(probe_s, nullptr, 0);
-                    if ((uint32_t)link_slot == probe_a) {
-                        fprintf(stderr,
-                            "[probe] EVICT erasing trampoline-slot func_map[0x%08X] "
-                            "(old_section=%zu link=0x%08X runtime=0x%08X slot=0x%X)\n",
-                            (uint32_t)link_slot,
-                            evict_it->section_table_index,
-                            (uint32_t)old_section.ram_addr,
-                            (uint32_t)fragment_ptr,
-                            slot_off);
-                        fflush(stderr);
-                    }
-                }
-                func_map.erase(link_slot);
-            }
-        }
-        // Reset the evicted section's address-table entry back to its
-        // link-time vram. The section is no longer resident at this
-        // runtime slot (the new fragment is taking it over), so any
-        // reloc-driven RELOC_HI16/LO16 referencing it must fall back to
-        // the fragment-space literal — matching Memmap_GetFragmentVaddr.
-        // Without this the stale runtime base corrupts fragment-id math
-        // (((addr & 0x0FF00000) >> 20) - 0x10) for the evicted fragment.
-        if (section_addresses != nullptr) {
-            secaddr_set(old_section.index, old_section.ram_addr, "evict-rst");
-        }
-        // Remove from loaded_sections so subsequent registrations
-        // don't see this entry as a "ghost" still occupying the
-        // runtime address. Without this, a re-register would attempt
-        // to evict the same already-evicted section repeatedly, and
-        // fresh fragments at this same runtime addr would all leave
-        // ghost entries behind.
-        evict_it = loaded_sections.erase(evict_it);
     }
 
     // Register every FuncEntry at both the runtime address and the
@@ -1338,6 +1573,10 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
     if (section_addresses != nullptr) {
         secaddr_set(section.index, fragment_ptr, "register");
     }
+
+    // Issue #9 Phase 1: record this instance's live runtime range so the NEXT load of this id
+    // at a different base can supersede-unregister it (above).
+    s_frag_live_range[id] = { (uint32_t)fragment_ptr, (uint32_t)section.size };
 
     // Per-variant synthetic-vram registration: if this section has a
     // synthetic link identity (ram_addr in the synthetic pool), populate
@@ -1552,6 +1791,9 @@ static void unload_overlay_by_section_index(uint32_t section_table_index) {
             const auto& func = section.funcs[func_index];
             erase_section_func_aliases(section, find_it->loaded_ram_addr, func);
         }
+        // Issue #9 Phase 1: also range-erase the whole runtime extent to remove trampoline
+        // slots + interior-entry aliases the per-func erase above doesn't cover.
+        if (frag_unreg_enabled()) frag_range_erase((uint32_t)find_it->loaded_ram_addr, (uint32_t)section.size);
         // Reset the section's address in the address table
         secaddr_set(section.index, section.ram_addr, "unload-idx");
         // Remove the section from the loaded section map
@@ -1603,6 +1845,8 @@ extern "C" void unload_overlays(int32_t ram_addr, uint32_t size) {
                 const auto& func = section.funcs[func_index];
                 erase_section_func_aliases(section, it->loaded_ram_addr, func);
             }
+            // Issue #9 Phase 1: range-erase the whole runtime extent (trampolines + interior aliases).
+            if (frag_unreg_enabled()) frag_range_erase((uint32_t)it->loaded_ram_addr, (uint32_t)section.size);
             // Reset the section's address in the address table
             secaddr_set(section.index, section.ram_addr, "unload-rng");
             // Remove the section from the loaded section map
@@ -1960,9 +2204,143 @@ static void dump_lookup_context(FILE* f, uint8_t* rdram, recomp_context* ctx) {
     dump_lookup_memory_window(f, rdram, "sp+0x8C", (uint32_t)ctx->r29 + 0x8Cu);
     dump_lookup_memory_window(f, rdram, "gp", (uint32_t)ctx->r28);
     dump_lookup_memory_window(f, rdram, "gp+0x53C8", gb_dispatch_slot);
-    dump_lookup_memory_window(f, rdram, "v1", (uint32_t)ctx->r3);
-    dump_lookup_memory_window(f, rdram, "a2", (uint32_t)ctx->r6);
-    dump_lookup_memory_window(f, rdram, "at", (uint32_t)ctx->r1);
+
+    // General pointer-register sweep. Indirect-call crashes vary by site: the
+    // hand-picked v1/a2/at above were for the GB dispatch class, but a vtable
+    // dispatch keeps the object in a0/s0, and a jump-table dispatch (e.g. the
+    // GeoLayoutJumpTable[node->opcode] geo-layout interpreter) keeps the
+    // command pointer / table base / indexed slot in callee-saved + temp
+    // registers (s0/s2/t8). Rather than guess, dump a window around EVERY GPR
+    // that points into the 8 MiB RDRAM window so ANY dispatch crash is
+    // diagnosable straight from the dump — the corrupt geo command bytes, the
+    // wrong branch target, the null/garbage vtable, etc.
+    {
+        const uint64_t sweep[32] = {
+            ctx->r0,  ctx->r1,  ctx->r2,  ctx->r3,  ctx->r4,  ctx->r5,  ctx->r6,  ctx->r7,
+            ctx->r8,  ctx->r9,  ctx->r10, ctx->r11, ctx->r12, ctx->r13, ctx->r14, ctx->r15,
+            ctx->r16, ctx->r17, ctx->r18, ctx->r19, ctx->r20, ctx->r21, ctx->r22, ctx->r23,
+            ctx->r24, ctx->r25, ctx->r26, ctx->r27, ctx->r28, ctx->r29, ctx->r30, ctx->r31,
+        };
+        static const char* snames[32] = {
+            "r0", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+            "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+        };
+        for (uint32_t i = 1; i < 32; i++) {
+            uint32_t v = (uint32_t)sweep[i];
+            // KSEG0/KSEG1 view of the 8 MiB RDRAM window.
+            if (v >= 0x80000000u && (v & 0x1FFFFFFFu) < 0x00800000u) {
+                dump_lookup_memory_window(f, rdram, snames[i], v);
+            }
+        }
+    }
+
+    // PSR issue #9 — geo-layout interpreter walk crash. When the bad indirect
+    // call came from process_geo_layout's dispatch
+    // (`GeoLayoutJumpTable[gGeoLayoutCommand[0]]()`, jalr at 0x80018C00 → ra
+    // 0x80018C08), the geo script pointer left valid geo data. Dump the
+    // interpreter state so we can see WHY: the branch/return stack (each
+    // geo_layout_cmd_branch pushes cmd+8, so these point into the live script),
+    // the indices, the command stream, and the SEGMENT/FRAGMENT tables that
+    // Util_ConvertAddrToVirtAddr → Memmap_Get{Segment,Fragment}Vaddr use to
+    // resolve a branch/jump target (the prime suspect for a wrong resolution).
+    // PSR US (US 1.0) addresses; harmless no-op on any other title/build.
+    if ((uint32_t)ctx->r31 == 0x80018C08u && rdram != nullptr) {
+        const uint32_t kGeoCommand = 0x800ABE00u; // u8*  gGeoLayoutCommand
+        const uint32_t kGeoStack   = 0x800ABD38u; // u32  gGeoLayoutStack[16]
+        const uint32_t kIdxWord0   = 0x800ABDF8u; // s16 gCurGraphNodeIndex, s16 gGeoLayoutStackIndex
+        const uint32_t kIdxWord1   = 0x800ABDFCu; // s16 D_800ABDFC, s16 gGeoLayoutReturnIndex
+        const uint32_t kSegments   = 0x800A5870u; // struct {u32 vaddr,size} gSegments[16]
+        const uint32_t kFragments  = 0x800A58F0u; // struct {u32 vaddr,size} gFragments[240]
+
+        uint32_t cmd  = read_rdram_u32_macro_order(rdram, kGeoCommand);
+        uint32_t w0   = read_rdram_u32_macro_order(rdram, kIdxWord0);
+        uint32_t w1   = read_rdram_u32_macro_order(rdram, kIdxWord1);
+        uint8_t  op   = (uint8_t)(read_rdram_u32_macro_order(rdram, cmd) >> 24);
+        fprintf(f, "  GEO LAYOUT STATE (process_geo_layout dispatch miss):\n");
+        fprintf(f, "    gGeoLayoutCommand=0x%08X  cmd[0]=0x%02X (table has 40 entries)\n", cmd, op);
+        fprintf(f, "    gCurGraphNodeIndex=%d gGeoLayoutStackIndex=%d gGeoLayoutReturnIndex=%d\n",
+                (int16_t)(w0 >> 16), (int16_t)(w0 & 0xFFFF), (int16_t)(w1 & 0xFFFF));
+        fprintf(f, "    gGeoLayoutStack[16] (branch return addrs = branchCmd+8):\n");
+        for (uint32_t i = 0; i < 16; i++) {
+            fprintf(f, "      [%2u] 0x%08X\n", i, read_rdram_u32_macro_order(rdram, kGeoStack + i * 4u));
+        }
+        fprintf(f, "    gSegments[16] (vaddr, size):\n");
+        for (uint32_t i = 0; i < 16; i++) {
+            uint32_t va = read_rdram_u32_macro_order(rdram, kSegments + i * 8u);
+            uint32_t sz = read_rdram_u32_macro_order(rdram, kSegments + i * 8u + 4u);
+            if (va != 0 || sz != 0) fprintf(f, "      seg[%2u] vaddr=0x%08X size=0x%08X\n", i, va, sz);
+        }
+        fprintf(f, "    gFragments[non-null] (vaddr, size):\n");
+        for (uint32_t i = 0; i < 240; i++) {
+            uint32_t va = read_rdram_u32_macro_order(rdram, kFragments + i * 8u);
+            uint32_t sz = read_rdram_u32_macro_order(rdram, kFragments + i * 8u + 4u);
+            if (va != 0 || sz != 0) fprintf(f, "      frag[%3u] vaddr=0x%08X size=0x%08X\n", i, va, sz);
+        }
+        dump_lookup_memory_window(f, rdram, "geoCmd-0x40", cmd - 0x40u);
+        dump_lookup_memory_window(f, rdram, "geoCmd",      cmd);
+        dump_lookup_memory_window(f, rdram, "geoCmd+0x40", cmd + 0x40u);
+
+        // PSR #9 probe: historical fragment-INSTANCE registry with intact-check.
+        // For each recent instance, recompute the head-hash from CURRENT rdram
+        // and compare to the load-time hash:
+        //   INTACT  = bytes unchanged since load -> if a stale graph pointer
+        //             targets this range, the fix is old-instance DISPATCH
+        //             (recoverable via an address-range registry).
+        //   CHANGED = bytes freed/overwritten/reused -> the guest graph is
+        //             genuinely dangling -> an allocator/lifetime problem.
+        // Also flags the instance whose [runtime_base,+size) contains
+        // gGeoLayoutCommand (where the geo walk wandered) — that's the smoking
+        // gun: the geo cmd ptr should land in a geo-source fragment instance,
+        // not the graph pool.
+        uint64_t fr_seq = s_frag_reg_seq.load(std::memory_order_relaxed);
+        uint32_t fr_n = (fr_seq < kFragInstCap) ? (uint32_t)fr_seq : kFragInstCap;
+        fprintf(f, "  FRAG INSTANCE REGISTRY (total loads=%llu, showing last %u):\n",
+                (unsigned long long)fr_seq, fr_n);
+        uint32_t bad_target = (uint32_t)g_last_lookup_miss_addr;
+        for (uint32_t i = 0; i < fr_n; i++) {
+            uint64_t off = fr_seq - fr_n + i;
+            const FragInstance& e = s_frag_inst[off % kFragInstCap];
+            uint64_t now_hash = frag_head_hash(rdram, e.runtime_base, e.size);
+            bool intact = (now_hash == e.head_hash);
+            bool has_cmd = (cmd >= e.runtime_base && cmd < e.runtime_base + e.size);
+            bool has_bad = (bad_target >= e.runtime_base && bad_target < e.runtime_base + e.size);
+            fprintf(f, "    [gen %llu] id=%u link=0x%08X rt=0x%08X size=0x%X count(id)=%u %s%s%s\n",
+                    (unsigned long long)e.generation, e.id, e.link_base, e.runtime_base, e.size,
+                    s_frag_reg_count.count(e.id) ? s_frag_reg_count[e.id] : 0u,
+                    intact ? "INTACT" : "CHANGED",
+                    has_cmd ? " <-gGeoLayoutCommand" : "",
+                    has_bad ? " <-bad_target" : "");
+        }
+
+        // PSR #9 mid-function ALIASING probe: for each historical instance, count func_map
+        // entries still mapped into its runtime range. An instance is SUPERSEDED if a LATER
+        // generation reused its id at a DIFFERENT base (the slot moved). A superseded instance
+        // with funcmap_entries>0 means its function-start / interior-entry / computed-call
+        // aliases were NOT unregistered on reload => stale aliases live => func(0,0) /
+        // computed calls into that range can resolve old code and return stale data (the
+        // upstream cause of the bad geo source). Zero stale entries for superseded instances =>
+        // unregister is complete => aliasing ruled out => it's loader extent / data freshness.
+        fprintf(f, "  FUNC_MAP ALIAS SCAN (funcmap entries per historical instance):\n");
+        for (uint32_t i = 0; i < fr_n; i++) {
+            uint64_t off = fr_seq - fr_n + i;
+            const FragInstance& e = s_frag_inst[off % kFragInstCap];
+            if (e.runtime_base == 0 || e.size == 0) continue;
+            // superseded = a later gen has the same id at a different base.
+            bool superseded = false;
+            for (uint32_t j = i + 1; j < fr_n; j++) {
+                const FragInstance& l = s_frag_inst[(fr_seq - fr_n + j) % kFragInstCap];
+                if (l.id == e.id && l.runtime_base != e.runtime_base) { superseded = true; break; }
+            }
+            uint32_t fm = frag_funcmap_entries_in_range(e.runtime_base, e.runtime_base + e.size);
+            fprintf(f, "    [gen %llu] id=%u rt=[0x%08X,0x%08X) funcmap=%u %s%s\n",
+                    (unsigned long long)e.generation, e.id, e.runtime_base,
+                    e.runtime_base + e.size, fm,
+                    superseded ? "SUPERSEDED" : "current",
+                    (superseded && fm > 0) ? " <-STALE-ALIASES-LIVE" : "");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

@@ -2662,6 +2662,25 @@ static FILE* open_runtime_captures(const char* mode) {
     return f;
 }
 
+// Live snapshot of the self-healing tier counters, for the debug server's
+// `coverage` command. Unlike the runtime_captures.json manifest (rewritten only
+// on a NEW unique miss, so stale mid-run), this reads the atomics directly — so
+// a probe can see dispatch_entry_rejects / interp_runs / self_heals climb during
+// a stall in real time. Out-params may be null.
+extern "C" void recomp_coverage_live(
+    uint64_t* static_hits, uint64_t* lookup_misses, uint64_t* self_heals,
+    uint64_t* self_heal_misses, uint64_t* dispatch_entry_rejects,
+    uint64_t* interp_runs, uint64_t* jit_compiles, uint64_t* jit_failures) {
+    if (static_hits)            *static_hits            = g_tier_static_hits.load();
+    if (lookup_misses)          *lookup_misses          = g_tier_lookup_misses.load();
+    if (self_heals)             *self_heals             = g_tier_self_heals.load();
+    if (self_heal_misses)       *self_heal_misses       = g_tier_self_heal_misses.load();
+    if (dispatch_entry_rejects) *dispatch_entry_rejects = g_tier_dispatch_entry_rejects.load();
+    if (interp_runs)            *interp_runs            = g_tier_interp_runs.load();
+    if (jit_compiles)           *jit_compiles           = g_tier_jit_compiles.load();
+    if (jit_failures)           *jit_failures           = g_tier_jit_failures.load();
+}
+
 // Rewrite the whole captures file from the in-memory map. Cheap: the map
 // holds one entry per UNIQUE missing address (a handful in practice).
 // Called only when a new unique address appears, or once at abort —

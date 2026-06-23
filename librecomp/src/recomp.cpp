@@ -528,7 +528,21 @@ namespace {
     }
 }
 
+// Always-on count of depth-bound tailcall BUBBLE events (generated wrappers call
+// recomp_cf_note("call-bubble-dispatch", ...) when ctx->tailcall_dispatching
+// >= 64 forces a bubble-up instead of a local drain). Lets a probe see whether
+// the >=64 depth bound is being hit — the #17 GB Tower MBC3 stall hypothesis —
+// without enabling full PSR_CFDIAG. Cheap: distinguished by kind[0]=='c' &&
+// kind[5]=='b' ("call-bubble-dispatch"; the other call-* kinds differ at [5]).
+std::atomic<uint64_t> g_bubble_dispatch_count{0};
+extern "C" uint64_t recomp_bubble_dispatch_count(void) {
+    return g_bubble_dispatch_count.load(std::memory_order_relaxed);
+}
+
 extern "C" void recomp_cf_note(const char* kind, uint32_t value0, uint32_t value1, uint32_t value2, recomp_context* ctx) {
+    if (kind != nullptr && kind[0] == 'c' && kind[1] == 'a' && kind[5] == 'b') {
+        g_bubble_dispatch_count.fetch_add(1, std::memory_order_relaxed);
+    }
     if (cfdiag_enabled()) {
         cf_push(kind, value0, value1, value2, 0, ctx);
         if (std::strcmp(kind, "call-nested-return-dispatch") == 0) {

@@ -539,6 +539,25 @@ extern "C" uint64_t recomp_bubble_dispatch_count(void) {
     return g_bubble_dispatch_count.load(std::memory_order_relaxed);
 }
 
+// PROBE (issue #17, behavior-preserving): counts how often the trampoline's
+// `target == host_return_target` break drops a *pending* tailcall. Every pending
+// tailcall was requested only because (at its requesting frame) target !=
+// host_return_target; so a break here means host_return_target CHANGED between
+// request and drain (bubble-unwind restore) — the suspected GB-Tower stall. We
+// capture the last dropped target + the depth at which it fired.
+std::atomic<uint64_t> g_host_return_break_count{0};
+std::atomic<uint32_t> g_host_return_break_last_target{0};
+std::atomic<uint32_t> g_host_return_break_last_depth{0};
+extern "C" uint64_t recomp_host_return_break_count(void) {
+    return g_host_return_break_count.load(std::memory_order_relaxed);
+}
+extern "C" uint32_t recomp_host_return_break_last_target(void) {
+    return g_host_return_break_last_target.load(std::memory_order_relaxed);
+}
+extern "C" uint32_t recomp_host_return_break_last_depth(void) {
+    return g_host_return_break_last_depth.load(std::memory_order_relaxed);
+}
+
 extern "C" void recomp_cf_note(const char* kind, uint32_t value0, uint32_t value1, uint32_t value2, recomp_context* ctx) {
     if (kind != nullptr && kind[0] == 'c' && kind[1] == 'a' && kind[5] == 'b') {
         g_bubble_dispatch_count.fetch_add(1, std::memory_order_relaxed);
@@ -577,6 +596,9 @@ extern "C" void recomp_handle_tailcalls(uint8_t* rdram, recomp_context* ctx) {
         ctx->tailcall_func = nullptr;
 
         if (target == ctx->host_return_target) {
+            g_host_return_break_count.fetch_add(1, std::memory_order_relaxed);
+            g_host_return_break_last_target.store(target, std::memory_order_relaxed);
+            g_host_return_break_last_depth.store(ctx->tailcall_dispatching, std::memory_order_relaxed);
             if (cfdiag_enabled()) {
                 cf_push("tailcall-host-return", target, 0, 0, 0, ctx);
             }

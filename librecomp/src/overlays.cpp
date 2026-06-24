@@ -4569,7 +4569,42 @@ extern "C" recomp_func_t* recomp_lookup_function_or_null(int32_t addr) {
     return (it != func_map.end()) ? it->second : nullptr;
 }
 
+#ifdef PSR_DIVERGENCE_TOOLS
+// Dev-only static-vs-interp divergence localizer (compiled out in production;
+// gated by the WITH_DEV_DIVERGENCE CMake option). Force every DISPATCHED call
+// (computed j/jr/jalr → get_function) into the GB-Tower fragment to run through
+// the R4300i interpreter instead of its recompiled native code, so we can tell
+// a codegen divergence (interp boots Red, native wedges) from a non-codegen
+// timing/event divergence (both behave the same). Matched by the fragment's
+// CURRENT runtime range — section_addresses[9] (the GB-Tower fragment) relocates
+// per load, so a fixed link address would not match. A hit takes the exact same
+// path as a real lookup miss: the interp trampoline runs recomp_interpret_function.
+static bool force_interp_frag9_enabled() {
+    static const bool on = []{
+        const char* e = std::getenv("PSR_FORCE_INTERP_FRAG9");
+        return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+    }();
+    return on;
+}
+static bool addr_in_frag9(int32_t addr) {
+    if (section_addresses == nullptr) return false;
+    uint32_t base = (uint32_t)section_addresses[9];
+    if (base == 0) return false;
+    uint32_t a = (uint32_t)addr;
+    return a >= base && a < base + 0x40000u; // generous bound over the GB-Tower frag
+}
+#endif
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
+#ifdef PSR_DIVERGENCE_TOOLS
+    if (force_interp_frag9_enabled() && addr_in_frag9(addr)) {
+        // Route this dispatched GB-Tower call through the interpreter (same
+        // mechanism as a lookup miss). g_self_heal_addr is thread-local.
+        g_last_lookup_miss_addr = addr;
+        g_self_heal_addr = (uint32_t)addr;
+        return unhandled_lookup_trampoline;
+    }
+#endif
     std::shared_lock<std::shared_mutex> lock(func_map_mutex);
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {

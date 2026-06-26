@@ -55,6 +55,7 @@
 #include "recomp.h"
 #include "recompiler/context.h"
 #include "recompiler/live_recompiler.h"
+#include "recompiler/tcc_recompiler.h"
 #include "overlays.hpp"
 #include "sections.h"
 #include "json/json.hpp"
@@ -2445,8 +2446,13 @@ extern "C" void recomp_capture_interp_target(uint32_t addr);
 // func_map and the generated code bakes in its string/jumptable/section-addr
 // pointers. Freeing any of these would UAF. Guarded by func_map_mutex.
 struct JitEntry {
+    // sljit backend: the LiveGenerator output owns the executable code + its
+    // baked string/jumptable/section-addr storage.
     std::unique_ptr<N64Recomp::LiveGeneratorOutput> output;
     std::unique_ptr<int32_t[]> section_addrs;
+    // tcc backend: the TccRecompOutput owns the TCCState that backs the code.
+    // Exactly one of {output, tcc_output} is set per entry.
+    std::unique_ptr<N64Recomp::TccRecompOutput> tcc_output;
 };
 static std::vector<JitEntry> g_jit_entries;
 
@@ -3280,6 +3286,142 @@ extern "C" recomp_func_t* get_function(int32_t addr);
 // input is untrusted guest bytes. It is ALWAYS called through the SEH-guarded
 // jit_compile_function wrapper below, never directly, so such a fault becomes
 // a graceful failure instead of taking down the process.
+// JIT codegen backend selection. The in-process libtcc backend (CGenerator -> C
+// -> libtcc in-memory) is the default; the legacy in-process sljit LiveGenerator
+// is retained as a fallback during bring-up (PSR_JIT_BACKEND=sljit) and removed
+// once tcc is validated in-game. PSR_JIT_BACKEND=tcc|sljit.
+enum class JitBackend { Tcc, Sljit };
+static JitBackend jit_backend() {
+    static const JitBackend b = []{
+        const char* v = std::getenv("PSR_JIT_BACKEND");
+        if (v && (v[0] == 's' || v[0] == 'S')) return JitBackend::Sljit;
+        return JitBackend::Tcc;
+    }();
+    return b;
+}
+
+// Directory holding the bundled tcc toolchain (libtcc.dll + lib/ + include/),
+// shipped beside the host executable. PSR_TCC_DIR overrides; otherwise probe
+// <exe_dir>/tcc then <exe_dir>/lib/tcc. Empty result => libtcc loads from the
+// default OS search path (PATH / exe dir). Resolved once.
+static const std::string& tcc_toolchain_dir() {
+    static const std::string dir = []() -> std::string {
+        if (const char* env = std::getenv("PSR_TCC_DIR"); env && *env) {
+            return env;
+        }
+        std::error_code ec;
+        std::filesystem::path exe_dir;
+#if defined(_WIN32)
+        char buf[MAX_PATH];
+        DWORD n = GetModuleFileNameA(nullptr, buf, (DWORD)sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) {
+            exe_dir = std::filesystem::path(buf).parent_path();
+        }
+#endif
+        if (!exe_dir.empty()) {
+            for (const char* sub : {"tcc", "lib/tcc"}) {
+                std::filesystem::path cand = exe_dir / sub;
+                if (std::filesystem::exists(cand / "libtcc.dll", ec) ||
+                    std::filesystem::exists(cand, ec)) {
+                    return cand.string();
+                }
+            }
+        }
+        return std::string();
+    }();
+    return dir;
+}
+
+// Codegen one discovered function via the active backend into a callable
+// recomp_func_t*, taking ownership of the backing storage in `entry_out` (which
+// the caller stores in g_jit_entries). Returns null + sets `err` on failure.
+// `ctx` is the minimal single-section/single-function context; `vram` is the
+// function's runtime base (also section 0's address).
+static recomp_func_t* codegen_function(N64Recomp::Context& ctx, uint32_t vram,
+                                       std::unique_ptr<int32_t[]>& section_addrs,
+                                       JitEntry& entry_out, size_t* out_code_size,
+                                       std::string& err) {
+    using namespace N64Recomp;
+    if (jit_backend() == JitBackend::Tcc) {
+        // Bind the host runtime helpers the shard calls. All are CODE symbols
+        // (tcc_add_symbol resolves these); the lone DATA symbol,
+        // section_addresses, is defined inside the shard from the bases below.
+        // Every host runtime helper the CGenerator output can call. These are all
+        // CODE symbols (tcc_add_symbol resolves them); the lone DATA symbol,
+        // section_addresses, is defined inside the shard. Unreferenced bindings
+        // are harmless no-ops, so bind the complete set the C emitter may emit —
+        // a single missed helper makes tcc_relocate fail the whole function.
+        // (get_cop1_cs/set_cop1_cs are static-inline in recomp.h, so inlined into
+        // the shard — no binding needed. recomp_trigger_event is mod-only and not
+        // declared here.) fesetround/fegetround come from the host UCRT because
+        // tcc 0.9.27's bundled msvcrt.def doesn't export them.
+        std::vector<TccSymbol> syms = {
+            {"get_function",                   (const void*)&get_function},
+            {"cop0_status_read",               (const void*)&cop0_status_read},
+            {"cop0_status_write",              (const void*)&cop0_status_write},
+            {"switch_error",                   (const void*)&switch_error},
+            {"do_break",                       (const void*)&do_break},
+            {"recomp_handle_tailcalls",        (const void*)&recomp_handle_tailcalls},
+            {"recomp_cf_note",                 (const void*)&recomp_cf_note},
+            {"ultramodern_scheduler_tick_vram",(const void*)&ultramodern_scheduler_tick_vram},
+            {"pause_self",                     (const void*)&pause_self},
+            {"recomp_unhandled_branch",        (const void*)&recomp_unhandled_branch},
+            {"recomp_unhandled_call",          (const void*)&recomp_unhandled_call},
+            {"recomp_unhandled_instruction",   (const void*)&recomp_unhandled_instruction},
+            {"fesetround",                     (const void*)&fesetround},
+            {"fegetround",                     (const void*)&fegetround},
+        };
+        std::vector<int32_t> secaddrs = { (int32_t)vram };
+        TccToolchain tk; tk.toolchain_dir = tcc_toolchain_dir();
+        TccRecompOutput tcc_out = recompile_function_tcc(ctx, 0, syms, secaddrs, tk);
+        if (!tcc_out.good()) {
+            err = "tcc backend: " + tcc_out.error;
+            return nullptr;
+        }
+        recomp_func_t* fn = tcc_out.func;
+        if (out_code_size) *out_code_size = tcc_out.code_size;
+        entry_out.tcc_output = std::make_unique<TccRecompOutput>(std::move(tcc_out));
+        return fn;
+    }
+
+    // sljit (legacy) backend.
+    LiveGeneratorInputs inputs{};
+    inputs.base_event_index = 0;
+    inputs.cop0_status_write = cop0_status_write;
+    inputs.cop0_status_read = cop0_status_read;
+    inputs.switch_error = switch_error;
+    inputs.do_break = do_break;
+    inputs.get_function = get_function;
+    inputs.syscall_handler = nullptr;
+    inputs.pause_self = nullptr;
+    inputs.trigger_event = nullptr;
+    inputs.reference_section_addresses = section_addrs.get();
+    inputs.local_section_addresses = section_addrs.get();
+    inputs.run_hook = nullptr;
+    inputs.original_section_indices = std::vector<size_t>{0};
+
+    LiveGenerator generator{ ctx.functions.size(), inputs };
+    std::ostringstream dummy_ostream;
+    std::vector<std::vector<uint32_t>> dummy_static_funcs(ctx.sections.size());
+    if (!recompile_function_live(generator, ctx, 0, dummy_ostream,
+                                 dummy_static_funcs, false)) {
+        err = "recompile_function_live failed (unsupported instruction / "
+              "jump table / reference symbol)";
+        return nullptr;
+    }
+    auto output = std::make_unique<LiveGeneratorOutput>(generator.finish());
+    if (!output->good || output->functions.empty() ||
+        output->functions[0] == nullptr) {
+        err = "live generator produced no usable function";
+        return nullptr;
+    }
+    recomp_func_t* fn = output->functions[0];
+    if (out_code_size) *out_code_size = output->code_size;
+    entry_out.output = std::move(output);
+    entry_out.section_addrs = std::move(section_addrs);
+    return fn;
+}
+
 static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
                                          std::string& err,
                                          bool keep, bool register_in_map,
@@ -3360,59 +3502,31 @@ static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
     auto section_addrs = std::make_unique<int32_t[]>(1);
     section_addrs[0] = (int32_t)vram;
 
-    LiveGeneratorInputs inputs{};
-    inputs.base_event_index = 0;
-    inputs.cop0_status_write = cop0_status_write;
-    inputs.cop0_status_read = cop0_status_read;
-    inputs.switch_error = switch_error;
-    inputs.do_break = do_break;
-    inputs.get_function = get_function;
-    inputs.syscall_handler = nullptr;
-    inputs.pause_self = nullptr;     // vanilla overlay funcs don't pause_self
-    inputs.trigger_event = nullptr;  // ...or trigger mod events
-    inputs.reference_section_addresses = section_addrs.get();
-    inputs.local_section_addresses = section_addrs.get();
-    inputs.run_hook = nullptr;
-    inputs.original_section_indices = std::vector<size_t>{0};
-
-    LiveGenerator generator{ ctx.functions.size(), inputs };
-    std::ostringstream dummy_ostream;
-    // Must have one entry per section: recompile_function_impl writes
-    // jal/jalr link targets into static_funcs_out[section_index]. An empty
-    // span here is an out-of-bounds write (crash) on the first in-section
-    // call. We discard the contents, but the storage must exist.
-    std::vector<std::vector<uint32_t>> dummy_static_funcs(ctx.sections.size());
-    if (!recompile_function_live(generator, ctx, 0, dummy_ostream,
-                                 dummy_static_funcs, false)) {
-        err = "recompile_function_live failed (unsupported instruction / "
-              "jump table / reference symbol)";
-        return nullptr;
-    }
-    auto output = std::make_unique<LiveGeneratorOutput>(generator.finish());
-    if (!output->good || output->functions.empty() ||
-        output->functions[0] == nullptr) {
-        err = "live generator produced no usable function";
-        return nullptr;
+    // 6. Codegen via the active backend (tcc by default, sljit fallback). The
+    //    returned JitEntry owns whichever backend's backing storage; we keep it
+    //    alive (see step 7) so the baked pointers / TCCState never free.
+    JitEntry entry{};
+    recomp_func_t* jitted = codegen_function(ctx, vram, section_addrs, entry,
+                                             out_code_size, err);
+    if (jitted == nullptr) {
+        return nullptr;  // err populated by codegen_function
     }
 
-    recomp_func_t* jitted = output->functions[0];
     if (out_func_size) *out_func_size = func_size;
-    if (out_code_size) *out_code_size = output->code_size;
     if (!keep) {
-        // Validation path: proven good; discard (output + section_addrs freed
+        // Validation path: proven good; discard (entry's backend storage freed
         // here). Return a non-null sentinel meaning "compiled OK, not kept".
         // The caller must NOT call it.
         return reinterpret_cast<recomp_func_t*>(0x1);
     }
-    // 6. Keep output + section-addr array alive for the program lifetime.
+    // 7. Keep the backend storage alive for the program lifetime.
     //    register_in_map=true (B3) also puts it in func_map so all future calls
     //    hit the static fast path; the fragment tier (slice 3) keeps it alive
     //    but OUT of func_map (it is reached only through the content-keyed,
     //    per-dispatch-validated path).
     {
         std::unique_lock<std::shared_mutex> lock(func_map_mutex);
-        g_jit_entries.push_back(
-            JitEntry{ std::move(output), std::move(section_addrs) });
+        g_jit_entries.push_back(std::move(entry));
         if (register_in_map) {
             func_map[(int32_t)vram] = jitted;
         }
@@ -4595,6 +4709,299 @@ static bool addr_in_frag9(int32_t addr) {
 }
 #endif
 
+#ifdef PSR_TCC_DEV_TOOLS
+// ════════════════════════════════════════════════════════════════════════════
+// DEV-ONLY tcc validation/demo harness (CMake -DPSR_TCC_DEV_TOOLS=ON). NOT built
+// into production: it double-runs functions / swaps tcc twins into func_map to
+// validate and demonstrate the tcc backend against the static clang build. The
+// production tcc backend itself is jit_compile_inner/codegen_function, always
+// present and unaffected by this flag.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── tcc-vs-static A/B validation (PSR_TCC_AB) ────────────────────────────────
+// Proves the in-process tcc backend's codegen MATCHES the trusted static
+// (clang-cl) build, which is the gold reference on n64 (the psx "gcc shard"
+// equivalent). For a sampled static function we compile a tcc twin and, on the
+// REAL live entry state of an actual call, run BOTH and diff GPR/FPR/hi-lo + the
+// 8 MiB kseg0 RAM. The static result is ALWAYS what we commit, so the game runs
+// exactly as it would normally — this is a pure observer. sljit and the
+// interpreter never participate. Off by default; PSR_TCC_AB=1 arms it.
+//
+// Execution-driven by design (no synthetic inputs => no codegen-irrelevant
+// divergence, no infinite loops): we only ever validate on states the game
+// actually produced. Coverage is the INDIRECT-call subset (calls routed through
+// get_function / LOOKUP_FUNC); direct static->static calls are not interceptable
+// here without a regen entry-hook. The report logs exactly how many distinct
+// functions were covered so the cap is never silent.
+static bool tcc_ab_enabled() {
+    static const bool on = []{
+        const char* v = std::getenv("PSR_TCC_AB");
+        return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+    }();
+    return on;
+}
+static uint32_t tcc_ab_func_cap() {
+    static const uint32_t c = []{
+        const char* v = std::getenv("PSR_TCC_AB_CAP");
+        uint32_t n = v ? (uint32_t)strtoul(v, nullptr, 10) : 0;
+        return n ? n : 256u;   // distinct functions to validate
+    }();
+    return c;
+}
+static uint32_t tcc_ab_per_func() {
+    static const uint32_t c = []{
+        const char* v = std::getenv("PSR_TCC_AB_PER");
+        uint32_t n = v ? (uint32_t)strtoul(v, nullptr, 10) : 0;
+        return n ? n : 16u;    // validations per function (cap real-input vectors)
+    }();
+    return c;
+}
+
+enum class AbState { PendingCompile, Armed, Skip };
+struct AbEntry {
+    recomp_func_t* static_fn = nullptr;  // trusted clang reference (func_map entry)
+    recomp_func_t* tcc_fn = nullptr;     // tcc twin (kept alive in g_jit_entries)
+    AbState state = AbState::PendingCompile;
+    uint32_t runs = 0;
+    uint32_t diverge = 0;
+};
+static std::mutex g_ab_mutex;
+static std::unordered_map<uint32_t, AbEntry> g_ab_entries;   // g_ab_mutex
+static std::atomic<uint32_t> g_ab_armed_count{0};
+static std::atomic<uint64_t> g_ab_total_runs{0};
+static std::atomic<uint64_t> g_ab_total_clean{0};
+static std::atomic<uint64_t> g_ab_total_diverge{0};
+static std::atomic<uint64_t> g_ab_compile_fail{0};
+static std::atomic<uint64_t> g_ab_nonleaf_skip{0};
+
+// Set by get_function right before it returns the A/B trampoline, consumed by the
+// trampoline on the same thread in the same `get_function(v)(rdram,ctx)` expr.
+static thread_local uint32_t t_ab_pending_vram = 0;
+// Re-entrancy guard: while validating, nested get_function calls return the real
+// static function (no nested A/B, no recursion).
+static thread_local bool t_ab_active = false;
+
+extern "C" void recomp_tcc_ab_report() {
+    if (!tcc_ab_enabled()) return;
+    std::fprintf(stderr,
+        "[tcc-AB] functions=%u/%u runs=%llu clean=%llu diverge=%llu "
+        "compile_fail=%llu nonleaf_skip=%llu\n",
+        g_ab_armed_count.load(), tcc_ab_func_cap(),
+        (unsigned long long)g_ab_total_runs.load(),
+        (unsigned long long)g_ab_total_clean.load(),
+        (unsigned long long)g_ab_total_diverge.load(),
+        (unsigned long long)g_ab_compile_fail.load(),
+        (unsigned long long)g_ab_nonleaf_skip.load());
+    std::fflush(stderr);
+}
+
+// The actual differential, run on the real live (rdram, ctx) of one call.
+static void tcc_ab_run(uint8_t* rdram, recomp_context* ctx, uint32_t vram) {
+    constexpr size_t RAM = 0x800000;
+    static thread_local std::vector<uint8_t> ram0, ramS;
+    ram0.resize(RAM);
+    ramS.resize(RAM);
+
+    t_ab_active = true;
+
+    // Read the entry's current state under g_ab_mutex, but do NOT hold it across
+    // the twin compile: jit_compile_function takes func_map_mutex, and
+    // get_function holds func_map_mutex(shared) then takes g_ab_mutex — holding
+    // g_ab_mutex across the compile would invert that order and can deadlock.
+    recomp_func_t* static_fn = nullptr;
+    recomp_func_t* tcc_fn = nullptr;
+    bool need_compile = false;
+    {
+        std::lock_guard<std::mutex> g(g_ab_mutex);
+        auto it = g_ab_entries.find(vram);
+        if (it == g_ab_entries.end()) { t_ab_active = false; return; }
+        AbEntry& e = it->second;
+        static_fn = e.static_fn;
+        if (e.state == AbState::PendingCompile)              need_compile = true;
+        else if (e.state == AbState::Armed && e.runs < tcc_ab_per_func()) {
+            e.runs++; tcc_fn = e.tcc_fn;
+        }
+    }
+
+    if (need_compile) {
+        // Compile the tcc twin once, holding NO lock. jit_compile_function uses
+        // the active backend (tcc by default) and keeps the shard alive in
+        // g_jit_entries WITHOUT touching func_map (register_in_map=false).
+        std::string err;
+        size_t fsz = 0;
+        recomp_func_t* twin = jit_compile_function(vram, rdram, err,
+            /*keep=*/true, /*register_in_map=*/false, &fsz, nullptr);
+        const bool good = twin != nullptr && twin != reinterpret_cast<recomp_func_t*>(0x1);
+        const bool leaf = good && fragment_is_safe_leaf(rdram, vram, (uint32_t)fsz);
+        std::lock_guard<std::mutex> g(g_ab_mutex);
+        AbEntry& e = g_ab_entries[vram];
+        if (!good) {
+            e.state = AbState::Skip;
+            g_ab_compile_fail.fetch_add(1, std::memory_order_relaxed);
+        } else if (!leaf) {
+            // Non-leaf calls other functions => double-running it would double
+            // its side effects (the 8 MiB snapshot can't restore host-side HLE
+            // state). Validate leaves only (precision over recall).
+            e.state = AbState::Skip;
+            g_ab_nonleaf_skip.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            e.tcc_fn = twin;
+            e.state = AbState::Armed;
+            e.runs++;
+            tcc_fn = e.tcc_fn;   // validate this call too
+        }
+    }
+
+    if (tcc_fn == nullptr) {
+        // Skipped / capped / compile-failed: run the trusted static fn normally.
+        if (static_fn) static_fn(rdram, ctx);
+        t_ab_active = false;
+        return;
+    }
+
+    // PASS 1 — static (clang) reference, captured from the live input snapshot.
+    const recomp_context ctx0 = *ctx;
+    std::memcpy(ram0.data(), rdram, RAM);
+    static_fn(rdram, ctx);
+    const recomp_context ctxS = *ctx;
+    std::memcpy(ramS.data(), rdram, RAM);
+
+    // Restore the identical input, then PASS 2 — tcc twin.
+    *ctx = ctx0;
+    std::memcpy(rdram, ram0.data(), RAM);
+    tcc_fn(rdram, ctx);
+    const bool clean = shadow_regs_equal(ctx, &ctxS) &&
+                       std::memcmp(rdram, ramS.data(), RAM) == 0;
+
+    // COMMIT the trusted static result (the game proceeds exactly as normal).
+    *ctx = ctxS;
+    std::memcpy(rdram, ramS.data(), RAM);
+
+    const uint64_t total = g_ab_total_runs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (clean) {
+        g_ab_total_clean.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_ab_total_diverge.fetch_add(1, std::memory_order_relaxed);
+        uint32_t d;
+        { std::lock_guard<std::mutex> g(g_ab_mutex); d = ++g_ab_entries[vram].diverge; }
+        if (d <= 3) {
+            std::fprintf(stderr,
+                "[tcc-AB] DIVERGENCE: fn 0x%08X — tcc output != static (clang). "
+                "occurrence %u\n", vram, d);
+            FILE* f = open_last_error_log("a");
+            if (f) {
+                std::fprintf(f, "tcc-AB DIVERGENCE fn=0x%08X occ=%u\n", vram, d);
+                std::fclose(f);
+            }
+        }
+    }
+    if ((total % 64) == 0) recomp_tcc_ab_report();   // live progress on stderr
+    t_ab_active = false;
+}
+
+// The trampoline get_function hands back for an armed function. Reads the vram
+// stashed by get_function on this thread and runs the differential.
+static void tcc_ab_trampoline(uint8_t* rdram, recomp_context* ctx) {
+    tcc_ab_run(rdram, ctx, t_ab_pending_vram);
+}
+
+// Decide whether to intercept this static dispatch with the A/B trampoline.
+// Returns the trampoline (after stashing vram) or nullptr to use the static fn.
+static recomp_func_t* tcc_ab_intercept(uint32_t vram, recomp_func_t* static_fn) {
+    std::lock_guard<std::mutex> g(g_ab_mutex);
+    auto it = g_ab_entries.find(vram);
+    if (it == g_ab_entries.end()) {
+        if (g_ab_armed_count.load() >= tcc_ab_func_cap()) return nullptr;  // cap reached
+        g_ab_armed_count.fetch_add(1, std::memory_order_relaxed);
+        AbEntry e; e.static_fn = static_fn; e.state = AbState::PendingCompile;
+        g_ab_entries.emplace(vram, e);
+        t_ab_pending_vram = vram;
+        return tcc_ab_trampoline;
+    }
+    AbEntry& e = it->second;
+    if (e.state == AbState::Skip) return nullptr;
+    if (e.state == AbState::Armed && e.runs >= tcc_ab_per_func()) return nullptr;  // done with this fn
+    t_ab_pending_vram = vram;
+    return tcc_ab_trampoline;
+}
+
+// ── tcc-RUN: make tcc the REAL backend for sampled functions (PSR_TCC_RUN=N) ──
+// Unlike the A/B harness (observe-only, commits the static result), this REPLACES
+// the static (clang) function in func_map with a tcc twin, so the game actually
+// EXECUTES tcc-compiled code as its implementation — the same thing that happens
+// on a fragment game when tcc fills a real miss. Single execution (no two-pass
+// diff), so non-leaf functions are fine: a tcc twin runs once and calls its
+// callees through get_function exactly as the static version would. Converts up
+// to N distinct sampled indirectly-dispatched functions, then stops. Off by
+// default. This is the "see tcc run" switch; pair with PSR_TCC_AB to also verify
+// correctness on the (rarer) leaf functions.
+static uint32_t tcc_run_cap() {
+    static const uint32_t n = []{
+        const char* v = std::getenv("PSR_TCC_RUN");
+        return v ? (uint32_t)strtoul(v, nullptr, 10) : 0u;  // 0 = disabled
+    }();
+    return n;
+}
+static std::unordered_map<uint32_t, recomp_func_t*> g_run_static;  // g_ab_mutex: vram -> clang fn (fallback)
+static std::unordered_set<uint32_t> g_run_done;                    // g_ab_mutex: already converted
+static std::atomic<uint32_t> g_run_reserved{0};                    // slots taken (<= cap)
+static std::atomic<uint32_t> g_run_installed{0};                   // tcc twins live in func_map
+static thread_local uint32_t t_run_pending_vram = 0;
+static thread_local bool t_run_active = false;                     // no nested conversion mid-run
+
+static void tcc_run_trampoline(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t vram = t_run_pending_vram;
+    recomp_func_t* static_fn = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_ab_mutex);
+        auto it = g_run_static.find(vram);
+        if (it != g_run_static.end()) static_fn = it->second;
+    }
+    // Compile the tcc twin and INSTALL it into func_map (register_in_map=true),
+    // so this and every future indirect call to vram executes tcc. No lock held.
+    std::string err;
+    size_t fsz = 0;
+    t_run_active = true;
+    recomp_func_t* twin = jit_compile_function(vram, rdram, err,
+        /*keep=*/true, /*register_in_map=*/true, &fsz, nullptr);
+    const bool good = twin != nullptr && twin != reinterpret_cast<recomp_func_t*>(0x1);
+    if (good) {
+        bool leaf = fragment_is_safe_leaf(rdram, vram, (uint32_t)fsz);
+        uint32_t n = g_run_installed.fetch_add(1, std::memory_order_relaxed) + 1;
+        { std::lock_guard<std::mutex> g(g_ab_mutex); g_run_done.insert(vram); }
+        std::fprintf(stderr,
+            "[tcc-RUN] 0x%08X now executes TCC (leaf=%d, size=%zu)  [%u/%u installed]\n",
+            vram, leaf ? 1 : 0, fsz, n, tcc_run_cap());
+        std::fflush(stderr);
+        t_run_active = false;
+        twin(rdram, ctx);                 // RUN the tcc twin as the real impl
+        return;
+    }
+    // Compile failed: give the slot back and run the trusted static fn.
+    g_run_reserved.fetch_sub(1, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> g(g_ab_mutex); g_run_done.insert(vram); }  // don't retry
+    std::fprintf(stderr, "[tcc-RUN] 0x%08X tcc compile FAILED (%s) — staying on static\n",
+                 vram, err.c_str());
+    std::fflush(stderr);
+    t_run_active = false;
+    if (static_fn) static_fn(rdram, ctx);
+}
+
+// Returns the conversion trampoline (and reserves a slot) or nullptr to use the
+// static fn. Reaches only indirectly-dispatched functions (get_function), which
+// is exactly where tcc can take over on PSR.
+static recomp_func_t* tcc_run_intercept(uint32_t vram, recomp_func_t* static_fn) {
+    if (t_run_active) return nullptr;
+    std::lock_guard<std::mutex> g(g_ab_mutex);
+    if (g_run_done.count(vram)) return nullptr;           // already converted / decided
+    if (g_run_reserved.load() >= tcc_run_cap()) return nullptr;
+    g_run_reserved.fetch_add(1, std::memory_order_relaxed);
+    g_run_static[vram] = static_fn;
+    t_run_pending_vram = vram;
+    return tcc_run_trampoline;
+}
+#endif // PSR_TCC_DEV_TOOLS
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
 #ifdef PSR_DIVERGENCE_TOOLS
     if (force_interp_frag9_enabled() && addr_in_frag9(addr)) {
@@ -4649,6 +5056,22 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         return unhandled_lookup_trampoline;
     }
     g_tier_static_hits.fetch_add(1, std::memory_order_relaxed);
+#ifdef PSR_TCC_DEV_TOOLS
+    // DEV-ONLY validation hooks (compiled out of production). Both reach only the
+    // indirect-dispatch subset, which is exactly where tcc can take over on PSR.
+    // PSR_TCC_RUN: swap a tcc twin into func_map so the game EXECUTES tcc.
+    if (tcc_run_cap() != 0 && !t_run_active) {
+        recomp_func_t* tr = tcc_run_intercept((uint32_t)addr, func_find->second);
+        if (tr) return tr;
+    }
+    // PSR_TCC_AB: observe-only shadow diff vs the static (clang) result, which is
+    // always committed, so this never changes behavior. t_ab_active guards
+    // against nested validation while a diff is running.
+    if (tcc_ab_enabled() && !t_ab_active) {
+        recomp_func_t* tr = tcc_ab_intercept((uint32_t)addr, func_find->second);
+        if (tr) return tr;
+    }
+#endif // PSR_TCC_DEV_TOOLS
     return func_find->second;
 }
 

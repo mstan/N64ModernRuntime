@@ -54,7 +54,6 @@
 
 #include "recomp.h"
 #include "recompiler/context.h"
-#include "recompiler/live_recompiler.h"
 #include "recompiler/tcc_recompiler.h"
 #include "overlays.hpp"
 #include "sections.h"
@@ -2446,12 +2445,8 @@ extern "C" void recomp_capture_interp_target(uint32_t addr);
 // func_map and the generated code bakes in its string/jumptable/section-addr
 // pointers. Freeing any of these would UAF. Guarded by func_map_mutex.
 struct JitEntry {
-    // sljit backend: the LiveGenerator output owns the executable code + its
-    // baked string/jumptable/section-addr storage.
-    std::unique_ptr<N64Recomp::LiveGeneratorOutput> output;
-    std::unique_ptr<int32_t[]> section_addrs;
-    // tcc backend: the TccRecompOutput owns the TCCState that backs the code.
-    // Exactly one of {output, tcc_output} is set per entry.
+    // The TccRecompOutput owns the TCCState that backs the executable code, so
+    // it must outlive every call to the compiled function.
     std::unique_ptr<N64Recomp::TccRecompOutput> tcc_output;
 };
 static std::vector<JitEntry> g_jit_entries;
@@ -3267,20 +3262,6 @@ extern "C" recomp_func_t* get_function(int32_t addr);
 // input is untrusted guest bytes. It is ALWAYS called through the SEH-guarded
 // jit_compile_function wrapper below, never directly, so such a fault becomes
 // a graceful failure instead of taking down the process.
-// JIT codegen backend selection. The in-process libtcc backend (CGenerator -> C
-// -> libtcc in-memory) is the default; the legacy in-process sljit LiveGenerator
-// is retained as a fallback during bring-up (PSR_JIT_BACKEND=sljit) and removed
-// once tcc is validated in-game. PSR_JIT_BACKEND=tcc|sljit.
-enum class JitBackend { Tcc, Sljit };
-static JitBackend jit_backend() {
-    static const JitBackend b = []{
-        const char* v = std::getenv("PSR_JIT_BACKEND");
-        if (v && (v[0] == 's' || v[0] == 'S')) return JitBackend::Sljit;
-        return JitBackend::Tcc;
-    }();
-    return b;
-}
-
 // Directory holding the bundled tcc toolchain (libtcc.dll + lib/ + include/),
 // shipped beside the host executable. PSR_TCC_DIR overrides; otherwise probe
 // <exe_dir>/tcc then <exe_dir>/lib/tcc. Empty result => libtcc loads from the
@@ -3313,93 +3294,51 @@ static const std::string& tcc_toolchain_dir() {
     return dir;
 }
 
-// Codegen one discovered function via the active backend into a callable
-// recomp_func_t*, taking ownership of the backing storage in `entry_out` (which
-// the caller stores in g_jit_entries). Returns null + sets `err` on failure.
-// `ctx` is the minimal single-section/single-function context; `vram` is the
+// Codegen one discovered function via the in-process libtcc backend into a
+// callable recomp_func_t*, taking ownership of the backing storage (the
+// TccRecompOutput, which owns the executable memory) in `entry_out` (which the
+// caller stores in g_jit_entries). Returns null + sets `err` on failure. `ctx`
+// is the minimal single-section/single-function context; `vram` is the
 // function's runtime base (also section 0's address).
 static recomp_func_t* codegen_function(N64Recomp::Context& ctx, uint32_t vram,
-                                       std::unique_ptr<int32_t[]>& section_addrs,
                                        JitEntry& entry_out, size_t* out_code_size,
                                        std::string& err) {
     using namespace N64Recomp;
-    if (jit_backend() == JitBackend::Tcc) {
-        // Bind the host runtime helpers the shard calls. All are CODE symbols
-        // (tcc_add_symbol resolves these); the lone DATA symbol,
-        // section_addresses, is defined inside the shard from the bases below.
-        // Every host runtime helper the CGenerator output can call. These are all
-        // CODE symbols (tcc_add_symbol resolves them); the lone DATA symbol,
-        // section_addresses, is defined inside the shard. Unreferenced bindings
-        // are harmless no-ops, so bind the complete set the C emitter may emit —
-        // a single missed helper makes tcc_relocate fail the whole function.
-        // (get_cop1_cs/set_cop1_cs are static-inline in recomp.h, so inlined into
-        // the shard — no binding needed. recomp_trigger_event is mod-only and not
-        // declared here.) fesetround/fegetround come from the host UCRT because
-        // tcc 0.9.27's bundled msvcrt.def doesn't export them.
-        std::vector<TccSymbol> syms = {
-            {"get_function",                   (const void*)&get_function},
-            {"cop0_status_read",               (const void*)&cop0_status_read},
-            {"cop0_status_write",              (const void*)&cop0_status_write},
-            {"switch_error",                   (const void*)&switch_error},
-            {"do_break",                       (const void*)&do_break},
-            {"recomp_handle_tailcalls",        (const void*)&recomp_handle_tailcalls},
-            {"recomp_cf_note",                 (const void*)&recomp_cf_note},
-            {"ultramodern_scheduler_tick_vram",(const void*)&ultramodern_scheduler_tick_vram},
-            {"pause_self",                     (const void*)&pause_self},
-            {"recomp_unhandled_branch",        (const void*)&recomp_unhandled_branch},
-            {"recomp_unhandled_call",          (const void*)&recomp_unhandled_call},
-            {"recomp_unhandled_instruction",   (const void*)&recomp_unhandled_instruction},
-            {"fesetround",                     (const void*)&fesetround},
-            {"fegetround",                     (const void*)&fegetround},
-        };
-        std::vector<int32_t> secaddrs = { (int32_t)vram };
-        TccToolchain tk; tk.toolchain_dir = tcc_toolchain_dir();
-        TccRecompOutput tcc_out = recompile_function_tcc(ctx, 0, syms, secaddrs, tk);
-        if (!tcc_out.good()) {
-            err = "tcc backend: " + tcc_out.error;
-            return nullptr;
-        }
-        recomp_func_t* fn = tcc_out.func;
-        if (out_code_size) *out_code_size = tcc_out.code_size;
-        entry_out.tcc_output = std::make_unique<TccRecompOutput>(std::move(tcc_out));
-        return fn;
-    }
-
-    // sljit (legacy) backend.
-    LiveGeneratorInputs inputs{};
-    inputs.base_event_index = 0;
-    inputs.cop0_status_write = cop0_status_write;
-    inputs.cop0_status_read = cop0_status_read;
-    inputs.switch_error = switch_error;
-    inputs.do_break = do_break;
-    inputs.get_function = get_function;
-    inputs.syscall_handler = nullptr;
-    inputs.pause_self = nullptr;
-    inputs.trigger_event = nullptr;
-    inputs.reference_section_addresses = section_addrs.get();
-    inputs.local_section_addresses = section_addrs.get();
-    inputs.run_hook = nullptr;
-    inputs.original_section_indices = std::vector<size_t>{0};
-
-    LiveGenerator generator{ ctx.functions.size(), inputs };
-    std::ostringstream dummy_ostream;
-    std::vector<std::vector<uint32_t>> dummy_static_funcs(ctx.sections.size());
-    if (!recompile_function_live(generator, ctx, 0, dummy_ostream,
-                                 dummy_static_funcs, false)) {
-        err = "recompile_function_live failed (unsupported instruction / "
-              "jump table / reference symbol)";
+    // Bind every host runtime helper the CGenerator output can call. All are
+    // CODE symbols (tcc_add_symbol resolves them); the lone DATA symbol,
+    // section_addresses, is defined inside the shard. Unreferenced bindings are
+    // harmless no-ops, so bind the complete set the C emitter may emit — a single
+    // missed helper makes tcc_relocate fail the whole function. (get_cop1_cs/
+    // set_cop1_cs are static-inline in recomp.h, so inlined into the shard — no
+    // binding needed. recomp_trigger_event is mod-only and not declared here.)
+    // fesetround/fegetround come from the host UCRT because tcc 0.9.27's bundled
+    // msvcrt.def doesn't export them.
+    std::vector<TccSymbol> syms = {
+        {"get_function",                   (const void*)&get_function},
+        {"cop0_status_read",               (const void*)&cop0_status_read},
+        {"cop0_status_write",              (const void*)&cop0_status_write},
+        {"switch_error",                   (const void*)&switch_error},
+        {"do_break",                       (const void*)&do_break},
+        {"recomp_handle_tailcalls",        (const void*)&recomp_handle_tailcalls},
+        {"recomp_cf_note",                 (const void*)&recomp_cf_note},
+        {"ultramodern_scheduler_tick_vram",(const void*)&ultramodern_scheduler_tick_vram},
+        {"pause_self",                     (const void*)&pause_self},
+        {"recomp_unhandled_branch",        (const void*)&recomp_unhandled_branch},
+        {"recomp_unhandled_call",          (const void*)&recomp_unhandled_call},
+        {"recomp_unhandled_instruction",   (const void*)&recomp_unhandled_instruction},
+        {"fesetround",                     (const void*)&fesetround},
+        {"fegetround",                     (const void*)&fegetround},
+    };
+    std::vector<int32_t> secaddrs = { (int32_t)vram };
+    TccToolchain tk; tk.toolchain_dir = tcc_toolchain_dir();
+    TccRecompOutput tcc_out = recompile_function_tcc(ctx, 0, syms, secaddrs, tk);
+    if (!tcc_out.good()) {
+        err = "tcc backend: " + tcc_out.error;
         return nullptr;
     }
-    auto output = std::make_unique<LiveGeneratorOutput>(generator.finish());
-    if (!output->good || output->functions.empty() ||
-        output->functions[0] == nullptr) {
-        err = "live generator produced no usable function";
-        return nullptr;
-    }
-    recomp_func_t* fn = output->functions[0];
-    if (out_code_size) *out_code_size = output->code_size;
-    entry_out.output = std::move(output);
-    entry_out.section_addrs = std::move(section_addrs);
+    recomp_func_t* fn = tcc_out.func;
+    if (out_code_size) *out_code_size = tcc_out.code_size;
+    entry_out.tcc_output = std::make_unique<TccRecompOutput>(std::move(tcc_out));
     return fn;
 }
 
@@ -3478,17 +3417,12 @@ static recomp_func_t* jit_compile_inner(uint32_t vram, uint8_t* rdram,
     ctx.section_functions.push_back(std::vector<size_t>{0});
     ctx.use_lookup_for_all_function_calls = true;
 
-    // 5. Persistent per-JIT section-address array (generated code may bake
-    //    its address). One section; address = its runtime vram.
-    auto section_addrs = std::make_unique<int32_t[]>(1);
-    section_addrs[0] = (int32_t)vram;
-
-    // 6. Codegen via the active backend (tcc by default, sljit fallback). The
-    //    returned JitEntry owns whichever backend's backing storage; we keep it
-    //    alive (see step 7) so the baked pointers / TCCState never free.
+    // 5. Codegen via the libtcc backend. The returned JitEntry owns the
+    //    TccRecompOutput (which owns the executable memory); we keep it alive
+    //    (see step 6) so the compiled function never frees under us. The shard
+    //    bakes its own section_addresses from `vram` (see codegen_function).
     JitEntry entry{};
-    recomp_func_t* jitted = codegen_function(ctx, vram, section_addrs, entry,
-                                             out_code_size, err);
+    recomp_func_t* jitted = codegen_function(ctx, vram, entry, out_code_size, err);
     if (jitted == nullptr) {
         return nullptr;  // err populated by codegen_function
     }

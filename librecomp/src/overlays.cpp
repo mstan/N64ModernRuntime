@@ -2663,6 +2663,25 @@ static FILE* open_runtime_captures(const char* mode) {
     return f;
 }
 
+// Live snapshot of the self-healing tier counters, for the debug server's
+// `coverage` command. Unlike the runtime_captures.json manifest (rewritten only
+// on a NEW unique miss, so stale mid-run), this reads the atomics directly — so
+// a probe can see dispatch_entry_rejects / interp_runs / self_heals climb during
+// a stall in real time. Out-params may be null.
+extern "C" void recomp_coverage_live(
+    uint64_t* static_hits, uint64_t* lookup_misses, uint64_t* self_heals,
+    uint64_t* self_heal_misses, uint64_t* dispatch_entry_rejects,
+    uint64_t* interp_runs, uint64_t* jit_compiles, uint64_t* jit_failures) {
+    if (static_hits)            *static_hits            = g_tier_static_hits.load();
+    if (lookup_misses)          *lookup_misses          = g_tier_lookup_misses.load();
+    if (self_heals)             *self_heals             = g_tier_self_heals.load();
+    if (self_heal_misses)       *self_heal_misses       = g_tier_self_heal_misses.load();
+    if (dispatch_entry_rejects) *dispatch_entry_rejects = g_tier_dispatch_entry_rejects.load();
+    if (interp_runs)            *interp_runs            = g_tier_interp_runs.load();
+    if (jit_compiles)           *jit_compiles           = g_tier_jit_compiles.load();
+    if (jit_failures)           *jit_failures           = g_tier_jit_failures.load();
+}
+
 // Rewrite the whole captures file from the in-memory map. Cheap: the map
 // holds one entry per UNIQUE missing address (a handful in practice).
 // Called only when a new unique address appears, or once at abort —
@@ -4891,7 +4910,42 @@ static recomp_func_t* tcc_run_intercept(uint32_t vram, recomp_func_t* static_fn)
 }
 #endif // PSR_TCC_DEV_TOOLS
 
+#ifdef PSR_DIVERGENCE_TOOLS
+// Dev-only static-vs-interp divergence localizer (compiled out in production;
+// gated by the WITH_DEV_DIVERGENCE CMake option). Force every DISPATCHED call
+// (computed j/jr/jalr → get_function) into the GB-Tower fragment to run through
+// the R4300i interpreter instead of its recompiled native code, so we can tell
+// a codegen divergence (interp boots Red, native wedges) from a non-codegen
+// timing/event divergence (both behave the same). Matched by the fragment's
+// CURRENT runtime range — section_addresses[9] (the GB-Tower fragment) relocates
+// per load, so a fixed link address would not match. A hit takes the exact same
+// path as a real lookup miss: the interp trampoline runs recomp_interpret_function.
+static bool force_interp_frag9_enabled() {
+    static const bool on = []{
+        const char* e = std::getenv("PSR_FORCE_INTERP_FRAG9");
+        return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y');
+    }();
+    return on;
+}
+static bool addr_in_frag9(int32_t addr) {
+    if (section_addresses == nullptr) return false;
+    uint32_t base = (uint32_t)section_addresses[9];
+    if (base == 0) return false;
+    uint32_t a = (uint32_t)addr;
+    return a >= base && a < base + 0x40000u; // generous bound over the GB-Tower frag
+}
+#endif
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
+#ifdef PSR_DIVERGENCE_TOOLS
+    if (force_interp_frag9_enabled() && addr_in_frag9(addr)) {
+        // Route this dispatched GB-Tower call through the interpreter (same
+        // mechanism as a lookup miss). g_self_heal_addr is thread-local.
+        g_last_lookup_miss_addr = addr;
+        g_self_heal_addr = (uint32_t)addr;
+        return unhandled_lookup_trampoline;
+    }
+#endif
     std::shared_lock<std::shared_mutex> lock(func_map_mutex);
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {

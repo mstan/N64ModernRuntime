@@ -50,6 +50,7 @@ namespace mesg_log {
         OP_EXT_DEQ_FULL    = 7,  // dequeue tried to send but target full → re-queued (reliable)
         OP_DO_SEND_BLOCK   = 8,  // do_send blocked sender on queue-full
         OP_EXT_DEQ_DROP    = 9,  // dequeue dropped a coalescible event (VI/PRENMI) on a full queue
+        OP_DO_SEND_DROP    = 10, // do_send NOBLOCK send dropped on a full queue (caller saw send fail)
     };
 
     struct Event {
@@ -447,6 +448,18 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
     if (!block) {
         // If non-blocking, fail if the queue is full.
         if (MQ_IS_FULL(mq)) {
+            // Make the drop LOUD: a NOBLOCK send to a full queue is silently
+            // lost (the caller just sees "send failed"). Under the cooperative
+            // scheduler a queue can be transiently full where preemptive HW
+            // wouldn't be, so this is the prime suspect for boot-handshake
+            // lost-wakeups (e.g. GB Tower #17). Record it in the always-on ring
+            // so a probe can see WHICH wakeup was dropped, on which queue, by
+            // which thread — instead of an invisible return false. (Observability
+            // only; send semantics unchanged until the cause is confirmed.)
+            mesg_log::record(rdram, mesg_log::OP_DO_SEND_DROP,
+                             uint32_t(mq_), uint32_t(uintptr_t(msg)),
+                             uint16_t(mq->validCount), uint16_t(mq->validCount),
+                             false, true);
             return false;
         }
     }

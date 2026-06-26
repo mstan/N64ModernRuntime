@@ -67,6 +67,16 @@ if (PSR_TCC_DEV_TOOLS)
     message(STATUS "librecomp: PSR_TCC_DEV_TOOLS=ON — tcc A/B + force-run harness compiled in (dev only)")
 endif()
 
+# Dev-only divergence tooling (force-interpret a fragment, static-vs-interp
+# localizer). Like WITH_ARES_BRIDGE, this is a debugging aid that must NOT ship
+# in production: default OFF => PSR_DIVERGENCE_TOOLS undefined => the hooks
+# compile out to nothing. Devs enable with -DWITH_DEV_DIVERGENCE=ON. PUBLIC so
+# the app's debug server can gate matching commands on the same macro.
+option(WITH_DEV_DIVERGENCE "Build dev-only static-vs-interp divergence tooling" OFF)
+if (WITH_DEV_DIVERGENCE)
+    target_compile_definitions(librecomp PUBLIC PSR_DIVERGENCE_TOOLS)
+endif()
+
 if (WIN32)
     add_compile_definitions(NOMINMAX)
 endif()

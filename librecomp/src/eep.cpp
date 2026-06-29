@@ -22,8 +22,25 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
 
 constexpr int eeprom_block_size = 8;
 
+// EEPROM access is only valid when the configured save type is one of the
+// EEPROM variants; abort loudly otherwise to avoid scribbling on a save of a
+// different type.
+static void require_eeprom_save() {
+    if (!recomp::eeprom_allowed()) {
+        ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
+        ULTRAMODERN_QUICK_EXIT();
+    }
+}
+
+// EEPROM is addressed in fixed 8-byte blocks, so a block index scales to a
+// byte offset by the block size.
+static uint32_t eeprom_byte_offset(uint8_t block_index) {
+    return block_index * eeprom_block_size;
+}
+
 extern "C" void osEepromProbe_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
+    // Report the EEPROM capacity libultra should assume for this save type.
     switch (recomp::get_save_type()) {
         case recomp::SaveType::AllowAll:
         case recomp::SaveType::Eep16k:
@@ -40,68 +57,56 @@ extern "C" void osEepromProbe_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 extern "C" void osEepromWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
-    if (!recomp::eeprom_allowed()) {
-        ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
-        ULTRAMODERN_QUICK_EXIT();
-    }
+    require_eeprom_save();
 
-    uint8_t eep_address = ctx->r5;
+    uint8_t block_index = ctx->r5;
     gpr buffer = ctx->r6;
-    int32_t nbytes = eeprom_block_size;
 
-    save_write(rdram, buffer, eep_address * eeprom_block_size, nbytes);
+    // The single-block call always transfers exactly one 8-byte block.
+    save_write(rdram, buffer, eeprom_byte_offset(block_index), eeprom_block_size);
 
     ctx->r2 = 0;
 }
 
 extern "C" void osEepromLongWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
-    if (!recomp::eeprom_allowed()) {
-        ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
-        ULTRAMODERN_QUICK_EXIT();
-    }
+    require_eeprom_save();
 
-    uint8_t eep_address = ctx->r5;
+    uint8_t block_index = ctx->r5;
     gpr buffer = ctx->r6;
     int32_t nbytes = ctx->r7;
 
     assert((nbytes % eeprom_block_size) == 0);
 
-    save_write(rdram, buffer, eep_address * eeprom_block_size, nbytes);
+    save_write(rdram, buffer, eeprom_byte_offset(block_index), nbytes);
 
     ctx->r2 = 0;
 }
 
 extern "C" void osEepromRead_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
-    if (!recomp::eeprom_allowed()) {
-        ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
-        ULTRAMODERN_QUICK_EXIT();
-    }
+    require_eeprom_save();
 
-    uint8_t eep_address = ctx->r5;
+    uint8_t block_index = ctx->r5;
     gpr buffer = ctx->r6;
-    int32_t nbytes = eeprom_block_size;
 
-    save_read(rdram, buffer, eep_address * eeprom_block_size, nbytes);
+    // The single-block call always transfers exactly one 8-byte block.
+    save_read(rdram, buffer, eeprom_byte_offset(block_index), eeprom_block_size);
 
     ctx->r2 = 0;
 }
 
 extern "C" void osEepromLongRead_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
-    if (!recomp::eeprom_allowed()) {
-        ultramodern::error_handling::message_box("Attempted to use EEPROM saving with other save type");
-        ULTRAMODERN_QUICK_EXIT();
-    }
+    require_eeprom_save();
 
-    uint8_t eep_address = ctx->r5;
+    uint8_t block_index = ctx->r5;
     gpr buffer = ctx->r6;
     int32_t nbytes = ctx->r7;
 
     assert((nbytes % eeprom_block_size) == 0);
 
-    save_read(rdram, buffer, eep_address * eeprom_block_size, nbytes);
+    save_read(rdram, buffer, eeprom_byte_offset(block_index), nbytes);
 
     ctx->r2 = 0;
 }

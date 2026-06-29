@@ -1,7 +1,7 @@
 // Modifications in this file are part of N64ModernRuntime (GPL-3.0; see
 // COPYING). The notices below describe the changes and their authorship,
 // as required by GPL-3.0 §5(a). Original file copyright remains with the
-// upstream N64ModernRuntime authors.
+// original authors.
 //
 // Modified 2026 by Matthew Stanley:
 //   - Re-queue externals on full target OSMesgQueue (replaces silent drop

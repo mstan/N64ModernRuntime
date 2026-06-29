@@ -1,5 +1,5 @@
 // Part of N64ModernRuntime's librecomp subsystem (added by Matthew
-// Stanley in mstan fork; not present upstream). Distributed under
+// Stanley in mstan fork). Distributed under
 // the project's GPL-3.0 (see ../../../COPYING).
 //
 // Copyright (c) 2026 Matthew Stanley

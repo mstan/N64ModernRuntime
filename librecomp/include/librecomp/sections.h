@@ -1,6 +1,6 @@
 // N64ModernRuntime — modifications in this file by Matthew Stanley
 // (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
-// file copyright remains with upstream authors. See COPYING.
+// file copyright remains with the original authors. See COPYING.
 //
 // Modified 2026 by Matthew Stanley:
 //   - Section descriptor extensions for synthetic-fragment resolution

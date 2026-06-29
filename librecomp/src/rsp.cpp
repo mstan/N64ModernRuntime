@@ -1,10 +1,10 @@
 // N64ModernRuntime — modifications in this file by Matthew Stanley
 // (mstan fork). Per GPL-3.0 §5(a), changes are noted below; original
-// file copyright remains with upstream authors. See COPYING.
+// file copyright remains with the original authors. See COPYING.
 //
 // Modified 2026 by Matthew Stanley:
 //   - Path A: persistent RSP GPRs across run_task calls (paired with
-//     RSPRecomp emit changes in upstream-fork branch).
+//     RSPRecomp emit changes in a fork branch).
 //   - Pre-task hook registry + DMA helper export.
 //   - get_last_pc_trail API for live RSP hang inspection.
 //   - Post-task DMEM dispatch-table integrity check + cmd dump.

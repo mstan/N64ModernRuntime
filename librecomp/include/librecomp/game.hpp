@@ -56,20 +56,28 @@ namespace recomp {
         std::string suffix;
 
         std::string to_string() const {
-            return std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch) + suffix;
+            std::string out = std::to_string(major);
+            out += '.';
+            out += std::to_string(minor);
+            out += '.';
+            out += std::to_string(patch);
+            out += suffix;
+            return out;
         }
 
         static bool from_string(const std::string& str, Version& out);
 
         auto operator<=>(const Version& rhs) const {
-            if (major != rhs.major) {
-                return major <=> rhs.major;
+            // Order by major, then minor, then patch; the suffix is not part of the
+            // ordering.
+            if (auto cmp = major <=> rhs.major; cmp != 0) {
+                return cmp;
             }
-            if (minor != rhs.minor) {
-                return minor <=> rhs.minor;
+            if (auto cmp = minor <=> rhs.minor; cmp != 0) {
+                return cmp;
             }
             return patch <=> rhs.patch;
-        } 
+        }
     };
     enum class RomValidationError {
         Good,

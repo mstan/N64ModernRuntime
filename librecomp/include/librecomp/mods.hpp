@@ -49,11 +49,11 @@ template <>
 struct std::hash<recomp::mods::HookDefinition>
 {
     std::size_t operator()(const recomp::mods::HookDefinition& def) const {
-        // This hash packing only works if the resulting value is 64 bits.
+        // The packing scheme below assumes a 64-bit hash result.
         static_assert(sizeof(std::size_t) == 8);
-        // Combine the three values into a single 64-bit value.
-        // The lower 2 bits of a function address will always be zero, so pack
-        // the value of at_return into the lowest bit.
+        // Fold all three fields together into one 64-bit value. Function
+        // addresses are at least 4-byte aligned, so their bottom 2 bits are
+        // free; stash the at_return flag in bit 0.
         return (size_t(def.section_rom) << 32) | size_t(def.function_vram) | size_t(def.at_return ? 1 : 0);
     }
 };

@@ -446,7 +446,7 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
                     uint32_t(mq->msgCount));
     }
     if (!block) {
-        // If non-blocking, fail if the queue is full.
+        // Non-blocking send: report failure rather than wait when the queue is at capacity.
         if (MQ_IS_FULL(mq)) {
             // Make the drop LOUD: a NOBLOCK send to a full queue is silently
             // lost (the caller just sees "send failed"). Under the cooperative
@@ -464,7 +464,7 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
         }
     }
     else {
-        // Otherwise, yield this thread until the queue has room.
+        // Blocking send: park this thread and let others run until space frees up.
         while (MQ_IS_FULL(mq)) {
             mesg_log::record(rdram, mesg_log::OP_DO_SEND_BLOCK,
                              uint32_t(mq_), uint32_t(uintptr_t(msg)),
@@ -477,19 +477,19 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
     }
     
     if (jam) {
-        // Jams insert at the head of the message queue's buffer.
+        // A jam goes to the front of the circular buffer, becoming the next message read.
         mq->first = (mq->first + mq->msgCount - 1) % mq->msgCount;
         TO_PTR(OSMesg, mq->msg)[mq->first] = msg;
         mq->validCount++;
     }
     else {
-        // Sends insert at the tail of the message queue's buffer.
+        // A normal send appends to the back of the circular buffer.
         s32 last = (mq->first + mq->validCount) % mq->msgCount;
         TO_PTR(OSMesg, mq->msg)[last] = msg;
         mq->validCount++;
     }
 
-    // If any threads were blocked on receiving from this message queue, pop the first one and schedule it.
+    // A successful send may unblock a receiver: wake the first one waiting on this queue.
     PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv);
     if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
         ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
@@ -501,12 +501,12 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
 bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
     if (!block) {
-        // If non-blocking, fail if the queue is empty
+        // Non-blocking receive: report failure rather than wait when there is nothing to read.
         if (MQ_IS_EMPTY(mq)) {
             return false;
         }
     } else {
-        // Otherwise, yield this thread in a loop until the queue is no longer full
+        // Blocking receive: park this thread and let others run until a message arrives.
         while (MQ_IS_EMPTY(mq)) {
             mesg_log::record(rdram, mesg_log::OP_RECV_BLOCK,
                              uint32_t(mq_), 0,
@@ -525,7 +525,7 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     mq->first = (mq->first + 1) % mq->msgCount;
     mq->validCount--;
 
-    // If any threads were blocked on sending to this message queue, pop the first one and schedule it.
+    // Freeing a slot may unblock a sender: wake the first one waiting on this queue.
     PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_send);
     if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
         ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
@@ -538,24 +538,25 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     bool jam = false;
 
-    // Don't directly send to the message queue if this isn't a game thread to avoid contention.
+    // Posts from non-game threads route through the external queue so only the
+    // game thread ever touches the guest message buffer directly.
     if (!ultramodern::is_game_thread()) {
         enqueue_external_message(mq_, msg, jam);
         return 0;
     }
 
-    // Handle any messages that have been received from an external thread.
+    // Flush anything other threads posted before performing this send.
     dequeue_external_messages(PASS_RDRAM1);
 
     const uint16_t vb = uint16_t(mq ? mq->validCount : 0);
-    // Try to send the message.
+    // Perform the send itself.
     bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
     const uint16_t va = uint16_t(mq ? mq->validCount : 0);
     mesg_log::record(rdram, mesg_log::OP_SEND_GAME,
                      uint32_t(mq_), uint32_t(uintptr_t(msg)),
                      vb, va, flags == OS_MESG_BLOCK, true);
 
-    // Check the queue to see if this thread should swap execution to another.
+    // A higher-priority thread may now be runnable; reschedule if so.
     ultramodern::check_running_queue(PASS_RDRAM1);
 
     return sent ? 0 : -1;
@@ -564,20 +565,21 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
 extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     bool jam = true;
-    
-    // Don't directly send to the message queue if this isn't a game thread to avoid contention.
+
+    // Posts from non-game threads route through the external queue so only the
+    // game thread ever touches the guest message buffer directly.
     if (!ultramodern::is_game_thread()) {
         enqueue_external_message(mq_, msg, jam);
         return 0;
     }
-    
-    // Handle any messages that have been received from an external thread.
+
+    // Flush anything other threads posted before performing this jam.
     dequeue_external_messages(PASS_RDRAM1);
 
-    // Try to send the message.
+    // Perform the jam itself.
     bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
-    
-    // Check the queue to see if this thread should swap execution to another.
+
+    // A higher-priority thread may now be runnable; reschedule if so.
     ultramodern::check_running_queue(PASS_RDRAM1);
 
     return sent ? 0 : -1;
@@ -593,10 +595,10 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 
                      uint32_t(mq_), 0, vb_enter, vb_enter,
                      flags == OS_MESG_BLOCK, true);
 
-    // Handle any messages that have been received from an external thread.
+    // Flush anything other threads posted before attempting the receive.
     dequeue_external_messages(PASS_RDRAM1);
 
-    // Try to receive a message.
+    // Perform the receive itself.
     bool received = do_recv(PASS_RDRAM mq_, msg_, flags == OS_MESG_BLOCK);
     const uint16_t va = uint16_t(mq ? mq->validCount : 0);
     if (received) {
@@ -609,7 +611,7 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 
                          flags == OS_MESG_BLOCK, true);
     }
 
-    // Check the queue to see if this thread should swap execution to another.
+    // A higher-priority thread may now be runnable; reschedule if so.
     ultramodern::check_running_queue(PASS_RDRAM1);
 
     return received ? 0 : -1;

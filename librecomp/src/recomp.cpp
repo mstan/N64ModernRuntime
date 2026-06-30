@@ -84,7 +84,7 @@ void recomp::register_config_path(std::filesystem::path path) {
 }
 
 bool recomp::register_game(const recomp::GameEntry& entry) {
-    // TODO verify that there's no game with this ID already.
+    // TODO ensure no game has already been registered under this ID.
     {
         std::lock_guard<std::mutex> lock(game_roms_mutex);
         game_roms.insert({ entry.game_id, entry });
@@ -165,35 +165,33 @@ recomp::mods::DependencyStatus recomp::mods::is_dependency_met(size_t mod_index,
 }
 
 bool check_hash(const std::vector<uint8_t>& rom_data, uint64_t expected_hash) {
-    uint64_t calculated_hash = XXH3_64bits(rom_data.data(), rom_data.size());
-    return calculated_hash == expected_hash;
+    // Hash the supplied bytes and report whether they match the expected value.
+    return XXH3_64bits(rom_data.data(), rom_data.size()) == expected_hash;
 }
 
 static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
-    std::vector<uint8_t> ret;
+    std::vector<uint8_t> contents;
+    std::ifstream stream{ path, std::ios::binary};
 
-    std::ifstream file{ path, std::ios::binary};
-
-    if (file.good()) {
-        file.seekg(0, std::ios::end);
-        ret.resize(file.tellg());
-        file.seekg(0, std::ios::beg);
-
-        file.read(reinterpret_cast<char*>(ret.data()), ret.size());
+    if (stream.good()) {
+        // Determine the length by seeking to the end, then rewind and read it all.
+        stream.seekg(0, std::ios::end);
+        contents.resize(stream.tellg());
+        stream.seekg(0, std::ios::beg);
+        stream.read(reinterpret_cast<char*>(contents.data()), contents.size());
     }
 
-    return ret;
+    return contents;
 }
 
 bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
-    std::ofstream out_file{ path, std::ios::binary };
+    std::ofstream stream{ path, std::ios::binary };
 
-    if (!out_file.good()) {
+    if (!stream.good()) {
         return false;
     }
 
-    out_file.write(reinterpret_cast<const char*>(data.data()), data.size());
-
+    stream.write(reinterpret_cast<const char*>(data.data()), data.size());
     return true;
 }
 
@@ -201,7 +199,7 @@ bool check_stored_rom(const recomp::GameEntry& game_entry) {
     std::vector stored_rom_data = read_file(config_path / game_entry.stored_filename());
 
     if (!check_hash(stored_rom_data, game_entry.rom_hash)) {
-        // Incorrect hash, remove the stored ROM file if it exists.
+        // Hash mismatch: drop the cached ROM file if one is present.
         std::filesystem::remove(config_path / game_entry.stored_filename());
         return false;
     }
@@ -216,9 +214,10 @@ bool recomp::is_rom_valid(std::u8string& game_id) {
 }
 
 void recomp::check_all_stored_roms() {
-    for (const auto& cur_rom_entry: game_roms) {
-        if (check_stored_rom(cur_rom_entry.second)) {
-            valid_game_roms.insert(cur_rom_entry.first);
+    // Any game whose cached ROM still passes the hash check is marked valid.
+    for (const auto& rom_entry : game_roms) {
+        if (check_stored_rom(rom_entry.second)) {
+            valid_game_roms.insert(rom_entry.first);
         }
     }
 }
@@ -233,7 +232,7 @@ bool recomp::load_stored_rom(std::u8string& game_id) {
     std::vector<uint8_t> stored_rom_data = read_file(config_path / find_it->second.stored_filename());
 
     if (!check_hash(stored_rom_data, find_it->second.rom_hash)) {
-        // The ROM no longer has the right hash, delete it.
+        // The cached ROM's hash is stale, so remove it.
         std::filesystem::remove(config_path / find_it->second.stored_filename());
         return false;
     }
@@ -247,53 +246,55 @@ const recomp::Version& recomp::get_project_version() {
 }
 
 bool recomp::Version::from_string(const std::string& str, Version& out) {
-    std::array<size_t, 2> period_indices;
-    size_t cur_pos = 0;
+    // Accepted form: MAJOR.MINOR.PATCH, optionally trailed by a '+' or '-'
+    // suffix (build metadata or pre-release tag).
     uint16_t major;
     uint16_t minor;
     uint16_t patch;
     std::string suffix;
 
-    // Find the 2 required periods.
-    cur_pos = str.find('.', cur_pos);
-    period_indices[0] = cur_pos;
-    cur_pos = str.find('.', cur_pos + 1);
-    period_indices[1] = cur_pos;
-
-    // Check that both were found.
-    if (period_indices[0] == std::string::npos || period_indices[1] == std::string::npos) {
+    // Locate the two '.' separators that delimit the three numeric components.
+    size_t first_dot = str.find('.');
+    if (first_dot == std::string::npos) {
+        return false;
+    }
+    size_t second_dot = str.find('.', first_dot + 1);
+    if (second_dot == std::string::npos) {
         return false;
     }
 
-    // Parse the 3 numbers formed by splitting the string via the periods.
-    std::array<std::from_chars_result, 3> parse_results; 
-    std::array<size_t, 3> parse_starts { 0, period_indices[0] + 1, period_indices[1] + 1 };
-    std::array<size_t, 3> parse_ends { period_indices[0], period_indices[1], str.size() };
-    parse_results[0] = std::from_chars(str.data() + parse_starts[0], str.data() + parse_ends[0], major);
-    parse_results[1] = std::from_chars(str.data() + parse_starts[1], str.data() + parse_ends[1], minor);
-    parse_results[2] = std::from_chars(str.data() + parse_starts[2], str.data() + parse_ends[2], patch);
+    // Half-open [begin, end) ranges of each numeric component within the string.
+    const char* const base = str.data();
+    const std::array<const char*, 3> field_begin { base, base + first_dot + 1, base + second_dot + 1 };
+    const std::array<const char*, 3> field_end { base + first_dot, base + second_dot, base + str.size() };
 
-    // Check that the first two parsed correctly.
-    auto did_parse = [&](size_t i) {
-        return parse_results[i].ec == std::errc{} && parse_results[i].ptr == str.data() + parse_ends[i];
+    std::array<std::from_chars_result, 3> results;
+    results[0] = std::from_chars(field_begin[0], field_end[0], major);
+    results[1] = std::from_chars(field_begin[1], field_end[1], minor);
+    results[2] = std::from_chars(field_begin[2], field_end[2], patch);
+
+    // A component is "fully consumed" when conversion succeeded and reached its end.
+    auto fully_consumed = [&](size_t i) {
+        return results[i].ec == std::errc{} && results[i].ptr == field_end[i];
     };
-    
-    if (!did_parse(0) || !did_parse(1)) {
+
+    // Major and minor must each consume their entire substring.
+    if (!fully_consumed(0) || !fully_consumed(1)) {
         return false;
     }
 
-    // Check that the third had a successful parse, but not necessarily read all the characters.
-    if (parse_results[2].ec != std::errc{}) {
+    // Patch must convert successfully but may stop before its end.
+    if (results[2].ec != std::errc{}) {
         return false;
     }
 
-    // Allow a plus or minus directly after the third number.
-    if (parse_results[2].ptr != str.data() + parse_ends[2]) {
-        if (*parse_results[2].ptr == '+' || *parse_results[2].ptr == '-') {
-            suffix = str.substr(std::distance(str.data(), parse_results[2].ptr));
+    // Any leftover characters after patch are only valid as a '+'/'-' suffix.
+    if (results[2].ptr != field_end[2]) {
+        if (*results[2].ptr == '+' || *results[2].ptr == '-') {
+            suffix = str.substr(std::distance(base, results[2].ptr));
         }
-        // Failed to parse, as nothing is allowed directly after the last number besides a plus or minus.
         else {
+            // Anything else immediately after the patch number is rejected.
             return false;
         }
     }
@@ -319,44 +320,45 @@ ByteswapType check_rom_start(const std::vector<uint8_t>& rom_data) {
         return ByteswapType::Invalid;
     }
 
-    auto check_match = [&](uint8_t index0, uint8_t index1, uint8_t index2, uint8_t index3) {
-        return
-            rom_data[0] == first_rom_bytes[index0] &&
-            rom_data[1] == first_rom_bytes[index1] &&
-            rom_data[2] == first_rom_bytes[index2] &&
-            rom_data[3] == first_rom_bytes[index3];
+    // Test the first four ROM bytes against the magic value reordered by the
+    // given index permutation; a hit identifies that byteswap arrangement.
+    auto matches = [&](uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+        return rom_data[0] == first_rom_bytes[a]
+            && rom_data[1] == first_rom_bytes[b]
+            && rom_data[2] == first_rom_bytes[c]
+            && rom_data[3] == first_rom_bytes[d];
     };
 
-    // Check if the ROM is already in the correct byte order.
-    if (check_match(0,1,2,3)) {
+    if (matches(0, 1, 2, 3)) {
+        // Native (big-endian) ordering.
         return ByteswapType::NotByteswapped;
     }
-
-    // Check if the ROM has been byteswapped in groups of 4 bytes.
-    if (check_match(3,2,1,0)) {
+    if (matches(3, 2, 1, 0)) {
+        // Bytes reversed within each 4-byte word.
         return ByteswapType::Byteswapped4;
     }
-
-    // Check if the ROM has been byteswapped in groups of 2 bytes.
-    if (check_match(1,0,3,2)) {
+    if (matches(1, 0, 3, 2)) {
+        // Bytes swapped within each 2-byte halfword.
         return ByteswapType::Byteswapped2;
     }
 
-    // No match found.
+    // None of the known orderings matched.
     return ByteswapType::Invalid;
 }
 
 void byteswap_data(std::vector<uint8_t>& rom_data, size_t index_xor) {
-    for (size_t rom_pos = 0; rom_pos < rom_data.size(); rom_pos += 4) {
-        uint8_t temp0 = rom_data[rom_pos + 0];
-        uint8_t temp1 = rom_data[rom_pos + 1];
-        uint8_t temp2 = rom_data[rom_pos + 2];
-        uint8_t temp3 = rom_data[rom_pos + 3];
+    // Process the buffer one 4-byte word at a time, relocating each byte to the
+    // slot obtained by XORing its position with index_xor.
+    for (size_t pos = 0; pos < rom_data.size(); pos += 4) {
+        const uint8_t b0 = rom_data[pos + 0];
+        const uint8_t b1 = rom_data[pos + 1];
+        const uint8_t b2 = rom_data[pos + 2];
+        const uint8_t b3 = rom_data[pos + 3];
 
-        rom_data[rom_pos + (0 ^ index_xor)] = temp0;
-        rom_data[rom_pos + (1 ^ index_xor)] = temp1;
-        rom_data[rom_pos + (2 ^ index_xor)] = temp2;
-        rom_data[rom_pos + (3 ^ index_xor)] = temp3;
+        rom_data[pos + (0 ^ index_xor)] = b0;
+        rom_data[pos + (1 ^ index_xor)] = b1;
+        rom_data[pos + (2 ^ index_xor)] = b2;
+        rom_data[pos + (3 ^ index_xor)] = b3;
     }
 }
 
@@ -375,12 +377,12 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
         return recomp::RomValidationError::FailedToOpen;
     }
 
-    // Pad the rom to the nearest multiple of 4 bytes.
+    // Round the size up to a multiple of 4 bytes so word-wise swapping stays
+    // within the buffer.
     rom_data.resize((rom_data.size() + 3) & ~3);
 
-    ByteswapType byteswap_type = check_rom_start(rom_data);
-
-    switch (byteswap_type) {
+    // Identify the byte ordering and undo any swapping in place.
+    switch (check_rom_start(rom_data)) {
         case ByteswapType::Invalid:
             return recomp::RomValidationError::NotARom;
         case ByteswapType::Byteswapped2:
@@ -427,22 +429,20 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
     uint32_t new_sr = (uint32_t)value;
     uint32_t changed = old_sr ^ new_sr;
 
-    // Check if the FR bit changed
+    // React only when the FR bit flips; it controls odd single-FPU addressing.
     if (changed & (uint32_t)StatusReg::FR) {
-        // Check if the FR bit was set
         if (new_sr & (uint32_t)StatusReg::FR) {
-            // FR = 1, odd single floats point to their own registers
+            // FR=1: every odd single float lives in its own register.
             ctx->f_odd = &ctx->f1.u32l;
             ctx->mips3_float_mode = true;
         }
-        // Otherwise, it was cleared
         else {
-            // FR = 0, odd single floats point to the upper half of the previous register
+            // FR=0: odd singles overlap the upper half of the even register.
             ctx->f_odd = &ctx->f0.u32h;
             ctx->mips3_float_mode = false;
         }
 
-        // Remove the FR bit from the changed bits as it's been handled
+        // FR has been dealt with, so drop it from the set of changed bits.
         changed &= ~(uint32_t)StatusReg::FR;
     }
 
@@ -469,7 +469,7 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
         }
     }
 
-    // Update the status register in the context
+    // Store the new value back into the context's Status register.
     ctx->status_reg = new_sr;
 }
 
@@ -668,23 +668,23 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 }
 
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
-    // Initialize the overlays
+    // Bring up the overlay subsystem.
     recomp::overlays::init_overlays();
 
-    // Load overlays in the first 1MB
+    // Map the overlays that live within the first megabyte.
     load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
 
-    // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
+    // Perform the opening 1MB DMA (ROM offset 0x1000 -> physical 0x10001000).
     recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
 
-    // Read in any extra data from patches
+    // Pull in any supplementary patch data.
     recomp::overlays::read_patch_data(rdram, (gpr)recomp::patch_rdram_start);
 
-    // Set up context floats
+    // Point the float context at its default layout.
     ctx->f_odd = &ctx->f0.u32h;
     ctx->mips3_float_mode = false;
 
-    // Initialize variables normally set by IPL3
+    // Populate the globals that IPL3 would normally fill in.
     constexpr int32_t osTvType = 0x80000300;
     //constexpr int32_t osRomType = 0x80000304;
     constexpr int32_t osRomBase = 0x80000308;
@@ -705,9 +705,7 @@ std::u8string recomp::current_game_id() {
 };
 
 std::string recomp::current_mod_game_id() {
-    auto find_it = game_roms.find(current_game_id());
-    const recomp::GameEntry& game_entry = find_it->second;
-
+    const recomp::GameEntry& game_entry = game_roms.find(current_game_id())->second;
     return game_entry.mod_game_id;
 }
 
@@ -828,7 +826,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
     game_status.wait(GameStatus::None);
 
     switch (game_status.load()) {
-        // TODO refactor this to allow a project to specify what entrypoint function to run for a give game.
+        // TODO let projects choose which entrypoint function to launch per game.
         case GameStatus::Running:
             {
                 if (!recomp::load_stored_rom(current_game.value())) {
@@ -845,8 +843,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 // trip and fall into error paths.
                 recomp::mirror_rom_to_kseg1(rdram);
 
-                auto find_it = game_roms.find(current_game.value());
-                const recomp::GameEntry& game_entry = find_it->second;
+                const recomp::GameEntry& game_entry = game_roms.find(current_game.value())->second;
 
                 init(rdram, context, game_entry.entrypoint_address);
                 if (game_entry.on_init_callback) {
@@ -966,8 +963,9 @@ void recomp::start(
     recomp::mods::initialize_mods();
     recomp::mods::scan_mods();
 
-    // Allocate rdram without comitting it. Use a platform-specific virtual allocation function
-    // that initializes to zero. Protect the region above the memory size to catch accesses to invalid addresses.
+    // Reserve rdram via a platform virtual-allocation call (zero-initialized)
+    // without committing it, leaving the region past the memory size protected
+    // so stray accesses to invalid addresses fault instead of succeeding.
     uint8_t* rdram;
     bool alloc_failed;
 #ifdef _WIN32
@@ -975,7 +973,7 @@ void recomp::start(
     DWORD old_protect = 0;
     alloc_failed = (rdram == nullptr);
     if (!alloc_failed) {
-        // VirtualProtect returns 0 on failure.
+        // A zero return from VirtualProtect signals failure.
         alloc_failed = (VirtualProtect(rdram, mem_size, PAGE_READWRITE, &old_protect) == 0);
         if (alloc_failed) {
             VirtualFree(rdram, 0, MEM_RELEASE);
@@ -985,7 +983,7 @@ void recomp::start(
     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
     if (!alloc_failed) {
-        // mprotect returns -1 on failure.
+        // mprotect reports failure by returning -1.
         alloc_failed = (mprotect(rdram, mem_size, PROT_READ | PROT_WRITE) == -1);
         if (alloc_failed) {
             munmap(rdram, allocation_size);
@@ -1011,7 +1009,7 @@ void recomp::start(
 
         recomp_context context{};
 
-        // Loop until the game starts.
+        // Spin here until a game has been started.
         while (!wait_for_game_started(rdram, &context)) {}
     }, window_handle, rdram};
 
@@ -1030,13 +1028,13 @@ void recomp::start(
     ultramodern::join_saving_thread();
     ultramodern::join_scheduler_tick();
     
-    // Free rdram.
+    // Release the rdram allocation.
     bool free_failed;
 #ifdef _WIN32
-    // VirtualFree returns zero on failure.
+    // VirtualFree yields zero when it fails.
     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
 #else
-    // munmap returns -1 on failure.
+    // munmap yields -1 when it fails.
     free_failed = (munmap(rdram, allocation_size) == -1);
 #endif
 

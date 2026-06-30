@@ -214,60 +214,65 @@ void ultramodern::scheduler_trace_mark(RDRAM_ARG uint32_t op,
     sched_log::record(PASS_RDRAM op, queue_, thread_, queue_head_or_zero(PASS_RDRAM queue_));
 }
 
-void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) toadd_) {
-    PTR(OSThread)* cur = queue_to_ptr(PASS_RDRAM queue_);
-    OSThread* toadd = TO_PTR(OSThread, toadd_); 
-    debug_printf("[Thread Queue] Inserting thread %d into queue 0x%08X\n", toadd->id, (uintptr_t)queue_);
-    while (*cur && TO_PTR(OSThread, *cur)->priority > toadd->priority) {
-        cur = &TO_PTR(OSThread, *cur)->next;
+void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) added_) {
+    // The queue is an intrusive singly-linked list kept in descending priority
+    // order. Advance to the first link whose thread does not outrank the new one
+    // and splice the new thread in ahead of it.
+    PTR(OSThread)* link = queue_to_ptr(PASS_RDRAM queue_);
+    OSThread* added = TO_PTR(OSThread, added_);
+    debug_printf("[Thread Queue] thread %d -> queue 0x%08X\n", added->id, (uintptr_t)queue_);
+    while (*link && TO_PTR(OSThread, *link)->priority > added->priority) {
+        link = &TO_PTR(OSThread, *link)->next;
     }
-    toadd->next = (*cur);
-    toadd->queue = queue_;
-    *cur = toadd_;
-    sched_log::record(PASS_RDRAM sched_log::OP_INSERT, queue_, toadd_, *queue_to_ptr(PASS_RDRAM queue_));
+    added->next = *link;
+    added->queue = queue_;
+    *link = added_;
+    sched_log::record(PASS_RDRAM sched_log::OP_INSERT, queue_, added_, *queue_to_ptr(PASS_RDRAM queue_));
 
+    // Trace the queue contents after the insertion.
     debug_printf("  Contains:");
-    cur = queue_to_ptr(PASS_RDRAM queue_);
-    while (*cur) {
-        debug_printf("%d (%d) ", TO_PTR(OSThread, *cur)->id, TO_PTR(OSThread, *cur)->priority);
-        cur = &TO_PTR(OSThread, *cur)->next;
+    link = queue_to_ptr(PASS_RDRAM queue_);
+    while (*link) {
+        debug_printf("%d (%d) ", TO_PTR(OSThread, *link)->id, TO_PTR(OSThread, *link)->priority);
+        link = &TO_PTR(OSThread, *link)->next;
     }
     debug_printf("\n");
 }
 
 PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_) {
-    PTR(OSThread)* queue = queue_to_ptr(PASS_RDRAM queue_);
-    PTR(OSThread) ret = *queue;
-    *queue = TO_PTR(OSThread, ret)->next;
-    TO_PTR(OSThread, ret)->queue = NULLPTR;
-    sched_log::record(PASS_RDRAM sched_log::OP_POP, queue_, ret, *queue);
-    debug_printf("[Thread Queue] Popped thread %d from queue 0x%08X\n", TO_PTR(OSThread, ret)->id, (uintptr_t)queue_);
-    return ret;
+    // The highest-priority thread is at the head; detach and return it.
+    PTR(OSThread)* head = queue_to_ptr(PASS_RDRAM queue_);
+    PTR(OSThread) popped = *head;
+    *head = TO_PTR(OSThread, popped)->next;
+    TO_PTR(OSThread, popped)->queue = NULLPTR;
+    sched_log::record(PASS_RDRAM sched_log::OP_POP, queue_, popped, *head);
+    debug_printf("[Thread Queue] popped thread %d from queue 0x%08X\n", TO_PTR(OSThread, popped)->id, (uintptr_t)queue_);
+    return popped;
 }
 
 bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
-    debug_printf("[Thread Queue] Removing thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
+    debug_printf("[Thread Queue] remove thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
 
-    PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
-    while (*cur_ptr != NULLPTR) {
-        if (*cur_ptr == t_) {
-            *cur_ptr = TO_PTR(OSThread, *cur_ptr)->next;
+    // Scan the list for the target and unlink it if found.
+    PTR(OSThread)* link = queue_to_ptr(PASS_RDRAM queue_);
+    while (*link != NULLPTR) {
+        if (*link == t_) {
+            *link = TO_PTR(OSThread, *link)->next;
             sched_log::record(PASS_RDRAM sched_log::OP_REMOVE, queue_, t_, *queue_to_ptr(PASS_RDRAM queue_));
             return true;
         }
-        cur_ptr = &TO_PTR(OSThread, *cur_ptr)->next;
+        link = &TO_PTR(OSThread, *link)->next;
     }
 
+    // Target was not present in this queue.
     sched_log::record(PASS_RDRAM sched_log::OP_REMOVE_MISS, queue_, t_, *queue_to_ptr(PASS_RDRAM queue_));
     return false;
 }
 
 bool ultramodern::thread_queue_empty(RDRAM_ARG PTR(PTR(OSThread)) queue_) {
-    PTR(OSThread)* queue = queue_to_ptr(PASS_RDRAM queue_);
-    return *queue == NULLPTR;
+    return *queue_to_ptr(PASS_RDRAM queue_) == NULLPTR;
 }
 
 PTR(OSThread) ultramodern::thread_queue_peek(RDRAM_ARG PTR(PTR(OSThread)) queue_) {
-    PTR(OSThread)* queue = queue_to_ptr(PASS_RDRAM queue_);
-    return *queue;
+    return *queue_to_ptr(PASS_RDRAM queue_);
 }

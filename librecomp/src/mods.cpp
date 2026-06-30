@@ -11,52 +11,58 @@
 #include "recompiler/live_recompiler.h"
 
 static bool read_json(std::ifstream input_file, nlohmann::json &json_out) {
+    // Nothing to do if the stream isn't usable.
     if (!input_file.good()) {
         return false;
     }
 
+    // Deserialize from the stream, treating a malformed document as a soft failure.
     try {
         input_file >> json_out;
     }
     catch (nlohmann::json::parse_error &) {
         return false;
     }
+
     return true;
 }
 
 static bool read_json_with_backups(const std::filesystem::path &path, nlohmann::json &json_out) {
-    // Try reading and parsing the base file.
+    // First attempt: the primary file at the given path.
     if (read_json(std::ifstream{ path }, json_out)) {
         return true;
     }
 
-    // Try reading and parsing the backup file.
+    // Fallback attempt: the associated backup copy.
     if (read_json(recomp::open_input_backup_file(path), json_out)) {
         return true;
     }
 
-    // Both reads failed.
+    // Neither the primary nor the backup could be parsed.
     return false;
 }
 
 
 template <typename T1, typename T2>
 bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
-    const nlohmann::json::array_t* ptr = val.get_ptr<const nlohmann::json::array_t*>();
-    if (ptr == nullptr) {
+    // The value must be a JSON array for this to succeed.
+    const nlohmann::json::array_t* array_ptr = val.get_ptr<const nlohmann::json::array_t*>();
+    if (array_ptr == nullptr) {
         return false;
     }
 
     out.clear();
 
-    for (const nlohmann::json& cur_val : *ptr) {
-        const T1* temp_ptr = cur_val.get_ptr<const T1*>();
-        if (temp_ptr == nullptr) {
+    // Each element must be convertible to the requested element type; on any
+    // mismatch the partially-built output is discarded.
+    for (const nlohmann::json& element : *array_ptr) {
+        const T1* element_ptr = element.get_ptr<const T1*>();
+        if (element_ptr == nullptr) {
             out.clear();
             return false;
         }
 
-        out.emplace_back(*temp_ptr);
+        out.emplace_back(*element_ptr);
     }
 
     return true;
@@ -100,14 +106,10 @@ public:
     DynamicLibrary(const std::filesystem::path& path) {
         native_handle = LoadLibraryExW(std::filesystem::absolute(path).c_str(), nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
 
+        // When the module loads, query the version it exports; absence is encoded as all-ones.
         if (good()) {
-            uint32_t* recomp_api_version;
-            if (get_dll_symbol(recomp_api_version, "recomp_api_version")) {
-                api_version = *recomp_api_version;
-            }
-            else {
-                api_version = (uint32_t)-1;
-            }
+            uint32_t* version_symbol;
+            api_version = get_dll_symbol(version_symbol, "recomp_api_version") ? *version_symbol : (uint32_t)-1;
         }
     }
     ~DynamicLibrary() {
@@ -147,22 +149,18 @@ private:
 };
 
 void unprotect(void* target_func, uint64_t* old_flags) {
-    DWORD old_flags_dword;
-    BOOL result = VirtualProtect(target_func,
-        16,
-        PAGE_READWRITE,
-        &old_flags_dword);
-    *old_flags = old_flags_dword;
-    (void)result;
+    // Make the patch region writable, handing back the previous protection.
+    DWORD previous_protection = 0;
+    BOOL ok = VirtualProtect(target_func, 16, PAGE_READWRITE, &previous_protection);
+    *old_flags = previous_protection;
+    (void)ok;
 }
 
 void protect(void* target_func, uint64_t old_flags) {
-    DWORD dummy_old_flags;
-    BOOL result = VirtualProtect(target_func,
-        16,
-        static_cast<DWORD>(old_flags),
-        &dummy_old_flags);
-    (void)result;
+    // Restore the protection that unprotect() previously captured.
+    DWORD discarded_protection = 0;
+    BOOL ok = VirtualProtect(target_func, 16, static_cast<DWORD>(old_flags), &discarded_protection);
+    (void)ok;
 }
 #else
 #  include <unistd.h>
@@ -180,14 +178,10 @@ public:
     DynamicLibrary(const std::filesystem::path& path) {
         native_handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 
+        // When the module loads, query the version it exports; absence is encoded as all-ones.
         if (good()) {
-            uint32_t* recomp_api_version;
-            if (get_dll_symbol(recomp_api_version, "recomp_api_version")) {
-                api_version = *recomp_api_version;
-            }
-            else {
-                api_version = (uint32_t)-1;
-            }
+            uint32_t* version_symbol;
+            api_version = get_dll_symbol(version_symbol, "recomp_api_version") ? *version_symbol : (uint32_t)-1;
         }
     }
     ~DynamicLibrary() {
@@ -227,24 +221,22 @@ private:
 };
 
 void unprotect(void* target_func, uint64_t* old_flags) {
-    // Align the address to a page boundary.
-    uintptr_t page_start = (uintptr_t)target_func;
+    // mprotect operates on whole pages, so round the target down to its page base.
     int page_size = getpagesize();
-    page_start = (page_start / page_size) * page_size;
+    uintptr_t page_base = ((uintptr_t)target_func / page_size) * page_size;
 
-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE);
+    int rc = mprotect((void*)page_base, page_size, PROT_READ | PROT_WRITE);
     *old_flags = 0;
-    (void)result;
+    (void)rc;
 }
 
 void protect(void* target_func, uint64_t old_flags) {
-    // Align the address to a page boundary.
-    uintptr_t page_start = (uintptr_t)target_func;
+    // mprotect operates on whole pages, so round the target down to its page base.
     int page_size = getpagesize();
-    page_start = (page_start / page_size) * page_size;
+    uintptr_t page_base = ((uintptr_t)target_func / page_size) * page_size;
 
-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC);
-    (void)result;
+    int rc = mprotect((void*)page_base, page_size, PROT_READ | PROT_EXEC);
+    (void)rc;
 }
 #endif
 
@@ -275,6 +267,7 @@ recomp::mods::ModHandle::ModHandle(const ModContext& context, ModManifest&& mani
     thumbnail{ std::move(thumbnail) },
     game_indices{std::move(game_indices)}
 {
+    // The mod can be toggled at runtime only if none of its content types forbid it.
     runtime_toggleable = true;
     for (ModContentTypeId type : this->content_types) {
         if (!context.is_content_runtime_toggleable(type)) {
@@ -297,75 +290,81 @@ size_t recomp::mods::ModHandle::num_events() const {
 }
 
 void recomp::mods::ModHandle::populate_exports() {
+    // Index every exported function by its name for quick export lookups.
     for (size_t func_index : recompiler_context->exported_funcs) {
-        const auto& func_handle = recompiler_context->functions[func_index];
-        exports_by_name.emplace(func_handle.name, func_index);
+        const auto& exported = recompiler_context->functions[func_index];
+        exports_by_name.emplace(exported.name, func_index);
     }
 }
 
 recomp::mods::CodeModLoadError recomp::mods::ModHandle::load_native_library(const recomp::mods::NativeLibraryManifest& lib_manifest, std::string& error_param) {
-    std::string lib_filename = lib_manifest.name + std::string{DynamicLibrary::PlatformExtension};
-    std::filesystem::path lib_path = manifest.mod_root_path.parent_path() / lib_filename;
+    // Build the platform-specific filename and resolve it relative to the mod's directory.
+    std::string library_filename = lib_manifest.name + std::string{DynamicLibrary::PlatformExtension};
+    std::filesystem::path library_path = manifest.mod_root_path.parent_path() / library_filename;
 
-    std::unique_ptr<DynamicLibrary>& lib = native_libraries.emplace_back(std::make_unique<DynamicLibrary>(lib_path));
+    std::unique_ptr<DynamicLibrary>& library = native_libraries.emplace_back(std::make_unique<DynamicLibrary>(library_path));
 
-    if (!lib->good()) {
-        error_param = lib_filename;
+    // The library has to have actually loaded.
+    if (!library->good()) {
+        error_param = library_filename;
         return CodeModLoadError::FailedToLoadNativeLibrary;
     }
-    
-    std::string api_error_param;
-    CodeModLoadError api_error = validate_api_version(lib->get_api_version(), api_error_param);
 
-    if (api_error != CodeModLoadError::Good) {
-        if (api_error_param.empty()) {
-            error_param = lib_filename;
-        }
-        else {
-            error_param = lib_filename + ":" + api_error_param;
-        }
-        return api_error;
+    // The library's advertised API version has to be one we support.
+    std::string version_error_detail;
+    CodeModLoadError version_error = validate_api_version(library->get_api_version(), version_error_detail);
+
+    if (version_error != CodeModLoadError::Good) {
+        // Append the extra detail to the filename only when there is some.
+        error_param = version_error_detail.empty()
+            ? library_filename
+            : library_filename + ":" + version_error_detail;
+        return version_error;
     }
 
+    // Resolve every requested export, rejecting duplicates and missing symbols.
     native_library_exports.clear();
     for (const std::string& export_name : lib_manifest.exports) {
-        recomp_func_t* cur_func;
         if (native_library_exports.contains(export_name)) {
             error_param = export_name;
             return CodeModLoadError::DuplicateExport;
         }
-        if (!lib->get_dll_symbol(cur_func, export_name.c_str())) {
+
+        recomp_func_t* resolved_func;
+        if (!library->get_dll_symbol(resolved_func, export_name.c_str())) {
             error_param = lib_manifest.name + ":" + export_name;
             return CodeModLoadError::FailedToFindNativeExport;
         }
-        native_library_exports.emplace(export_name, cur_func);
+
+        native_library_exports.emplace(export_name, resolved_func);
     }
 
     return CodeModLoadError::Good;
 }
 
 bool recomp::mods::ModHandle::get_export_function(const std::string& export_name, GenericFunction& out) const {
-    // First, check the code exports.
+    // Prefer a recompiled code export if one matches the name.
     auto code_find_it = exports_by_name.find(export_name);
     if (code_find_it != exports_by_name.end()) {
         out = code_handle->get_function_handle(code_find_it->second);
         return true;
     }
 
-    // Next, check the native library exports.
+    // Otherwise fall back to an export provided by a native library.
     auto native_find_it = native_library_exports.find(export_name);
     if (native_find_it != native_library_exports.end()) {
         out = native_find_it->second;
         return true;
     }
 
-
-    // Nothing found.
+    // No export by that name in either table.
     return false;
 }
 
 void recomp::mods::ModHandle::populate_events() {
-    for (size_t event_index = 0; event_index < recompiler_context->event_symbols.size(); event_index++) {
+    // Map each event symbol's name to its local index.
+    size_t event_count = recompiler_context->event_symbols.size();
+    for (size_t event_index = 0; event_index < event_count; event_index++) {
         const N64Recomp::EventSymbol& event = recompiler_context->event_symbols[event_index];
         events_by_name.emplace(event.base.name, event_index);
     }
@@ -383,29 +382,31 @@ bool recomp::mods::ModHandle::get_global_event_index(const std::string& event_na
 
 recomp::mods::DynamicLibraryCodeHandle::DynamicLibraryCodeHandle(const std::filesystem::path& dll_path, const N64Recomp::Context& context, const ModCodeHandleInputs& inputs) {
     is_good = true;
-    // Load the DLL.
+    // Open the shared library.
     dynamic_lib = std::make_unique<DynamicLibrary>(dll_path);
     if (!dynamic_lib->good()) {
         is_good = false;
         return;
     }
 
-    // Fill out the list of function pointers.
+    // Resolve a pointer for each context function. Named functions are looked up
+    // directly; anonymous ones use the "mod_func_<index>" fallback naming.
     functions.resize(context.functions.size());
-    for (size_t i = 0; i < functions.size(); i++) {
-        if(!context.functions[i].name.empty()) {
-            is_good &= dynamic_lib->get_dll_symbol(functions[i], context.functions[i].name.c_str());
+    for (size_t func_index = 0; func_index < functions.size(); func_index++) {
+        const std::string& context_name = context.functions[func_index].name;
+        if (!context_name.empty()) {
+            is_good &= dynamic_lib->get_dll_symbol(functions[func_index], context_name.c_str());
         }
         else {
-            std::string func_name = "mod_func_" + std::to_string(i);
-            is_good &= dynamic_lib->get_dll_symbol(functions[i], func_name.c_str());
+            std::string fallback_name = "mod_func_" + std::to_string(func_index);
+            is_good &= dynamic_lib->get_dll_symbol(functions[func_index], fallback_name.c_str());
         }
         if (!is_good) {
             return;
         }
     }
 
-    // Get the standard exported symbols.
+    // Resolve the fixed set of well-known exported symbols.
     is_good = true;
     is_good &= dynamic_lib->get_dll_symbol(imported_funcs, "imported_funcs");
     is_good &= dynamic_lib->get_dll_symbol(reference_symbol_funcs, "reference_symbol_funcs");
@@ -453,22 +454,31 @@ void recomp::mods::DynamicLibraryCodeHandle::set_imported_function(size_t import
 }
 
 recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
-    size_t reference_symbol_index = 0;
+    // Walk every relocation across all sections, resolving the call-target
+    // relocations that point at regular reference sections.
+    size_t resolved_count = 0;
     for (const auto& section : context.sections) {
         for (const auto& reloc : section.relocs) {
-            if (reloc.type == N64Recomp::RelocType::R_MIPS_26 && reloc.reference_symbol && context.is_regular_reference_section(reloc.target_section)) {
-                recomp_func_t* cur_func = recomp::overlays::get_func_by_section_index_function_offset(reloc.target_section, reloc.target_section_offset);
-                if (cur_func == nullptr) {
-                    std::stringstream error_param_stream{};
-                    error_param_stream << std::hex <<
-                        "section: " << reloc.target_section <<
-                        " func offset: 0x" << reloc.target_section_offset;
-                    error_param = error_param_stream.str();
-                    return CodeModLoadError::InvalidReferenceSymbol;
-                }
-                reference_symbol_funcs[reference_symbol_index] = cur_func;
-                reference_symbol_index++;
+            bool is_call_reference =
+                reloc.type == N64Recomp::RelocType::R_MIPS_26 &&
+                reloc.reference_symbol &&
+                context.is_regular_reference_section(reloc.target_section);
+            if (!is_call_reference) {
+                continue;
             }
+
+            recomp_func_t* resolved_func = recomp::overlays::get_func_by_section_index_function_offset(reloc.target_section, reloc.target_section_offset);
+            if (resolved_func == nullptr) {
+                std::stringstream error_param_stream{};
+                error_param_stream << std::hex <<
+                    "section: " << reloc.target_section <<
+                    " func offset: 0x" << reloc.target_section_offset;
+                error_param = error_param_stream.str();
+                return CodeModLoadError::InvalidReferenceSymbol;
+            }
+
+            reference_symbol_funcs[resolved_count] = resolved_func;
+            resolved_count++;
         }
     }
     return CodeModLoadError::Good;
@@ -494,7 +504,7 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
         .pause_self = pause_self,
         .trigger_event = inputs.recomp_trigger_event,
         .reference_section_addresses = inputs.reference_section_addresses,
-        // Use the reference section addresses as the local section addresses if this is regenerated code so that jump tables work correctly.
+        // For regenerated code reuse the reference section addresses as the local section addresses so that jump tables resolve correctly.
         .local_section_addresses = regenerated ? inputs.reference_section_addresses : section_addresses.get(),
         .run_hook = run_hook,
         .entry_func_hooks = std::move(entry_func_hooks),
@@ -505,20 +515,20 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
     N64Recomp::LiveGenerator generator{ context.functions.size(), recompiler_inputs };
     std::vector<std::vector<uint32_t>> dummy_static_funcs{};
 
-    bool errored = false;
-
+    // Live-recompile every function in turn, stopping at the first failure.
+    bool recompile_failed = false;
     for (size_t func_index = 0; func_index < context.functions.size(); func_index++) {
         std::ostringstream dummy_ostream{};
 
         if (!N64Recomp::recompile_function_live(generator, context, func_index, dummy_ostream, dummy_static_funcs, true)) {
-            errored = true;
+            recompile_failed = true;
             break;
         }
     }
 
-    // Generate the code.
+    // Emit the generated code and record whether the whole process succeeded.
     recompiler_output = std::make_unique<N64Recomp::LiveGeneratorOutput>(generator.finish());
-    is_good = !errored && recompiler_output->good;
+    is_good = !recompile_failed && recompiler_output->good;
 }
 
 void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
@@ -530,12 +540,14 @@ void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t import
 }
 
 recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
-    size_t num_reference_jumps = recompiler_output->num_reference_symbol_jumps();
-    for (size_t jump_index = 0; jump_index < num_reference_jumps; jump_index++) {
+    // Resolve a real function pointer for every reference-symbol jump emitted by
+    // the live recompiler and patch it back into the generated output.
+    size_t jump_count = recompiler_output->num_reference_symbol_jumps();
+    for (size_t jump_index = 0; jump_index < jump_count; jump_index++) {
         N64Recomp::ReferenceJumpDetails jump_details = recompiler_output->get_reference_symbol_jump_details(jump_index);
 
-        recomp_func_t* cur_func = recomp::overlays::get_func_by_section_index_function_offset(jump_details.section, jump_details.section_offset);
-        if (cur_func == nullptr) {
+        recomp_func_t* resolved_func = recomp::overlays::get_func_by_section_index_function_offset(jump_details.section, jump_details.section_offset);
+        if (resolved_func == nullptr) {
             std::stringstream error_param_stream{};
             error_param_stream << std::hex <<
                 "section: " << jump_details.section <<
@@ -544,7 +556,7 @@ recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_
             return CodeModLoadError::InvalidReferenceSymbol;
         }
 
-        recompiler_output->set_reference_symbol_jump(jump_index, cur_func);
+        recompiler_output->set_reference_symbol_jump(jump_index, resolved_func);
     }
     return CodeModLoadError::Good;
 }
@@ -562,16 +574,19 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
         offset += count;
     };
 
+    // Make the target writable, overwrite its prologue with a trampoline to the
+    // replacement, then restore the original protection.
     uint64_t old_flags;
     unprotect(target_func_u8, &old_flags);
 
 #if defined(IS_X86_64)
+    // Encodes: movabs rax, <addr> ; jmp rax
     static const uint8_t movabs_rax[] = {0x48, 0xB8};
     static const uint8_t jmp_rax[] = {0xFF, 0xE0};
     std::visit(overloaded {
-        [&write_bytes](recomp_func_t* native_func) {
+        [&write_bytes](recomp_func_t* dest) {
            write_bytes(movabs_rax, sizeof(movabs_rax));
-           write_bytes(&native_func, sizeof(&native_func));
+           write_bytes(&dest, sizeof(&dest));
            write_bytes(jmp_rax, sizeof(jmp_rax));
         }
     }, replacement_func);
@@ -610,19 +625,20 @@ recomp::mods::ModLoadError recomp::mods::ModContext::load_mod(recomp::mods::ModH
     using namespace recomp::mods;
     mod.section_load_addresses.clear();
 
-    // Check that the mod's minimum recomp version is met.
+    // Refuse to load if the runtime is older than the mod requires.
     if (get_project_version() < mod.manifest.minimum_recomp_version) {
         error_param = mod.manifest.minimum_recomp_version.to_string();
         return ModLoadError::MinimumRecompVersionNotMet;
     }
 
+    // Fire the enable hook for every content type this mod provides.
     for (ModContentTypeId type_id : mod.content_types) {
-        content_enabled_callback* callback = content_types[type_id.value].on_enabled;
-        if (callback) {
-            callback(*this, mod);
+        content_enabled_callback* on_enabled = content_types[type_id.value].on_enabled;
+        if (on_enabled != nullptr) {
+            on_enabled(*this, mod);
         }
     }
-    
+
     return ModLoadError::Good;
 }
 
@@ -654,22 +670,25 @@ bool save_mod_config_storage(const std::filesystem::path &path, const std::strin
     config_json["recomp_version"] = recomp::get_project_version().to_string();
 
     json &storage_json = config_json["storage"];
-    for (auto it : config_storage.value_map) {
-        auto id_it = config_schema.options_by_id.find(it.first);
-        if (id_it == config_schema.options_by_id.end()) {
+    // Serialize each stored value, skipping any whose id is no longer in the schema.
+    for (auto stored_value : config_storage.value_map) {
+        const std::string &option_id = stored_value.first;
+        auto option_lookup = config_schema.options_by_id.find(option_id);
+        if (option_lookup == config_schema.options_by_id.end()) {
             continue;
         }
 
-        const recomp::mods::ConfigOption &config_option = config_schema.options[id_it->second];
+        const recomp::mods::ConfigOption &config_option = config_schema.options[option_lookup->second];
         switch (config_option.type) {
         case recomp::mods::ConfigOptionType::Enum:
-            storage_json[it.first] = std::get<recomp::mods::ConfigOptionEnum>(config_option.variant).options[std::get<uint32_t>(it.second)];
+            // Enums are persisted as the human-readable option string rather than the index.
+            storage_json[option_id] = std::get<recomp::mods::ConfigOptionEnum>(config_option.variant).options[std::get<uint32_t>(stored_value.second)];
             break;
         case recomp::mods::ConfigOptionType::Number:
-            storage_json[it.first] = std::get<double>(it.second);
+            storage_json[option_id] = std::get<double>(stored_value.second);
             break;
         case recomp::mods::ConfigOptionType::String:
-            storage_json[it.first] = std::get<std::string>(it.second);
+            storage_json[option_id] = std::get<std::string>(stored_value.second);
             break;
         default:
             assert(false && "Unknown config type.");
@@ -695,16 +714,18 @@ bool parse_mods_config(const std::filesystem::path &path, std::unordered_set<std
         return false;
     }
 
+    // Pull the set of enabled mods, if the field is present and well-formed.
     auto enabled_mods_json = config_json.find("enabled_mods");
     if (enabled_mods_json != config_json.end()) {
-        std::vector<std::string> enabled_mods_vector;
-        if (get_to_vec<std::string>(*enabled_mods_json, enabled_mods_vector)) {
-            for (const std::string &mod_id : enabled_mods_vector) {
+        std::vector<std::string> parsed_enabled;
+        if (get_to_vec<std::string>(*enabled_mods_json, parsed_enabled)) {
+            for (const std::string &mod_id : parsed_enabled) {
                 enabled_mods.emplace(mod_id);
             }
         }
     }
 
+    // Pull the mod ordering directly into the caller's vector when present.
     auto mod_order_json = config_json.find("mod_order");
     if (mod_order_json != config_json.end()) {
         get_to_vec<std::string>(*mod_order_json, mod_order);
@@ -755,23 +776,24 @@ void recomp::mods::ModContext::dirty_mod_configuration_thread_process() {
     };
 
     while (active) {
-        // Wait for at least one mod to require writing.
+        // Block until there's at least one request to process.
         mod_configuration_thread_queue.wait_dequeue(variant);
         handle_variant(variant);
 
 
-        // Clear out the entire queue to coalesce all writes with a timeout.
+        // Keep draining the queue (with a short timeout) so that bursts of writes get batched together.
         while (active && mod_configuration_thread_queue.wait_dequeue_timed(variant, 1s)) {
             handle_variant(variant);
         }
 
         if (active && !pending_mods.empty()) {
             {
+                // Snapshot each pending mod's storage/schema/version while holding the locks.
                 std::unique_lock opened_mods_lock(opened_mods_mutex);
                 for (const std::string &id : pending_mods) {
-                    auto it = opened_mods_by_id.find(id);
-                    if (it != opened_mods_by_id.end()) {
-                        const ModHandle &mod = opened_mods[it->second];
+                    auto mod_it = opened_mods_by_id.find(id);
+                    if (mod_it != opened_mods_by_id.end()) {
+                        const ModHandle &mod = opened_mods[mod_it->second];
                         std::unique_lock config_storage_lock(mod_config_storage_mutex);
                         pending_mod_storage[id] = mod.config_storage;
                         pending_mod_schema[id] = mod.manifest.config_schema;
@@ -780,6 +802,7 @@ void recomp::mods::ModContext::dirty_mod_configuration_thread_process() {
                 }
             }
 
+            // Write the snapshots out without holding any locks.
             for (const std::string &id : pending_mods) {
                 config_path = mod_config_directory / std::string(id + ".json");
                 save_mod_config_storage(config_path, id, pending_mod_version[id], pending_mod_storage[id], pending_mod_schema[id]);
@@ -790,8 +813,8 @@ void recomp::mods::ModContext::dirty_mod_configuration_thread_process() {
 
         if (active && pending_config_save) {
             {
-                // Store the enabled mods and the order.
-                std::unique_lock lock(opened_mods_mutex);
+                // Copy out the enabled set and current order under the lock.
+                std::unique_lock order_lock(opened_mods_mutex);
                 config_enabled_mods = enabled_mods;
                 config_mod_order.clear();
                 for (size_t mod_index : opened_mods_order) {
@@ -815,12 +838,14 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
         bool is_mod = false;
         bool requires_manifest = true;
         std::reference_wrapper<const std::vector<ModContentTypeId>> supported_content_types = std::cref(empty_content_types);
+        // A regular file is a mod only if its extension matches a registered container type;
+        // a directory is always treated as a (loose) mod.
         if (mod_path.is_regular_file()) {
-            auto find_container_it = container_types.find(mod_path.path().extension().string());
-            if (find_container_it != container_types.end()) {
+            auto container_it = container_types.find(mod_path.path().extension().string());
+            if (container_it != container_types.end()) {
                 is_mod = true;
-                supported_content_types = find_container_it->second.supported_content_types;
-                requires_manifest = find_container_it->second.requires_manifest;
+                supported_content_types = container_it->second.supported_content_types;
+                requires_manifest = container_it->second.requires_manifest;
             }
         }
         else if (mod_path.is_directory()) {
@@ -861,48 +886,49 @@ void recomp::mods::ModContext::load_mods_config() {
     std::vector<bool> opened_mod_is_known;
     parse_mods_config(mods_config_path, config_enabled_mods, config_mod_order);
 
-    // Fill a vector with the relative order of the mods. Existing mods will get ordered below new mods.
-    std::vector<size_t> sort_order;
-    sort_order.resize(opened_mods.size());
+    // Give every mod a sort key. Unrecognized (new) mods keep their default key
+    // (their index), while mods named in the saved order receive larger keys so
+    // they sort after the new ones while retaining their saved relative order.
+    std::vector<size_t> relative_order;
+    relative_order.resize(opened_mods.size());
     opened_mod_is_known.resize(opened_mods.size(), false);
-    std::iota(sort_order.begin(), sort_order.end(), 0);
-    for (size_t i = 0; i < config_mod_order.size(); i++) {
-        auto it = opened_mods_by_id.find(config_mod_order[i]);
-        if (it != opened_mods_by_id.end()) {
-            sort_order[it->second] = opened_mods.size() + i;
-            opened_mod_is_known[it->second] = true;
+    std::iota(relative_order.begin(), relative_order.end(), 0);
+    for (size_t order_pos = 0; order_pos < config_mod_order.size(); order_pos++) {
+        auto id_it = opened_mods_by_id.find(config_mod_order[order_pos]);
+        if (id_it != opened_mods_by_id.end()) {
+            relative_order[id_it->second] = opened_mods.size() + order_pos;
+            opened_mod_is_known[id_it->second] = true;
         }
     }
 
-    // Run the sort using the relative order computed before.
+    // Sort the order list by the computed keys.
     std::iota(opened_mods_order.begin(), opened_mods_order.end(), 0);
-    std::sort(opened_mods_order.begin(), opened_mods_order.end(), [&](size_t i, size_t j) {
-        return sort_order[i] < sort_order[j];
+    std::sort(opened_mods_order.begin(), opened_mods_order.end(), [&](size_t lhs, size_t rhs) {
+        return relative_order[lhs] < relative_order[rhs];
     });
 
     rebuild_mod_order_lookup();
 
-    // Enable mods that are specified in the configuration or mods that are considered new.
-    for (size_t i = 0; i < opened_mods.size(); i++) {
-        const ModHandle& mod = opened_mods[i];
+    // Enable any mod that the config marks enabled, plus brand-new mods whose manifest opts in by default.
+    for (size_t mod_index = 0; mod_index < opened_mods.size(); mod_index++) {
+        const ModHandle& mod = opened_mods[mod_index];
         const std::string &mod_id = mod.manifest.mod_id;
-        bool is_default_enabled = !opened_mod_is_known[i] && mod.manifest.enabled_by_default;
-        bool is_manually_enabled = config_enabled_mods.contains(mod_id);
-        if (is_default_enabled || is_manually_enabled) {
+        bool default_enabled = !opened_mod_is_known[mod_index] && mod.manifest.enabled_by_default;
+        bool manually_enabled = config_enabled_mods.contains(mod_id);
+        if (default_enabled || manually_enabled) {
             enable_mod(mod_id, true, false);
         }
     }
 }
 
 void recomp::mods::ModContext::rebuild_mod_order_lookup() {
-    // Initialize the mod order lookup to all -1 so that mods that aren't enabled have an order index of -1.
+    // Default every entry to -1; a mod that never appears in the order list keeps that sentinel.
     mod_order_lookup.resize(opened_mods.size());
     std::fill(mod_order_lookup.begin(), mod_order_lookup.end(), static_cast<size_t>(-1));
 
-    // Build the lookup of mod index to mod order by inverting the opened mods order list.
-    for (size_t mod_order_index = 0; mod_order_index < opened_mods_order.size(); mod_order_index++) {
-        size_t mod_index = opened_mods_order[mod_order_index];
-        mod_order_lookup[mod_index] = mod_order_index;
+    // The lookup is just the inverse of opened_mods_order (mod index -> order position).
+    for (size_t order_index = 0; order_index < opened_mods_order.size(); order_index++) {
+        mod_order_lookup[opened_mods_order[order_index]] = order_index;
     }
 }
 
@@ -947,27 +973,27 @@ recomp::mods::ModContentTypeId recomp::mods::ModContext::register_content_type(c
 }
 
 bool recomp::mods::ModContext::register_container_type(const std::string& extension, const std::vector<ModContentTypeId>& container_content_types, bool requires_manifest) {
-    // Validate the provided content type IDs.
+    // Every referenced content type ID must already exist.
     for (ModContentTypeId id : container_content_types) {
         if (id.value >= content_types.size()) {
             return false;
         }
     }
-    
-    // Validate that the extension doesn't contain a dot.
+
+    // The caller passes the extension without a leading dot, so reject one if present.
     if (extension.find('.') != std::string::npos) {
         return false;
     }
 
-    // Prepend a dot to the extension to get the real extension that will be registered..
+    // The key actually stored includes the leading dot.
     std::string true_extension = "." + extension;
 
-    // Validate that this extension hasn't been registered already.
+    // Reject a second registration of the same extension.
     if (container_types.contains(true_extension)) {
         return false;
     }
 
-    // Register the container type.
+    // Store the new container type.
     container_types.emplace(true_extension,
         ModContainerType {
             .supported_content_types = container_content_types,
@@ -996,20 +1022,22 @@ std::pair<std::string, std::string> recomp::mods::ModContext::get_mod_import_inf
 recomp::mods::DependencyStatus recomp::mods::ModContext::is_dependency_met(size_t mod_index, const std::string& dependency_id) const {
     const ModHandle& mod = opened_mods[mod_index];
 
-    auto find_dep = mod.manifest.dependencies_by_id.find(dependency_id);
-    if (find_dep == mod.manifest.dependencies_by_id.end()) {
+    // The id must actually be declared as a dependency of this mod.
+    auto manifest_dep_it = mod.manifest.dependencies_by_id.find(dependency_id);
+    if (manifest_dep_it == mod.manifest.dependencies_by_id.end()) {
         return DependencyStatus::InvalidDependency;
     }
 
-    auto find_dep_mod = loaded_mods_by_id.find(dependency_id);
-    if (find_dep_mod == loaded_mods_by_id.end()) {
+    // The dependency also has to currently be loaded.
+    auto loaded_dep_it = loaded_mods_by_id.find(dependency_id);
+    if (loaded_dep_it == loaded_mods_by_id.end()) {
         return DependencyStatus::NotFound;
     }
 
-    const Dependency& dep = mod.manifest.dependencies[find_dep->second];
-    const ModHandle& dep_mod = opened_mods[find_dep_mod->second];
-
-    if (dep_mod.manifest.version < dep.version) {
+    // Finally the loaded version has to satisfy the required version.
+    const Dependency& required = mod.manifest.dependencies[manifest_dep_it->second];
+    const ModHandle& dep_mod = opened_mods[loaded_dep_it->second];
+    if (dep_mod.manifest.version < required.version) {
         return DependencyStatus::WrongVersion;
     }
 
@@ -1023,61 +1051,66 @@ bool recomp::mods::ModContext::is_content_runtime_toggleable(ModContentTypeId co
 }
 
 void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enabled, bool trigger_save) {
-    // Check that the mod exists.
+    // Look the mod up; silently ignore unknown ids.
     std::unique_lock lock(opened_mods_mutex);
-    auto find_it = opened_mods_by_id.find(mod_id);
-    if (find_it == opened_mods_by_id.end()) {
+    auto mod_it = opened_mods_by_id.find(mod_id);
+    if (mod_it == opened_mods_by_id.end()) {
         return;
     }
-    ModHandle& mod = opened_mods[find_it->second];
+    ModHandle& mod = opened_mods[mod_it->second];
 
     bool mods_loaded = active_game != (size_t)-1;
 
-    // Do nothing if mods have already been loaded and this mod isn't runtime toggleable.
-    if (!mod.is_runtime_toggleable() && mods_loaded) {
+    // Once mods are loaded, only runtime-toggleable mods belonging to the active
+    // game may be toggled; otherwise this is a no-op.
+    if (mods_loaded && !mod.is_runtime_toggleable()) {
         return;
     }
-
-    // Do nothing if mods have already been loaded and this mod isn't for the active game.
     if (mods_loaded && !mod.is_for_game(active_game)) {
         return;
     }
 
     if (enabled) {
-        bool was_enabled = enabled_mods.emplace(mod_id).second;
+        bool newly_enabled = enabled_mods.emplace(mod_id).second;
 
-        // If mods have been loaded and a mod was successfully enabled by this call, call the on_enabled handlers for its content types.
-        if (was_enabled && mods_loaded) {
+        // Fire on_enabled for the mod's content types if it actually transitioned to enabled after load.
+        if (newly_enabled && mods_loaded) {
             for (ModContentTypeId type_id : mod.content_types) {
-                content_enabled_callback* callback = content_types[type_id.value].on_enabled;
-                if (callback) {
-                    callback(*this, mod);
+                content_enabled_callback* on_enabled = content_types[type_id.value].on_enabled;
+                if (on_enabled != nullptr) {
+                    on_enabled(*this, mod);
                 }
             }
         }
 
-        if (was_enabled) {
-            std::vector<std::string> mod_stack;
-            mod_stack.emplace_back(mod_id);
-            while (!mod_stack.empty()) {
-                std::string mod_from_stack = std::move(mod_stack.back());
-                mod_stack.pop_back();
+        if (newly_enabled) {
+            // Walk the required-dependency graph starting from this mod, marking each
+            // newly reached non-optional dependency as auto-enabled.
+            std::vector<std::string> pending;
+            pending.emplace_back(mod_id);
+            while (!pending.empty()) {
+                std::string current_id = std::move(pending.back());
+                pending.pop_back();
 
-                auto mod_from_stack_it = opened_mods_by_id.find(mod_from_stack);
-                if (mod_from_stack_it != opened_mods_by_id.end()) {
-                    const ModHandle &mod_from_stack_handle = opened_mods[mod_from_stack_it->second];
-                    for (const Dependency &dependency : mod_from_stack_handle.manifest.dependencies) {
-                        if (!dependency.optional && !auto_enabled_mods.contains(dependency.mod_id)) {
-                            auto_enabled_mods.emplace(dependency.mod_id);
-                            mod_stack.emplace_back(dependency.mod_id);
+                auto current_it = opened_mods_by_id.find(current_id);
+                if (current_it == opened_mods_by_id.end()) {
+                    continue;
+                }
 
-                            if (mods_loaded) {
-                                for (ModContentTypeId type_id : mod_from_stack_handle.content_types) {
-                                    content_enabled_callback* callback = content_types[type_id.value].on_enabled;
-                                    if (callback) {
-                                        callback(*this, mod_from_stack_handle);
-                                    }
-                                }
+                const ModHandle &current_mod = opened_mods[current_it->second];
+                for (const Dependency &dependency : current_mod.manifest.dependencies) {
+                    if (dependency.optional || auto_enabled_mods.contains(dependency.mod_id)) {
+                        continue;
+                    }
+
+                    auto_enabled_mods.emplace(dependency.mod_id);
+                    pending.emplace_back(dependency.mod_id);
+
+                    if (mods_loaded) {
+                        for (ModContentTypeId type_id : current_mod.content_types) {
+                            content_enabled_callback* on_enabled = content_types[type_id.value].on_enabled;
+                            if (on_enabled != nullptr) {
+                                on_enabled(*this, current_mod);
                             }
                         }
                     }
@@ -1086,60 +1119,66 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
         }
     }
     else {
-        bool was_disabled = enabled_mods.erase(mod_id) != 0;
+        bool newly_disabled = enabled_mods.erase(mod_id) != 0;
 
-        // If mods have been loaded and a mod was successfully disabled by this call, call the on_disabled handlers for its content types.
-        if (was_disabled && mods_loaded) {
+        // Fire on_disabled for the mod's content types if it actually transitioned to disabled after load.
+        if (newly_disabled && mods_loaded) {
             for (ModContentTypeId type_id : mod.content_types) {
-                content_disabled_callback* callback = content_types[type_id.value].on_disabled;
-                if (callback) {
-                    callback(*this, mod);
+                content_disabled_callback* on_disabled = content_types[type_id.value].on_disabled;
+                if (on_disabled != nullptr) {
+                    on_disabled(*this, mod);
                 }
             }
         }
 
-        if (was_disabled) {
-            // The algorithm needs to be run again with a new set of auto-enabled mods from scratch for all enabled mods.
-            std::unordered_set<std::string> new_auto_enabled_mods;
-            for (const std::string &enabled_mod_id : enabled_mods) {
-                std::vector<std::string> mod_stack;
-                mod_stack.emplace_back(enabled_mod_id);
-                while (!mod_stack.empty()) {
-                    std::string mod_from_stack = std::move(mod_stack.back());
-                    mod_stack.pop_back();
+        if (newly_disabled) {
+            // Disabling a mod can change the whole auto-enabled set, so recompute it
+            // from scratch by traversing the dependency graph of every still-enabled mod.
+            std::unordered_set<std::string> rebuilt_auto_enabled;
+            for (const std::string &root_id : enabled_mods) {
+                std::vector<std::string> pending;
+                pending.emplace_back(root_id);
+                while (!pending.empty()) {
+                    std::string current_id = std::move(pending.back());
+                    pending.pop_back();
 
-                    auto mod_from_stack_it = opened_mods_by_id.find(mod_from_stack);
-                    if (mod_from_stack_it != opened_mods_by_id.end()) {
-                        const ModHandle &mod_from_stack_handle = opened_mods[mod_from_stack_it->second];
-                        for (const Dependency &dependency : mod_from_stack_handle.manifest.dependencies) {
-                            if (!dependency.optional && !new_auto_enabled_mods.contains(dependency.mod_id)) {
-                                new_auto_enabled_mods.emplace(dependency.mod_id);
-                                mod_stack.emplace_back(dependency.mod_id);
-                            }
+                    auto current_it = opened_mods_by_id.find(current_id);
+                    if (current_it == opened_mods_by_id.end()) {
+                        continue;
+                    }
+
+                    const ModHandle &current_mod = opened_mods[current_it->second];
+                    for (const Dependency &dependency : current_mod.manifest.dependencies) {
+                        if (!dependency.optional && !rebuilt_auto_enabled.contains(dependency.mod_id)) {
+                            rebuilt_auto_enabled.emplace(dependency.mod_id);
+                            pending.emplace_back(dependency.mod_id);
                         }
                     }
                 }
             }
 
             if (mods_loaded) {
-                // Before replacing the old set with the new one, whatever does not exist in the new set anymore should trigger it's on_disabled callback.
-                for (const std::string &enabled_mod_id : auto_enabled_mods) {
-                    if (!new_auto_enabled_mods.contains(enabled_mod_id)) {
-                        auto enabled_mod_it = opened_mods_by_id.find(enabled_mod_id);
-                        if (enabled_mod_it != opened_mods_by_id.end()) {
-                            const ModHandle &enabled_mod_handle = opened_mods[enabled_mod_it->second];
-                            for (ModContentTypeId type_id : enabled_mod_handle.content_types) {
-                                content_disabled_callback* callback = content_types[type_id.value].on_disabled;
-                                if (callback) {
-                                    callback(*this, enabled_mod_handle);
-                                }
+                // Any mod that was auto-enabled before but is no longer in the rebuilt set
+                // has effectively been disabled, so fire its on_disabled callbacks.
+                for (const std::string &previous_id : auto_enabled_mods) {
+                    if (rebuilt_auto_enabled.contains(previous_id)) {
+                        continue;
+                    }
+
+                    auto previous_it = opened_mods_by_id.find(previous_id);
+                    if (previous_it != opened_mods_by_id.end()) {
+                        const ModHandle &previous_mod = opened_mods[previous_it->second];
+                        for (ModContentTypeId type_id : previous_mod.content_types) {
+                            content_disabled_callback* on_disabled = content_types[type_id.value].on_disabled;
+                            if (on_disabled != nullptr) {
+                                on_disabled(*this, previous_mod);
                             }
                         }
                     }
                 }
             }
 
-            auto_enabled_mods = new_auto_enabled_mods;
+            auto_enabled_mods = rebuilt_auto_enabled;
         }
     }
 
@@ -1278,27 +1317,25 @@ struct RegeneratedList {
 N64Recomp::Context context_from_regenerated_list(const RegeneratedList& regenlist, std::span<const uint8_t> rom) {
     N64Recomp::Context ret{};
 
-    // TODO avoid copying the whole ROM into the context somehow.
+    // TODO find a way to avoid duplicating the entire ROM into the context.
     ret.rom.assign(rom.begin(), rom.end());
 
     ret.sections.resize(regenlist.sections.size());
     ret.section_functions.resize(regenlist.sections.size());
     ret.functions.resize(regenlist.functions.size());
 
-    for (size_t section_index = 0; section_index < regenlist.sections.size(); section_index++) {
+    size_t section_count = regenlist.sections.size();
+    for (size_t section_index = 0; section_index < section_count; section_index++) {
         const RegeneratedSection& section_in = regenlist.sections[section_index];
         N64Recomp::Section& section_out = ret.sections[section_index];
 
-        size_t cur_num_funcs;
-        size_t cur_num_relocs;
-        if (section_index == regenlist.sections.size() - 1) {
-            cur_num_funcs = regenlist.functions.size() - section_in.first_func_index;
-            cur_num_relocs = regenlist.relocs.size() - section_in.first_reloc_index;
-        }
-        else {
-            cur_num_funcs = regenlist.sections[section_index + 1].first_func_index - section_in.first_func_index;
-            cur_num_relocs = regenlist.sections[section_index + 1].first_reloc_index - section_in.first_reloc_index;
-        }
+        // The function/reloc counts for a section are the gap between its first
+        // index and the next section's first index (or the list end for the last one).
+        bool is_last_section = (section_index + 1 == section_count);
+        size_t func_list_end = is_last_section ? regenlist.functions.size() : regenlist.sections[section_index + 1].first_func_index;
+        size_t reloc_list_end = is_last_section ? regenlist.relocs.size() : regenlist.sections[section_index + 1].first_reloc_index;
+        size_t cur_num_funcs = func_list_end - section_in.first_func_index;
+        size_t cur_num_relocs = reloc_list_end - section_in.first_reloc_index;
 
         section_out.rom_addr = section_in.rom_addr;
         section_out.ram_addr = section_in.ram_addr;
@@ -1316,11 +1353,11 @@ N64Recomp::Context context_from_regenerated_list(const RegeneratedList& regenlis
         section_funcs_out.resize(cur_num_funcs);
 
         for (size_t section_function_index = 0; section_function_index < cur_num_funcs; section_function_index++) {
-            // Get the global index of the function within the context.
+            // Translate the section-local function index to the context-global one.
             size_t function_index = section_in.first_func_index + section_function_index;
             section_funcs_out[section_function_index] = function_index;
 
-            // Populate the fields of the function.
+            // Fill in this function's metadata.
             const RegeneratedFunction& function_in = regenlist.functions[function_index];
             N64Recomp::Function& function_out = ret.functions[function_index];
             function_out.vram = section_out.ram_addr + function_in.section_offset;
@@ -1333,16 +1370,16 @@ N64Recomp::Context context_from_regenerated_list(const RegeneratedList& regenlis
             function_out.stubbed = false;
             function_out.function_hooks.clear();
 
-            // Copy the function's words.
+            // Copy the raw instruction words straight out of the ROM image.
             const uint32_t* func_words = reinterpret_cast<const uint32_t*>(rom.data() + function_out.rom);
             function_out.words.assign(func_words, func_words + function_in.size / sizeof(uint32_t));
-            
-            // Add the function to the lookup table.
+
+            // Register the function in the vram lookup map.
             ret.functions_by_vram[function_out.vram].push_back(function_index);
         }
 
         for (size_t section_reloc_index = 0; section_reloc_index < cur_num_relocs; section_reloc_index++) {
-            // Get the global index of the reloc within the regenlist.
+            // Translate the section-local reloc index to the global one.
             size_t reloc_index = section_in.first_reloc_index + section_reloc_index;
 
             const RegeneratedReloc& reloc_in = regenlist.relocs[reloc_index];
@@ -1351,11 +1388,11 @@ N64Recomp::Context context_from_regenerated_list(const RegeneratedList& regenlis
             reloc_out.address = reloc_in.section_offset + section_out.ram_addr;
             reloc_out.target_section_offset = reloc_in.target_section_offset;
             if (reloc_in.target_section == N64Recomp::SectionEvent) {
-                // Symbol index holds the event index for event reference symbols.
+                // For event reference symbols the symbol index doubles as the event index.
                 reloc_out.symbol_index = reloc_in.target_section_offset;
             }
             else {
-                reloc_out.symbol_index = 0; // Unused for live recompilation.
+                reloc_out.symbol_index = 0; // Live recompilation doesn't consult this field.
             }
             reloc_out.target_section = reloc_in.target_section;
             reloc_out.type = static_cast<N64Recomp::RelocType>(reloc_in.type);
@@ -1368,11 +1405,12 @@ N64Recomp::Context context_from_regenerated_list(const RegeneratedList& regenlis
 
 void recomp::mods::ModContext::set_mod_index(const std::string &mod_game_id, const std::string &mod_id, size_t index) {
     std::unique_lock lock(opened_mods_mutex);
+    // An empty game id means the ordering view spans every game.
     bool all_games = mod_game_id.empty();
     size_t game_index = (size_t)-1;
-    auto find_game_it = mod_game_ids.find(mod_game_id);
-    if (find_game_it != mod_game_ids.end()) {
-        game_index = find_game_it->second;
+    auto game_it = mod_game_ids.find(mod_game_id);
+    if (game_it != mod_game_ids.end()) {
+        game_index = game_it->second;
     }
 
     auto id_it = opened_mods_by_id.find(mod_id);
@@ -1381,38 +1419,42 @@ void recomp::mods::ModContext::set_mod_index(const std::string &mod_game_id, con
     }
 
     size_t mod_index = id_it->second;
-    size_t search_index = 0;
+    // The requested index counts only mods visible in this view, so track a
+    // separate visible position while scanning the full order list.
+    size_t visible_index = 0;
     bool inserted = false;
     bool erased = false;
     for (size_t i = 0; i < opened_mods_order.size() && (!inserted || !erased); i++) {
-        size_t current_index = opened_mods_order[i];
-        const ModHandle &mod = opened_mods[current_index];
+        size_t order_entry = opened_mods_order[i];
+        const ModHandle &mod = opened_mods[order_entry];
         if (all_games || mod.is_for_game(game_index)) {
-            if (index == search_index) {
-                // This index corresponds to the one from the view. Insert the mod here.
+            if (index == visible_index) {
+                // Reached the requested visible slot: drop the mod in ahead of this entry.
                 opened_mods_order.insert(opened_mods_order.begin() + i, mod_index);
                 inserted = true;
             }
-            else if (mod_index == current_index) {
-                // This index corresponds to the previous position the mod had. Erase it.
+            else if (mod_index == order_entry) {
+                // Reached the mod's old location: remove it so it only lives at the new slot.
                 opened_mods_order.erase(opened_mods_order.begin() + i);
                 erased = true;
             }
 
-            search_index++;
+            visible_index++;
         }
     }
 
+    // If the requested slot was past the end, just append.
     if (!inserted) {
         opened_mods_order.push_back(mod_index);
     }
 
     rebuild_mod_order_lookup();
 
+    // Notify content types that care about reordering.
     for (ModContentTypeId type_id : opened_mods[mod_index].content_types) {
-        content_reordered_callback* callback = content_types[type_id.value].on_reordered;
-        if (callback) {
-            callback(*this);
+        content_reordered_callback* on_reordered = content_types[type_id.value].on_reordered;
+        if (on_reordered != nullptr) {
+            on_reordered(*this);
         }
     }
 
@@ -1449,10 +1491,11 @@ void recomp::mods::ModContext::set_mod_config_value(size_t mod_index, const std:
 
     ModHandle &mod = opened_mods[mod_index];
     std::unique_lock lock(mod_config_storage_mutex);
-    auto option_by_id_it = mod.manifest.config_schema.options_by_id.find(option_id);
-    if (option_by_id_it != mod.manifest.config_schema.options_by_id.end()) {
-        // Only accept setting values if the value exists and the variant is the right type.
-        const ConfigOption &option = mod.manifest.config_schema.options[option_by_id_it->second];
+    auto schema_it = mod.manifest.config_schema.options_by_id.find(option_id);
+    if (schema_it != mod.manifest.config_schema.options_by_id.end()) {
+        // Store the value only when its variant type matches the option's declared type
+        // (and, for enums, when the index is within range).
+        const ConfigOption &option = mod.manifest.config_schema.options[schema_it->second];
         switch (option.type) {
         case ConfigOptionType::Enum:
             if (std::holds_alternative<uint32_t>(value)) {
@@ -1480,7 +1523,7 @@ void recomp::mods::ModContext::set_mod_config_value(size_t mod_index, const std:
         }
     }
 
-    // Notify the asynchronous thread it should save the configuration for this mod.
+    // Ask the background thread to persist this mod's configuration.
     mod_configuration_thread_queue.enqueue(ModConfigQueueSaveMod{ mod.manifest.mod_id });
 }
 
@@ -1502,18 +1545,18 @@ recomp::mods::ConfigValueVariant recomp::mods::ModContext::get_mod_config_value(
 
     const ModHandle &mod = opened_mods[mod_index];
     std::unique_lock lock(mod_config_storage_mutex);
-    auto it = mod.config_storage.value_map.find(option_id);
-    if (it != mod.config_storage.value_map.end()) {
-        return it->second;
+    auto stored_it = mod.config_storage.value_map.find(option_id);
+    if (stored_it != mod.config_storage.value_map.end()) {
+        return stored_it->second;
     }
     else {
-        // Attempt to see if we can find a default value from the schema.
-        auto option_by_id_it = mod.manifest.config_schema.options_by_id.find(option_id);
-        if (option_by_id_it == mod.manifest.config_schema.options_by_id.end()) {
+        // No stored value, so fall back to the schema's declared default.
+        auto schema_it = mod.manifest.config_schema.options_by_id.find(option_id);
+        if (schema_it == mod.manifest.config_schema.options_by_id.end()) {
             return std::monostate();
         }
 
-        const ConfigOption &option = mod.manifest.config_schema.options[option_by_id_it->second];
+        const ConfigOption &option = mod.manifest.config_schema.options[schema_it->second];
         switch (option.type) {
         case ConfigOptionType::Enum:
             return std::get<ConfigOptionEnum>(option.variant).default_value;
@@ -1554,7 +1597,8 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
 
     std::span<const uint8_t> decompressed_rom{};
 
-    // Decompress the rom if needed.
+    // Games with compressed code need their ROM run through the decompression
+    // routine first; everything else can use the ROM image as-is.
     std::vector<uint8_t> decompressed_rom_data{};
     if (game_entry.has_compressed_code) {
         if (game_entry.decompression_routine != nullptr) {
@@ -1562,21 +1606,21 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
         }
         decompressed_rom = std::span{decompressed_rom_data};
     }
-    // Otherwise, assign the regular rom as the decompressed rom since no decompression is needed.
     else {
         decompressed_rom = recomp::get_rom();
     }
 
-    // Collect the set of functions patched by the base recomp.
+    // Gather every function that the base recomp itself has already patched.
     std::unordered_map<recomp_func_t*, recomp::overlays::BasePatchedFunction> base_patched_funcs = recomp::overlays::get_base_patched_funcs();
 
-    auto find_index_it = mod_game_ids.find(game_entry.mod_game_id);
-    if (find_index_it == mod_game_ids.end()) {
+    // The game has to be one we have a registered mod id for.
+    auto game_index_it = mod_game_ids.find(game_entry.mod_game_id);
+    if (game_index_it == mod_game_ids.end()) {
         ret.emplace_back(game_entry.mod_game_id, ModLoadError::InvalidGame, std::string{});
         return ret;
     }
 
-    size_t mod_game_index = find_index_it->second;
+    size_t mod_game_index = game_index_it->second;
 
     if (!patched_funcs.empty()) {
         printf("Mods already loaded!\n");
@@ -1587,7 +1631,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
 
     std::vector<size_t> active_mods{};
 
-    // Find and load active mods.
+    // Collect every mod that targets this game and is either explicitly or automatically enabled, then load each.
     for (size_t mod_index = 0; mod_index < opened_mods.size(); mod_index++) {
         auto& mod = opened_mods[mod_index];
         if (mod.is_for_game(mod_game_index) && (enabled_mods.contains(mod.manifest.mod_id) || auto_enabled_mods.contains(mod.manifest.mod_id))) {
@@ -1604,13 +1648,13 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
         }
     }
 
-    // Exit early if errors were found.
+    // Abort the whole load if anything went wrong in this phase.
     if (!ret.empty()) {
         unload_mods();
         return ret;
     }
 
-    // Check that mod dependencies are met.
+    // Verify every active mod's dependencies are satisfied.
     for (size_t mod_index : active_mods) {
         auto& mod = opened_mods[mod_index];
         std::vector<std::pair<ModLoadError, std::string>> cur_errors;
@@ -1623,7 +1667,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
         }
     }
 
-    // Exit early if errors were found.
+    // Abort the whole load if anything went wrong in this phase.
     if (!ret.empty()) {
         unload_mods();
         return ret;
@@ -1632,7 +1676,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
     std::vector<uint32_t> base_event_indices;
     base_event_indices.resize(opened_mods.size());
 
-    // Parse the code mods and load their binary data.
+    // First code-mod pass: parse symbols, copy binaries into RDRAM and reserve event slots.
     for (size_t mod_index : loaded_code_mods) {
         uint32_t cur_ram_used = 0;
         auto& mod = opened_mods[mod_index];
@@ -1654,26 +1698,26 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
         }
     }
 
-    // Exit early if errors were found.
+    // Abort the whole load if anything went wrong in this phase.
     if (!ret.empty()) {
         unload_mods();
         return ret;
     }
 
-    // Set up the event callbacks based on the number of events allocated.
+    // Allocate the event callback table now that the total event count is known.
     recomp::mods::setup_events(num_events);
 
     // TODO if any hooks have been made but the decompressed rom isn't available,
     // present an error and stop loading mods.
 
-    // Set up the hook slots based on the number of unique hooks.
+    // Allocate one hook slot per unique hook definition discovered above.
     recomp::mods::setup_hooks(hook_slots.size());
 
-    // Allocate room for tracking the processed hook slots.
+    // Prepare the processed-slot tracking bitset.
     processed_hook_slots.clear();
     processed_hook_slots.resize(hook_slots.size());
 
-    // Load the code and exports from all mods.
+    // Second code-mod pass: recompile/load each mod's code and register its exports.
     for (size_t mod_index : loaded_code_mods) {
         auto& mod = opened_mods[mod_index];
         std::string cur_error_param;
@@ -1688,13 +1732,13 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
         }
     }
 
-    // Exit early if errors were found.
+    // Abort the whole load if anything went wrong in this phase.
     if (!ret.empty()) {
         unload_mods();
         return ret;
     }
     
-    // Resolve code dependencies for all mods.
+    // Third code-mod pass: wire up imports, callbacks, hooks and replacements.
     for (size_t mod_index : loaded_code_mods) {
         auto& mod = opened_mods[mod_index];
         std::string cur_error_param;
@@ -1709,15 +1753,16 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
         }
     }
 
-    // Exit early if errors were found.
+    // Abort the whole load if anything went wrong in this phase.
     if (!ret.empty()) {
         unload_mods();
         return ret;
     }
 
-    // Regenerate any remaining hook slots that weren't handled during mod recompilation.
+    // Any hook slot not already handled by a function replacement still needs the
+    // underlying vanilla function regenerated so the hook can fire.
 
-    // List of unprocessed hooks and their hook index. Also set up which hooks are return hooks.
+    // Gather the leftover hook slots and record each slot's entry/return kind.
     std::vector<std::pair<recomp::mods::HookDefinition, size_t>> unprocessed_hooks;
     for (const auto& [def, index] : hook_slots) {
         if (!processed_hook_slots[index]) {
@@ -1728,7 +1773,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
 
     if (!unprocessed_hooks.empty()) {
 
-        // Sort the unprocessed hooks by section and vram.
+        // Order the leftover hooks by section ROM then function vram.
         std::sort(unprocessed_hooks.begin(), unprocessed_hooks.end(),
             [](const std::pair<recomp::mods::HookDefinition, size_t>& lhs, const std::pair<recomp::mods::HookDefinition, size_t>& rhs) {
                 if (lhs.first.section_rom == rhs.first.section_rom) {
@@ -1775,16 +1820,16 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
     bool cur_func_is_base_patched = false;
     recomp::overlays::BasePatchedFunction cur_base_patched = {};
 
-    // Collect the unprocessed hooks into a patch list.
-    // Hooks have been sorted by their section address and function address at this point so they
-    // can be gathered by section into the patch list.
+    // Group the (already section/function-sorted) hooks into the regenerated list.
+    // Because they're sorted by section ROM then function vram, a simple single pass
+    // can gather them section-by-section and function-by-function.
     for (size_t hook_index = 0; hook_index < sorted_unprocessed_hooks.size(); hook_index++) {
         const auto& cur_hook = sorted_unprocessed_hooks[hook_index];
         const auto& cur_hook_def = cur_hook.first;
         size_t cur_hook_slot_index = cur_hook.second;
-    
+
         if (cur_hook_def.section_rom != cur_section_rom) {
-            // Get the index of the section.
+            // Crossed into a new section; resolve its index.
             auto find_section_it = section_vrom_map.find(cur_hook_def.section_rom);
             if (find_section_it == section_vrom_map.end()) {
                 std::stringstream error_param_stream{};
@@ -1809,24 +1854,24 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
                 cur_section_relocs = recomp::overlays::get_section_relocs(section_index);
             }
 
-            // Allocate a new section.
+            // Start a fresh regenerated section.
             auto& section_out = regenlist.sections.emplace_back(RegeneratedSection{
                 .rom_addr = cur_hook_def.section_rom,
                 .ram_addr = section_ram_addr,
                 .original_index = section_index,
                 .first_func_index = regenlist.functions.size(),
                 .first_reloc_index = regenlist.relocs.size(),
-                // Patch sections are never relocatable, so a section is relocatable if it has any relocs and is not a base patch section.
+                // Base patch sections are never relocatable; a regular section is relocatable when it actually has relocs.
                 .relocatable = !patched_regenlist && !cur_section_relocs.empty()
             });
 
-            // Update the tracked section fields.
+            // Refresh the carried section state.
             cur_section_rom = section_out.rom_addr;
             cur_section_vram = section_out.ram_addr;
             cur_section_index = section_index;
             cur_section_reloc_index = 0;
-        
-            // Reset the tracked function vram to prevent issues when two functions have the same vram in different sections.
+
+            // Clear the carried function vram so identical vrams in different sections don't collide.
             cur_function_vram = 0xFFFFFFFF;
         }
 
@@ -1835,7 +1880,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
             FuncEntry func_entry{};
             bool found_func;
             cur_func_is_base_patched = false;
-            
+
             if constexpr (patched_regenlist) {
                 found_func = recomp::overlays::get_patch_func_entry_by_section_index_function_offset(cur_section_index, function_section_offset, func_entry);
             }
@@ -1856,7 +1901,8 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
         
             uint32_t function_rom_size = func_entry.rom_size;
 
-            // A size of 0 means the function can't be hooked (e.g. it's a native reimplemented function).
+            // A zero ROM size marks a function that has no real body to regenerate
+            // (for instance a natively reimplemented one), so it can't carry a hook.
             if (function_rom_size == 0) {
                 std::stringstream error_param_stream{};
                 error_param_stream << std::hex <<
@@ -1868,7 +1914,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
                 return ret;
             }
             
-            // Check if this function has been patched by the base recomp.
+            // For regular (non-patch) regeneration, note whether the base recomp already patched this function.
             if constexpr (!patched_regenlist) {
                 auto find_patched_it = base_patched_funcs.find(func_entry.func);
                 if (find_patched_it != base_patched_funcs.end()) {
@@ -1878,7 +1924,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
             }
 
             if (!cur_func_is_base_patched) {
-                // Allocate a new function.
+                // Append a function entry plus its native pointer for later patching.
                 regenlist.functions.emplace_back(RegeneratedFunction{
                     .section_offset = function_section_offset,
                     .size = function_rom_size
@@ -1886,10 +1932,10 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
                 regenlist.func_ptrs.push_back(func_entry.func);
             }
 
-            // Update the tracked function address.
+            // Remember this function as the currently tracked one.
             cur_function_vram = cur_hook_def.function_vram;
 
-            // Advance forward in the section's reloc list until reaching this function's offset or the end of the list.
+            // Skip past any relocs that fall before this function's start offset.
             size_t cur_function_offset = cur_function_vram - cur_section_vram;
             size_t cur_function_end_offset = cur_function_offset + function_rom_size;
             while (true) {
@@ -1903,8 +1949,8 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
 
                 cur_section_reloc_index++;
             }
-            
-            // Add all relocs until the end of this function or the end of the reloc list.
+
+            // Copy every reloc that lies within this function's extent.
             while (true) {
                 if (cur_section_reloc_index >= cur_section_relocs.size()) {
                     break;
@@ -1927,10 +1973,11 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
         }
 
         if (cur_func_is_base_patched) {
+            // Base-patched functions get handled later through a separate patch regenlist.
             regenlist.patched_hooks.emplace_back(std::make_pair(cur_base_patched, cur_hook));
         }
         else {
-            // Record the hooks in the function to hook mapping.
+            // Map the most recently added function to this hook slot, by hook kind.
             size_t func_index = regenlist.functions.size() - 1;
             if (cur_hook_def.at_return) {
                 regenlist.return_func_hooks[func_index] = cur_hook_slot_index;
@@ -1949,12 +1996,13 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
 
     std::unique_ptr<LiveRecompilerCodeHandle> regenerated_code_handle{};
 
-    // Generate the recompiler context.
+    // Build a recompiler context from the regenerated list, marking all reference
+    // sections relocatable and forcing every call to go through the lookup table.
     N64Recomp::Context hook_context = context_from_regenerated_list(regenlist, rom);
     hook_context.set_all_reference_sections_relocatable();
     hook_context.use_lookup_for_all_function_calls = true;
 
-    // Regenerate the functions using the live recompiler.
+    // Inputs handed to the live recompiler for the regenerated functions.
     ModCodeHandleInputs handle_inputs{
         .base_event_index = 0, // No events in vanilla functions, so this doesn't matter.
         .recomp_trigger_event = recomp_trigger_event,
@@ -1966,7 +2014,8 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
         .reference_section_addresses = section_addresses,
     };
 
-    std::vector<size_t> original_section_indices{}; 
+    // Map each regenerated section back to the original section index it came from.
+    std::vector<size_t> original_section_indices{};
     original_section_indices.resize(regenlist.sections.size());
     for (size_t new_section_index = 0; new_section_index < regenlist.sections.size(); new_section_index++) {
         original_section_indices[new_section_index] = regenlist.sections[new_section_index].original_index;
@@ -1985,7 +2034,7 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
         return {};
     }
 
-    // Patch the functions that were regenerated.
+    // Redirect each original function to its freshly regenerated counterpart.
     for (size_t patched_func_index = 0; patched_func_index < regenlist.func_ptrs.size(); patched_func_index++) {
         patch_func(regenlist.func_ptrs[patched_func_index], regenerated_code_handle->get_function_handle(patched_func_index));
     }
@@ -1999,7 +2048,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
     const std::unordered_map<recomp_func_t*, overlays::BasePatchedFunction>& base_patched_funcs,
     std::span<const uint8_t> decompressed_rom
 ) {
-    // The output regenerated function list.
+    // Accumulates the functions/relocs that need regenerating.
     RegeneratedList regenlist{};
 
     std::vector<ModLoadErrorDetails> ret = build_regen_list<false>(sorted_unprocessed_hooks, section_vrom_map, base_patched_funcs, regenlist);
@@ -2007,7 +2056,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
         return ret;
     }
 
-    // Apply the regenlist.
+    // Regenerate and patch the ordinary (non-base-patched) functions.
     if (!regenlist.functions.empty()) {
         regenerated_code_handle = apply_regenlist(regenlist, decompressed_rom);
         if (!regenerated_code_handle || !regenerated_code_handle->good()) {
@@ -2020,7 +2069,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
     }
 
     if (!regenlist.patched_hooks.empty()) {
-        // Create new hook definitions based on the actual addresses in the patch binary.
+        // Re-express each base-patched hook in terms of the patch binary's real addresses.
         std::vector<std::pair<HookDefinition, size_t>> base_patched_hooks{};
         base_patched_hooks.resize(regenlist.patched_hooks.size());
         for (size_t i = 0; i < regenlist.patched_hooks.size(); i++) {
@@ -2036,7 +2085,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
             base_patched_hooks[i].second = regenlist_entry.second.second;
         }
 
-        // Sort the hook definitions by rom and ram.
+        // Order them by section ROM then function vram.
         std::sort(base_patched_hooks.begin(), base_patched_hooks.end(),
             [](const std::pair<recomp::mods::HookDefinition, size_t>& lhs, const std::pair<recomp::mods::HookDefinition, size_t>& rhs) {
                 if (lhs.first.section_rom == rhs.first.section_rom) {
@@ -2048,7 +2097,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
             }
         );
 
-        // Create the regenerated list for the base patched functions.
+        // Build the regenerated list against the patch binary's sections.
         std::unordered_map<uint32_t, uint16_t> patch_section_vrom_map = overlays::get_patch_vrom_to_section_map();
         RegeneratedList patch_regenlist{};
         std::vector<ModLoadErrorDetails> ret = build_regen_list<true>(base_patched_hooks, patch_section_vrom_map, {}, patch_regenlist);
@@ -2056,7 +2105,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
             return ret;
         }
 
-        // Apply the patched function regenlist.
+        // Regenerate and patch the base-patched functions.
         base_patched_code_handle = apply_regenlist(patch_regenlist, overlays::get_patch_binary());
         if (!base_patched_code_handle || !base_patched_code_handle->good()) {
             regenerated_code_handle.reset();
@@ -2073,46 +2122,48 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
 
 void recomp::mods::ModContext::check_dependencies(recomp::mods::ModHandle& mod, std::vector<std::pair<recomp::mods::ModLoadError, std::string>>& errors) {
     errors.clear();
-    // Prevent mods with dependencies from being toggled at runtime.
-    // TODO make this possible.
+    // A mod that has dependencies can't safely be toggled at runtime yet.
+    // TODO lift this restriction.
     if (!mod.manifest.dependencies.empty()) {
         mod.disable_runtime_toggle();
     }
     for (const recomp::mods::Dependency& cur_dep : mod.manifest.dependencies) {
-        if (!cur_dep.optional) {
-            // Look for the dependency in the loaded mod mapping.
-            auto find_loaded_dep_it = loaded_mods_by_id.find(cur_dep.mod_id);
-            if (find_loaded_dep_it != loaded_mods_by_id.end()) {
-                ModHandle& dep_mod = opened_mods[find_loaded_dep_it->second];
-                if (cur_dep.version > dep_mod.manifest.version)
-                {
-                    std::stringstream error_param_stream{};
-                    error_param_stream << "requires mod \"" << cur_dep.mod_id << "\" " <<
-                        (int)cur_dep.version.major << "." << (int)cur_dep.version.minor << "." << (int)cur_dep.version.patch << ", got " <<
-                        (int)dep_mod.manifest.version.major << "." << (int)dep_mod.manifest.version.minor << "." << (int)dep_mod.manifest.version.patch << "";
-                    errors.emplace_back(ModLoadError::WrongDependencyVersion, error_param_stream.str());
-                }
-
-                // Prevent the dependency from being toggled at runtime, as it's required for this mod.
-                dep_mod.disable_runtime_toggle();
-            }
-            // Add an error for this mod if the dependency isn't optional.
-            else {
-                errors.emplace_back(ModLoadError::MissingDependency, cur_dep.mod_id);
-            }
+        // Optional dependencies never produce errors here.
+        if (cur_dep.optional) {
+            continue;
         }
+
+        auto loaded_dep_it = loaded_mods_by_id.find(cur_dep.mod_id);
+        if (loaded_dep_it == loaded_mods_by_id.end()) {
+            // A required dependency that isn't loaded is a hard error.
+            errors.emplace_back(ModLoadError::MissingDependency, cur_dep.mod_id);
+            continue;
+        }
+
+        ModHandle& dep_mod = opened_mods[loaded_dep_it->second];
+        // The loaded version must be at least the required version.
+        if (cur_dep.version > dep_mod.manifest.version) {
+            std::stringstream error_param_stream{};
+            error_param_stream << "requires mod \"" << cur_dep.mod_id << "\" " <<
+                (int)cur_dep.version.major << "." << (int)cur_dep.version.minor << "." << (int)cur_dep.version.patch << ", got " <<
+                (int)dep_mod.manifest.version.major << "." << (int)dep_mod.manifest.version.minor << "." << (int)dep_mod.manifest.version.patch << "";
+            errors.emplace_back(ModLoadError::WrongDependencyVersion, error_param_stream.str());
+        }
+
+        // A required dependency must stay loaded, so lock it against runtime toggling.
+        dep_mod.disable_runtime_toggle();
     }
 }
 
 recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t* rdram, const std::unordered_map<uint32_t, uint16_t>& section_vrom_map, ModHandle& mod, int32_t load_address, bool hooks_available, uint32_t& ram_used, std::string& error_param) {
-    // Load the mod symbol data from the file provided in the manifest.
+    // Read both the symbol blob and the code binary named by the manifest.
     bool binary_syms_exists = false;
     std::vector<char> syms_data = mod.manifest.file_handle->read_file(std::string{ modpaths::binary_syms_path }, binary_syms_exists);
-    
-    // Load the binary data from the file provided in the manifest.
+
     bool binary_exists = false;
     std::vector<char> binary_data = mod.manifest.file_handle->read_file(std::string{ modpaths::binary_path }, binary_exists);
 
+    // Symbols and binary must come as a matched pair.
     if (binary_syms_exists && !binary_exists) {
         return CodeModLoadError::HasSymsButNoBinary;
     }
@@ -2123,13 +2174,13 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t* 
 
     std::span<uint8_t> binary_span {reinterpret_cast<uint8_t*>(binary_data.data()), binary_data.size() };
 
-    // Parse the symbol file into the recompiler context.
+    // Feed the symbol data into this mod's recompiler context.
     N64Recomp::ModSymbolsError symbol_load_error = N64Recomp::parse_mod_symbols(syms_data, binary_span, section_vrom_map, *mod.recompiler_context);
     if (symbol_load_error != N64Recomp::ModSymbolsError::Good) {
         return CodeModLoadError::FailedToParseSyms;
     }
 
-    // Prevent loading the mod if hooks aren't available and it has any hooks.
+    // A mod that defines hooks can't load when hook support is unavailable.
     if (!hooks_available && !mod.recompiler_context->hooks.empty()) {
         return CodeModLoadError::HooksUnavailable;
     }
@@ -2147,140 +2198,137 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t* 
     // Populate the mod's event map and set its base event index.
     mod.populate_events();
 
-    // Validate that the dependencies present in the symbol file are all present in the mod's manifest as well.
+    // Every non-special dependency named by the symbols must also appear in the manifest.
     for (const auto& [cur_dep_id, cur_dep_index] : mod.recompiler_context->dependencies_by_name) {
-        // Handle special dependency names.
+        // The reserved base-recomp and self dependencies don't live in the manifest.
         if (cur_dep_id == N64Recomp::DependencyBaseRecomp || cur_dep_id == N64Recomp::DependencySelf) {
             continue;
         }
 
-        // Find the dependency in the mod manifest to get its version.
         auto find_manifest_dep_it = mod.manifest.dependencies_by_id.find(cur_dep_id);
         if (find_manifest_dep_it == mod.manifest.dependencies_by_id.end()) {
 
             return CodeModLoadError::MissingDependencyInManifest;
         }
     }
-    
+
     const std::vector<N64Recomp::Section>& mod_sections = mod.recompiler_context->sections;
     mod.section_load_addresses.resize(mod_sections.size());
 
-    // Copy each section's binary into rdram, leaving room for the section's bss before the next one.
+    // Lay each section out in RDRAM in turn, reserving its bss right after its data.
     int32_t cur_section_addr = load_address;
     for (size_t section_index = 0; section_index < mod_sections.size(); section_index++) {
         const auto& section = mod_sections[section_index];
-        // Do not load fixed address sections into mod memory. Use their address as-is.
+        // Fixed-address sections aren't relocated into mod memory; keep their declared address.
         if (section.fixed_address) {
             mod.section_load_addresses[section_index] = section.ram_addr;
         }
         else {
+            // Copy the section's bytes from the binary into RDRAM.
             for (size_t i = 0; i < section.size; i++) {
                 MEM_B(i, (gpr)cur_section_addr) = binary_data[section.rom_addr + i];
             }
             mod.section_load_addresses[section_index] = cur_section_addr;
-            // Calculate the bss section's address based on the size of this section.
+            // The bss immediately follows the loaded data.
             cur_section_addr += section.size;
-            // Zero the bss section.
+            // Clear the bss region.
             for (size_t i = 0; i < section.bss_size; i++) {
                 MEM_B(i, (gpr)cur_section_addr) = 0;
             }
-            // Calculate the next section's address based on the size of the bss section.
+            // Advance past the bss.
             cur_section_addr += section.bss_size;
-            // Align the next section's address to 16 bytes.
+            // Round the next placement up to a 16-byte boundary.
             cur_section_addr = (cur_section_addr + 15) & ~15;
-            // Add some empty space between mods to act as a buffer for misbehaving mods that have out of bounds accesses.
+            // Leave a guard gap so out-of-bounds accesses from a buggy mod stay contained.
             cur_section_addr += 0x400;
         }
     }
 
-    // Iterate over each section again after loading them to perform R_MIPS_32 relocations.
+    // With every section placed, make a second pass to fix up R_MIPS_32 relocations.
     for (size_t section_index = 0; section_index < mod_sections.size(); section_index++) {
         const auto& section = mod_sections[section_index];
         uint32_t cur_section_original_vram = section.ram_addr;
-        uint32_t cur_section_loaded_vram = mod.section_load_addresses[section_index]; 
+        uint32_t cur_section_loaded_vram = mod.section_load_addresses[section_index];
 
-        // Perform mips32 relocations for this section.
         for (const auto& reloc : section.relocs) {
             if (reloc.type == N64Recomp::RelocType::R_MIPS_32 && !reloc.reference_symbol) {
                 if (reloc.target_section >= mod_sections.size()) {
                     return CodeModLoadError::FailedToParseSyms;
                 }
-                // Get the ram address of the word that's being relocated and read its original value.
+                // Translate the reloc's address into the loaded image and read the stored word.
                 int32_t reloc_word_addr = reloc.address - cur_section_original_vram + cur_section_loaded_vram;
                 uint32_t reloc_word = MEM_W(0, reloc_word_addr);
 
-                // Determine the original and loaded addresses of the section that the relocation points to.
+                // Look up where the pointed-to section originally was versus where it landed.
                 uint32_t target_section_original_vram = mod_sections[reloc.target_section].ram_addr;
                 uint32_t target_section_loaded_vram = mod.section_load_addresses[reloc.target_section];
 
-                // Recalculate the word and write it back into ram.
+                // Shift the stored word by the section's relocation delta and store it back.
                 reloc_word += (target_section_loaded_vram - target_section_original_vram);
-                MEM_W(0, reloc_word_addr) = reloc_word;           
+                MEM_W(0, reloc_word_addr) = reloc_word;
             }
         }
     }
 
     ram_used = cur_section_addr - load_address;
 
-    // Allocate the event indices used by the mod.
+    // Reserve event indices for this mod's events.
     num_events += mod.num_events();
 
-    // Read the mod's hooks and allocate hook slots as needed.
+    // Register a unique slot for every distinct hook definition this mod declares.
     for (const N64Recomp::FunctionHook& hook : mod.recompiler_context->hooks) {
-        // Get the definition of this hook.
         HookDefinition def {
             .section_rom = hook.original_section_vrom,
             .function_vram = hook.original_vram,
             .at_return = (hook.flags & N64Recomp::HookFlags::AtReturn) == N64Recomp::HookFlags::AtReturn
         };
-        // Check if the hook definition already exists in the hook slots.
-        auto find_it = hook_slots.find(def);
-        if (find_it == hook_slots.end()) {
-            // The hook definition is new, so assign a hook slot index and add it to the slots.
+        // Only allocate a slot if this exact definition hasn't been seen yet.
+        if (hook_slots.find(def) == hook_slots.end()) {
             hook_slots.emplace(def, hook_slots.size());
         }
     }
 
-    // Copy the mod's binary into the recompiler context so it can be analyzed during code loading.
-    // TODO move it instead, right now the move can't be done because of a signedness difference in the types.
+    // Keep a copy of the binary in the recompiler context for use during code loading.
+    // TODO move rather than copy once the signedness mismatch in the element types is resolved.
     mod.recompiler_context->rom.assign(binary_span.begin(), binary_span.end());
 
     return CodeModLoadError::Good;
 }
 
 recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* rdram, recomp::mods::ModHandle& mod, uint32_t base_event_index, std::string& error_param) {
-    // Build the hook list for this mod. Maps function index within mod to hook slot index.
+    // Per-function hook maps for this mod: mod function index -> hook slot index.
     std::unordered_map<size_t, size_t> entry_func_hooks{};
     std::unordered_map<size_t, size_t> return_func_hooks{};
 
-    // Scan the replacements to handle hooks on the replaced functions.
+    // When a mod replaces a function that is also hooked, the replacement function
+    // itself carries those hooks, so wire each replaced function's entry/return slots.
     for (const auto& replacement : mod.recompiler_context->replacements) {
-        // Check if there's a hook slot for the entry of this function.
+        // Entry hook slot for the replaced function, if one exists.
         HookDefinition entry_def {
             .section_rom = replacement.original_section_vrom,
             .function_vram = replacement.original_vram,
             .at_return = false
         };
-        auto find_entry_it = hook_slots.find(entry_def);
-        if (find_entry_it != hook_slots.end()) {
-            entry_func_hooks.emplace(replacement.func_index, find_entry_it->second);
-            processed_hook_slots[find_entry_it->second] = true;
+        auto entry_slot_it = hook_slots.find(entry_def);
+        if (entry_slot_it != hook_slots.end()) {
+            entry_func_hooks.emplace(replacement.func_index, entry_slot_it->second);
+            processed_hook_slots[entry_slot_it->second] = true;
         }
-        
-        // Check if there's a hook slot for the return of this function.
+
+        // Return hook slot for the replaced function, if one exists.
         HookDefinition return_def {
             .section_rom = replacement.original_section_vrom,
             .function_vram = replacement.original_vram,
             .at_return = true
         };
-        auto find_return_it = hook_slots.find(return_def);
-        if (find_return_it != hook_slots.end()) {
-            return_func_hooks.emplace(replacement.func_index, find_return_it->second);
-            processed_hook_slots[find_return_it->second] = true;
+        auto return_slot_it = hook_slots.find(return_def);
+        if (return_slot_it != hook_slots.end()) {
+            return_func_hooks.emplace(replacement.func_index, return_slot_it->second);
+            processed_hook_slots[return_slot_it->second] = true;
         }
     }
 
-    // Build the inputs for the mod code handle.
+    // Inputs shared by either code handle implementation.
     std::string cur_error_param;
     CodeModLoadError cur_error;
     ModCodeHandleInputs handle_inputs{
@@ -2294,11 +2342,11 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
         .reference_section_addresses = section_addresses,
     };
 
-    // Use a dynamic library code handle. This feature isn't meant to be used by end users, but provides a more debuggable
-    // experience than the live recompiler for mod developers.
-    // Enabled if the mod's filename ends with ".offline.nrm".
+    // A filename ending in ".offline.nrm" selects the dynamic-library handle. This
+    // path is a developer aid (easier to debug than the live recompiler) rather than
+    // something end users are expected to use.
     if (mod.manifest.mod_root_path.filename().string().ends_with(".offline.nrm")) {
-        // Hooks can't be generated for native mods, so return an error if any of the functions this mod replaces are also hooked by another mod.
+        // The offline path can't synthesize hooks, so reject it when any replaced function is also hooked.
         if (!entry_func_hooks.empty() || !return_func_hooks.empty()) {
             return CodeModLoadError::OfflineModHooked;
         }
@@ -2324,11 +2372,11 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
             return cur_error;
         }
     }
-    // Live recompiler code handle.
+    // Otherwise use the live recompiler handle (the default for shipped mods).
     else {
         mod.code_handle = std::make_unique<LiveRecompilerCodeHandle>(*mod.recompiler_context, handle_inputs,
             std::move(entry_func_hooks), std::move(return_func_hooks), std::vector<size_t>{}, false);
-        
+
         if (!mod.code_handle->good()) {
             mod.code_handle.reset();
             error_param = {};
@@ -2336,7 +2384,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
         }
     }
 
-    // Load any native libraries specified by the mod and validate/register the expors.
+    // Bring in and validate every native library the mod declares.
     std::filesystem::path parent_path = mod.manifest.mod_root_path.parent_path();
     for (const recomp::mods::NativeLibraryManifest& cur_lib_manifest: mod.manifest.native_libraries) {
         cur_error = mod.load_native_library(cur_lib_manifest, cur_error_param);
@@ -2348,16 +2396,16 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
 
     const std::vector<N64Recomp::Section>& mod_sections = mod.recompiler_context->sections;
 
-    // Add each function from the mod into the function lookup table.
+    // Publish each of the mod's functions into the global function lookup table.
     for (size_t func_index = 0; func_index < mod.recompiler_context->functions.size(); func_index++) {
         const auto& func = mod.recompiler_context->functions[func_index];
         if (func.section_index >= mod_sections.size()) {
             return CodeModLoadError::FailedToParseSyms;
         }
-        // Calculate the loaded address of this function.
+        // Translate the function's vram into its actual loaded address.
         int32_t func_address = func.vram - mod_sections[func.section_index].ram_addr + mod.section_load_addresses[func.section_index];
 
-        // Get the handle to the function and add it to the lookup table based on its type.
+        // Register the function handle at its loaded address.
         recomp::mods::GenericFunction func_handle = mod.code_handle->get_function_handle(func_index);
         std::visit(overloaded{
             [func_address](recomp_func_t* native_func) {
@@ -2370,7 +2418,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
 }
 
 recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependencies(recomp::mods::ModHandle& mod, size_t mod_index, const std::unordered_map<recomp_func_t*, overlays::BasePatchedFunction>& base_patched_funcs, std::string& error_param) {
-    // Reference symbols.
+    // Resolve reference symbols first.
     std::string reference_syms_error_param{};
     CodeModLoadError reference_syms_error = mod.code_handle->populate_reference_symbols(*mod.recompiler_context, reference_syms_error_param);
 
@@ -2379,7 +2427,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
         return reference_syms_error;
     }
 
-    // Create a list of dependencies ordered by their index in the recompiler context.
+    // Flatten the dependency-name map into an index-ordered list for quick lookups.
     std::vector<std::string> dependencies_ordered{};
     dependencies_ordered.resize(mod.recompiler_context->dependencies_by_name.size());
 
@@ -2387,7 +2435,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
         dependencies_ordered[dependency_index] = dependency;
     }
 
-    // Imported symbols.
+    // Bind every imported symbol to a concrete function.
     for (size_t import_index = 0; import_index < mod.recompiler_context->import_symbols.size(); import_index++) {
         const N64Recomp::ImportSymbol& imported_func = mod.recompiler_context->import_symbols[import_index];
         const std::string& dependency_id = dependencies_ordered[imported_func.dependency_index];
@@ -2396,6 +2444,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
         bool did_find_func = false;
 
         if (dependency_id == N64Recomp::DependencyBaseRecomp) {
+            // Try a plain base export first, then an extended one (wrapped in a shim).
             recomp_func_t* func_ptr = recomp::overlays::get_base_export(imported_func.base.name);
             did_find_func = func_ptr != nullptr;
             if (!did_find_func) {
@@ -2408,17 +2457,22 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
             func_handle = func_ptr;
         }
         else if (dependency_id == N64Recomp::DependencySelf) {
+            // The mod imports one of its own exports.
             did_find_func = mod.get_export_function(imported_func.base.name, func_handle);
         }
         else {
             auto find_mod_it = loaded_mods_by_id.find(dependency_id);
             if (find_mod_it != loaded_mods_by_id.end()) {
+                // The dependency is loaded, so pull the export from it.
                 const auto& dependency = opened_mods[find_mod_it->second];
                 did_find_func = dependency.get_export_function(imported_func.base.name, func_handle);
             }
             else {
                 auto find_optional_it = mod.manifest.dependencies_by_id.find(dependency_id);
                 if (find_optional_it != mod.manifest.dependencies_by_id.end()) {
+                    // An unmet but optional dependency: point the import at a shim that
+                    // errors out only if the import is actually called. The argument packs
+                    // the import index in the high word and the mod index in the low word.
                     uintptr_t shim_argument = ((import_index & 0xFFFFFFFFu) << 32) | (mod_index & 0xFFFFFFFFu);
                     func_handle = shim_functions.emplace_back(std::make_unique<N64Recomp::ShimFunction>(unmet_dependency_handler, shim_argument)).get()->get_func();
                     did_find_func = true;
@@ -2459,13 +2513,11 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
             did_find_event = mod.get_global_event_index(dependency_event.event_name, event_index);
         }
         else {
-            // Check if the dependency is optional.
             auto find_mod_it = loaded_mods_by_id.find(dependency_id);
             if (find_mod_it == loaded_mods_by_id.end()) {
-                // Get the manifest's version of the dependency.
+                // The dependency isn't loaded; that's only acceptable if it's optional.
                 auto find_manifest_dep = mod.manifest.dependencies_by_id.find(dependency_id);
-                // This should always be found, but just in case validate that the find was successful.
-                // This will get treated as an error if it wasn't found in the manifest.
+                // It should always be in the manifest (validated earlier); treat absence as non-optional.
                 if (find_manifest_dep != mod.manifest.dependencies_by_id.end()) {
                     const auto& manifest_dep = mod.manifest.dependencies[find_manifest_dep->second];
                     if (manifest_dep.optional) {
@@ -2475,12 +2527,12 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
 
                 if (!optional) {
                     error_param = "Failed to find callback dependency while loading code: " + dependency_id;
-                    // This should never happen, as dependencies are scanned before mod code is loaded and the symbol dependency list
-                    // is validated against the manifest's. 
+                    // Unreachable in practice: dependencies are validated against the manifest before code loads.
                     return CodeModLoadError::InternalError;
                 }
             }
             else {
+                // The dependency is loaded, so resolve the event against it.
                 const auto& dependency_mod = opened_mods[find_mod_it->second];
                 did_find_event = dependency_mod.get_global_event_index(dependency_event.event_name, event_index);
             }
@@ -2495,34 +2547,33 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
         }
     }
 
-    // Register hooks.
+    // Register the mod's hook callbacks.
     for (const auto& cur_hook : mod.recompiler_context->hooks) {
-        // Get the definition of this hook.
         HookDefinition def {
             .section_rom = cur_hook.original_section_vrom,
             .function_vram = cur_hook.original_vram,
             .at_return = (cur_hook.flags & N64Recomp::HookFlags::AtReturn) == N64Recomp::HookFlags::AtReturn
         };
 
-        // Find the hook's slot from the definition.
+        // The slot must already exist from the earlier hook scan.
         auto find_it = hook_slots.find(def);
         if (find_it == hook_slots.end()) {
             error_param = "Failed to register hook";
-            // This should never happen, as hooks are scanned earlier to generate hook_slots.
+            // Unreachable in practice: every hook got a slot during init_mod_code.
             return CodeModLoadError::InternalError;
         }
 
-        // Register the function handle for this hook slot.
+        // Attach this mod's function to the hook slot.
         GenericFunction func = mod.code_handle->get_function_handle(cur_hook.func_index);
         recomp::mods::register_hook(find_it->second, mod_index, func);
     }
 
-    // Populate the relocated section addresses for the mod.
+    // Hand the loaded section addresses to the code handle.
     for (size_t section_index = 0; section_index < mod.section_load_addresses.size(); section_index++) {
         mod.code_handle->set_local_section_address(section_index, mod.section_load_addresses[section_index]);
     }
 
-    // Apply all the function replacements in the mod.
+    // Install each function replacement the mod requests.
     for (const auto& replacement : mod.recompiler_context->replacements) {
         recomp_func_t* to_replace = recomp::overlays::get_func_by_section_rom_function_vram(replacement.original_section_vrom, replacement.original_vram);
 
@@ -2535,7 +2586,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
             return CodeModLoadError::InvalidFunctionReplacement;
         }
 
-        // Check if this function has already been patched by the base recomp, but allow it if this is a force patch.
+        // Reject replacing a function the base recomp already patched, unless the replacement is marked Force.
         if ((replacement.flags & N64Recomp::ReplacementFlags::Force) == N64Recomp::ReplacementFlags(0)) {
             auto find_it = base_patched_funcs.find(to_replace);
             if (find_it != base_patched_funcs.end()) {
@@ -2548,19 +2599,19 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
             }
         }
 
-        // Check if this function has already been replaced.
+        // Reject a second mod trying to replace the same function.
         auto find_patch_it = patched_funcs.find(to_replace);
         if (find_patch_it != patched_funcs.end()) {
             error_param = find_patch_it->second.mod_id;
             return CodeModLoadError::ModConflict;
         }
 
-        // Copy the original bytes so they can be restored later after the mod is unloaded.
+        // Stash the original bytes so the patch can be reverted when the mod unloads.
         PatchData& cur_replacement_data = patched_funcs[to_replace];
         memcpy(cur_replacement_data.replaced_bytes.data(), reinterpret_cast<void*>(to_replace), cur_replacement_data.replaced_bytes.size());
         cur_replacement_data.mod_id = mod.manifest.mod_id;
 
-        // Patch the function to redirect it to the replacement.
+        // Overwrite the original with a trampoline to the replacement.
         patch_func(to_replace, mod.code_handle->get_function_handle(replacement.func_index));
     }
 
@@ -2583,6 +2634,8 @@ void recomp::mods::ModContext::unload_mods() {
 }
 
 void recomp::mods::unmet_dependency_handler(uint8_t* rdram, recomp_context* ctx, uintptr_t arg) {
+    // Undo the packing done when the shim was created: low word is the mod index,
+    // high word is the import index.
     size_t caller_mod_index = (arg >>  0) & uint64_t(0xFFFFFFFF);
     size_t import_index =     (arg >> 32) & uint64_t(0xFFFFFFFF);
 

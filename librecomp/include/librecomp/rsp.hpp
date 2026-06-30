@@ -87,38 +87,43 @@ namespace recomp {
     (*reinterpret_cast<uint8_t*>(dmem + (0xFFF & (((offset) + (addr)) ^ 3))))
 
 static inline uint32_t RSP_MEM_W_LOAD(uint32_t offset, uint32_t addr) {
-    uint32_t out;
-    for (int i = 0; i < 4; i++) {
-        reinterpret_cast<uint8_t*>(&out)[i ^ 3] = RSP_MEM_BU(offset + i, addr);
+    uint32_t value = 0;
+    uint8_t* value_bytes = reinterpret_cast<uint8_t*>(&value);
+    for (uint32_t i = 0; i < 4; i++) {
+        value_bytes[i ^ 3] = RSP_MEM_BU(offset + i, addr);
     }
-    return out;
+    return value;
 }
 
 static inline void RSP_MEM_W_STORE(uint32_t offset, uint32_t addr, uint32_t val) {
-    for (int i = 0; i < 4; i++) {
-        RSP_MEM_BU(offset + i, addr) = reinterpret_cast<uint8_t*>(&val)[i ^ 3];
+    const uint8_t* val_bytes = reinterpret_cast<uint8_t*>(&val);
+    for (uint32_t i = 0; i < 4; i++) {
+        RSP_MEM_BU(offset + i, addr) = val_bytes[i ^ 3];
     }
 }
 
 static inline uint32_t RSP_MEM_HU_LOAD(uint32_t offset, uint32_t addr) {
-    uint16_t out;
-    for (int i = 0; i < 2; i++) {
-        reinterpret_cast<uint8_t*>(&out)[(i + 2) ^ 3] = RSP_MEM_BU(offset + i, addr);
+    uint16_t value = 0;
+    uint8_t* value_bytes = reinterpret_cast<uint8_t*>(&value);
+    for (uint32_t i = 0; i < 2; i++) {
+        value_bytes[(i + 2) ^ 3] = RSP_MEM_BU(offset + i, addr);
     }
-    return out;
+    return value;
 }
 
 static inline uint32_t RSP_MEM_H_LOAD(uint32_t offset, uint32_t addr) {
-    int16_t out;
-    for (int i = 0; i < 2; i++) {
-        reinterpret_cast<uint8_t*>(&out)[(i + 2) ^ 3] = RSP_MEM_BU(offset + i, addr);
+    int16_t value = 0;
+    uint8_t* value_bytes = reinterpret_cast<uint8_t*>(&value);
+    for (uint32_t i = 0; i < 2; i++) {
+        value_bytes[(i + 2) ^ 3] = RSP_MEM_BU(offset + i, addr);
     }
-    return out;
+    return value;
 }
 
 static inline void RSP_MEM_H_STORE(uint32_t offset, uint32_t addr, uint32_t val) {
-    for (int i = 0; i < 2; i++) {
-        RSP_MEM_BU(offset + i, addr) = reinterpret_cast<uint8_t*>(&val)[(i + 2) ^ 3];
+    const uint8_t* val_bytes = reinterpret_cast<uint8_t*>(&val);
+    for (uint32_t i = 0; i < 2; i++) {
+        RSP_MEM_BU(offset + i, addr) = val_bytes[(i + 2) ^ 3];
     }
 }
 

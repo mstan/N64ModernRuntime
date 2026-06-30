@@ -35,33 +35,27 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
     }
 }
 
-// For SDL2
-//uint32_t buffer_offset_frames = 1;
-// For Godot
+// How far ahead of the true host buffer level to report, in frames. Titles size
+// their next batch of generated samples from this number: too high tends to pop,
+// too low tends to lag, so a fractional-frame lead keeps a cushion against audio-
+// thread jitter without overcommitting.
 float buffer_offset_frames = 0.5f;
 
-// If there's ever any audio popping, check here first. Some games are very sensitive to
-// the remaining sample count and reporting a number that's too high here can lead to issues.
-// Reporting a number that's too low can lead to audio lag in some games.
+// First place to look if audio ever pops or lags (see the note on the lead above).
 uint32_t ultramodern::get_remaining_audio_bytes() {
-    // Get the number of remaining buffered audio bytes.
-    uint32_t buffered_byte_count;
-    if (audio_callbacks.get_frames_remaining != nullptr) {
-        buffered_byte_count = audio_callbacks.get_frames_remaining() * 2 * sizeof(int16_t);
-    }
-    else {
-        buffered_byte_count = 100;
-    }
-    // Adjust the reported count to be some number of refreshes in the future, which helps ensure that
-    // there are enough samples even if the audio thread experiences a small amount of lag. This prevents
-    // audio popping on games that use the buffered audio byte count to determine how many samples
-    // to generate.
-    uint32_t samples_per_vi = (sample_rate / 60);
-    if (buffered_byte_count > static_cast<uint32_t>(buffer_offset_frames * sizeof(int16_t) * samples_per_vi)) {
-        buffered_byte_count -= static_cast<uint32_t>(buffer_offset_frames * sizeof(int16_t) * samples_per_vi);
-    }
-    else {
-        buffered_byte_count = 0;
-    }
+    // Bytes still queued in the host audio buffer — two int16 channels per frame.
+    // When the host can't report a level, fall back to a small nonzero estimate.
+    uint32_t buffered_byte_count = (audio_callbacks.get_frames_remaining != nullptr)
+        ? audio_callbacks.get_frames_remaining() * 2 * sizeof(int16_t)
+        : 100;
+
+    // Take off the lead cushion (buffer_offset_frames worth of one VI's samples,
+    // converted to bytes), clamping at zero so the count never underflows.
+    uint32_t samples_per_vi = sample_rate / 60;
+    uint32_t cushion_bytes = static_cast<uint32_t>(buffer_offset_frames * sizeof(int16_t) * samples_per_vi);
+    buffered_byte_count = (buffered_byte_count > cushion_bytes)
+        ? (buffered_byte_count - cushion_bytes)
+        : 0;
+
     return buffered_byte_count;
 }

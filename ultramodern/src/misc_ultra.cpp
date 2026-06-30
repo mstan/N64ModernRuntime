@@ -9,14 +9,20 @@
 #define K1_TO_PHYS(x) ((u32)(x)&0x1FFFFFFF)
 
 u32 osVirtualToPhysical(PTR(void) addr) {
-    uintptr_t addr_val = (uintptr_t)addr;
-    if (IS_KSEG0(addr_val)) {
-        return K0_TO_PHYS(addr_val);
-    } else if (IS_KSEG1(addr_val)) {
-        return K1_TO_PHYS(addr_val);
-    } else {
-        // TODO handle TLB mappings
-        return (u32)addr_val;
+    const uintptr_t vaddr = (uintptr_t)addr;
+
+    // The cached and uncached direct-mapped windows both resolve to a
+    // physical address simply by masking off the segment bits; only the
+    // mask macro that applies differs between them.
+    if (IS_KSEG0(vaddr)) {
+        return K0_TO_PHYS(vaddr);
     }
+    if (IS_KSEG1(vaddr)) {
+        return K1_TO_PHYS(vaddr);
+    }
+
+    // Outside those windows a real translation would consult the TLB,
+    // which isn't modeled here yet, so return the value untouched.
+    return (u32)vaddr;
 }
 

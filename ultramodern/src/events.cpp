@@ -90,7 +90,8 @@ static struct {
             PTR(void) framebuffer = osVirtualToPhysical(next_state->framebuffer);
             PTR(void) origin = framebuffer + field_regs->origin;
 
-            // Process the VI state flags.
+            // Fold the software VI flags into the values being staged. A black screen
+            // is produced by forcing the horizontal start to zero.
             uint32_t hStart = common_regs->hStart;
             if (next_state->state & VI_STATE_BLACK) {
                 hStart = 0;
@@ -107,7 +108,7 @@ static struct {
 
             // TODO implement osViFade
 
-            // Update VI registers.
+            // Stage the VI register block for this field from the active mode.
             regs.VI_ORIGIN_REG = origin;
             regs.VI_WIDTH_REG = common_regs->width;
             regs.VI_TIMING_REG = common_regs->burst;
@@ -121,8 +122,8 @@ static struct {
             regs.VI_X_SCALE_REG = common_regs->xScale; // TODO implement osViSetXScale
             regs.VI_Y_SCALE_REG = yScale; // TODO implement osViSetYScale
             regs.VI_STATUS_REG = next_state->control;
-            
-            // Swap VI states.
+
+            // Flip to the freshly-staged state and seed the new "next" from it.
             cur_state ^= 1;
             *get_next_state() = *get_cur_state();
         }
@@ -145,7 +146,8 @@ static struct {
         PTR(OSMesgQueue) mq = NULLPTR;
         OSMesg msg = (OSMesg)0;
     } si;
-    // The same message queue may be used for multiple events, so share a mutex for all of them
+    // One mutex guards every event slot, since a game may register the same queue
+    // for more than one event.
     std::mutex message_mutex;
     uint8_t* rdram;
     moodycamel::BlockingConcurrentQueue<Action> action_queue{};
@@ -210,36 +212,27 @@ void set_dummy_vi(bool odd);
 
 void vi_thread_func() {
     ultramodern::set_native_thread_name("VI Thread");
-    // This thread should be prioritized over every other thread in the application, as it's what allows
-    // the game to generate new audio and gfx lists.
+    // Run above every other thread: this thread's cadence is what keeps the game
+    // producing fresh audio and graphics lists.
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Critical);
     using namespace std::chrono_literals;
 
     int remaining_retraces = 1;
 
     while (!exited) {
-        // Determine the next VI time (more accurate than adding 16ms each VI interrupt)
+        // Derive the absolute time of the next VI from the running VI count instead of
+        // adding a fixed step each interrupt, which keeps long-term drift bounded.
         auto next = ultramodern::get_start() + (total_vis * 1000000us) / (60 * ultramodern::get_speed_multiplier());
-        //if (next > std::chrono::high_resolution_clock::now()) {
-        //    printf("Sleeping for %" PRIu64 " us to get from %" PRIu64 " us to %" PRIu64 " us \n",
-        //        (next - std::chrono::high_resolution_clock::now()) / 1us,
-        //        (std::chrono::high_resolution_clock::now() - events_context.start) / 1us,
-        //        (next - events_context.start) / 1us);
-        //} else {
-        //    printf("No need to sleep\n");
-        //}
-        // Detect if there's more than a second to wait and wait a fixed amount instead for the next VI if so, as that usually means the system clock went back in time.
+        // A target more than a second away almost always means the host clock jumped
+        // backward; in that case fire immediately rather than stalling for ages.
         if (std::chrono::floor<std::chrono::seconds>(next - std::chrono::high_resolution_clock::now()) > 1s) {
-            // printf("Skipping the next VI wait\n");
             next = std::chrono::high_resolution_clock::now();
         }
         ultramodern::sleep_until(next);
         auto time_now = ultramodern::time_since_start();
-        // Calculate how many VIs have passed
+        // Re-derive the VI count from elapsed time; one tick can span several VIs if
+        // the host fell behind.
         uint64_t new_total_vis = (time_now * (60 * ultramodern::get_speed_multiplier()) / 1000ms) + 1;
-        if (new_total_vis > total_vis + 1) {
-            //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
-        }
         total_vis = new_total_vis;
 
         // If the game hasn't started yet, OR has been marked started but
@@ -258,11 +251,12 @@ void vi_thread_func() {
             }
         }
 
-        // Queue a screen update for the graphics thread with the current VI register state.
-        // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
+        // Hand the current VI register state to the graphics thread as a screen update.
+        // Issuing it before update_vi() matches presenting the previous frame once its
+        // scanout has finished.
         events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
 
-        // Update VI registers and swap VI modes.
+        // Advance the VI registers and flip to the next field/state.
         events_context.vi.update_vi();
 
         // If the game has started, handle sending VI and AI events.
@@ -395,14 +389,15 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
     ultramodern::set_native_thread_name("SP Task Thread");
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
 
-    // Notify the caller thread that this thread is ready.
+    // Let the thread that spawned us know we're up.
     thread_ready->signal();
 
     while (true) {
-        // Wait until an RSP task has been sent
+        // Block until a non-graphics RSP task arrives.
         OSTask* task;
         events_context.sp_task_queue.wait_dequeue(task);
 
+        // A null task is the shutdown sentinel.
         if (task == nullptr) {
             return;
         }
@@ -489,24 +484,25 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
 
     ultramodern::rsp::init();
 
-    // Notify the caller thread that this thread is ready.
+    // Let the thread that spawned us know we're up.
     thread_ready->signal();
 
     while (!exited) {
-        // Try to pull an action from the queue
+        // Wait briefly for the next queued action.
         Action action;
         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
-            // Determine the action type and act on it
+            // Dispatch on the action variant.
             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
-                // Turn on instant present if the game has been started and it hasn't been turned on yet.
+                // Enable instant present the first time a task arrives after the game starts.
                 if (ultramodern::is_game_started() && !enabled_instant_present) {
                     renderer_context->enable_instant_present();
                     enabled_instant_present = true;
                 }
-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
-                // is finished as well, so sending this early shouldn't be an issue in most cases.
-                // If this causes issues then the logic can be replaced with responding to yield requests.
+                // Report SP completion right away so the game is free to enqueue other
+                // task types. It still won't start the next graphics task until the RDP
+                // also reports done, and games normally keep the RSP inputs alive until
+                // then, so signalling early is safe in practice. If a title misbehaves,
+                // this could instead be driven from RSP yield requests.
                 sp_complete(task_action->task.t.type);
                 ultramodern::measure_input_latency();
 
@@ -608,7 +604,7 @@ static const OSViMode dummy_mode = []() {
 void set_dummy_vi(bool odd) {
     ViState* next_state = events_context.vi.get_next_state();
     next_state->mode = &dummy_mode;
-    // Set up a dummy framebuffer.
+    // Aim at a placeholder framebuffer, nudged for the odd field.
     next_state->framebuffer = 0x80700000;
     if (odd) {
         next_state->framebuffer += 0x25800;
@@ -640,39 +636,35 @@ extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
 extern "C" void osViSetSpecialFeatures(uint32_t func) {
     std::lock_guard lock{ events_context.message_mutex };
     ViState* next_state = events_context.vi.get_next_state();
-    uint32_t* control_out = &next_state->control;
-    if ((func & OS_VI_GAMMA_ON) != 0) {
-        *control_out |= VI_CTRL_GAMMA_ON;
-    }
+    uint32_t& control = next_state->control;
 
-    if ((func & OS_VI_GAMMA_OFF) != 0) {
-        *control_out &= ~VI_CTRL_GAMMA_ON;
+    if (func & OS_VI_GAMMA_ON) {
+        control |= VI_CTRL_GAMMA_ON;
     }
-
-    if ((func & OS_VI_GAMMA_DITHER_ON) != 0) {
-        *control_out |= VI_CTRL_GAMMA_DITHER_ON;
+    if (func & OS_VI_GAMMA_OFF) {
+        control &= ~VI_CTRL_GAMMA_ON;
     }
-
-    if ((func & OS_VI_GAMMA_DITHER_OFF) != 0) {
-        *control_out &= ~VI_CTRL_GAMMA_DITHER_ON;
+    if (func & OS_VI_GAMMA_DITHER_ON) {
+        control |= VI_CTRL_GAMMA_DITHER_ON;
     }
-
-    if ((func & OS_VI_DIVOT_ON) != 0) {
-        *control_out |= VI_CTRL_DIVOT_ON;
+    if (func & OS_VI_GAMMA_DITHER_OFF) {
+        control &= ~VI_CTRL_GAMMA_DITHER_ON;
     }
-
-    if ((func & OS_VI_DIVOT_OFF) != 0) {
-        *control_out &= ~VI_CTRL_DIVOT_ON;
+    if (func & OS_VI_DIVOT_ON) {
+        control |= VI_CTRL_DIVOT_ON;
     }
-
-    if ((func & OS_VI_DITHER_FILTER_ON) != 0) {
-        *control_out |= VI_CTRL_DITHER_FILTER_ON;
-        *control_out &= ~VI_CTRL_ANTIALIAS_MASK;
+    if (func & OS_VI_DIVOT_OFF) {
+        control &= ~VI_CTRL_DIVOT_ON;
     }
-
-    if ((func & OS_VI_DITHER_FILTER_OFF) != 0) {
-        *control_out &= ~VI_CTRL_DITHER_FILTER_ON;
-        *control_out |= next_state->mode->comRegs.ctrl & VI_CTRL_ANTIALIAS_MASK;
+    if (func & OS_VI_DITHER_FILTER_ON) {
+        // Enabling the dither filter takes the place of hardware antialiasing.
+        control |= VI_CTRL_DITHER_FILTER_ON;
+        control &= ~VI_CTRL_ANTIALIAS_MASK;
+    }
+    if (func & OS_VI_DITHER_FILTER_OFF) {
+        // Turning it back off restores the antialias bits from the active mode.
+        control &= ~VI_CTRL_DITHER_FILTER_ON;
+        control |= next_state->mode->comRegs.ctrl & VI_CTRL_ANTIALIAS_MASK;
     }
 }
 
@@ -735,12 +727,12 @@ extern "C" uint64_t ultramodern_dp_complete_count(void);
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
-    // Send gfx tasks to the graphics action queue
+    // Graphics tasks are routed to the action queue serviced by the gfx thread.
     if (task->t.type == M_GFXTASK) {
         g_submit_gfx.fetch_add(1, std::memory_order_relaxed);
         events_context.action_queue.enqueue(SpTaskAction{ *task });
     }
-    // Set all other tasks as the RSP task
+    // Every other task type is serviced by the SP task thread.
     else {
         if (task->t.type == M_AUDTASK) g_submit_audio.fetch_add(1, std::memory_order_relaxed);
         else g_submit_other.fetch_add(1, std::memory_order_relaxed);
@@ -763,8 +755,8 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
     events_context.sp.gfx_thread = std::thread{ gfx_thread_func, rdram, &gfx_thread_ready, window_handle };
     events_context.sp.task_thread = std::thread{ task_thread_func, rdram, &task_thread_ready };
 
-    // Wait for the two sp threads to be ready before continuing to prevent the game from
-    // running before we're able to handle RSP tasks.
+    // Don't let the game proceed until both SP-side threads report ready, so no RSP task
+    // can arrive before there's something to service it.
     gfx_thread_ready.wait();
     task_thread_ready.wait();
 
@@ -803,7 +795,7 @@ void ultramodern::join_event_threads() {
     events_context.sp.gfx_thread.join();
     events_context.vi.thread.join();
 
-    // Send a null RSP task to indicate that the RSP task thread should exit.
+    // Push the null sentinel so the SP task thread falls out of its loop and returns.
     events_context.sp_task_queue.enqueue(nullptr);
     events_context.sp.task_thread.join();
 }

@@ -362,8 +362,8 @@ void recomp::overlays::register_patches(const char* patch, std::size_t size, Sec
     std::memcpy(patch_data.data(), patch, size);
 
     patch_code_sections_by_rom.reserve(num_patch_code_sections);
-    for (size_t i = 0; i < num_patch_code_sections; i++) {
-        patch_code_sections_by_rom.emplace(patch_code_sections[i].rom_addr, i);
+    for (size_t idx = 0; idx < num_patch_code_sections; idx++) {
+        patch_code_sections_by_rom.emplace(patch_code_sections[idx].rom_addr, idx);
     }
 }
 
@@ -376,42 +376,34 @@ void recomp::overlays::register_ext_base_export(const std::string& name, recomp_
 }
 
 void recomp::overlays::register_base_exports(const FunctionExport* export_list) {
-    std::unordered_map<uint32_t, recomp_func_t*> patch_func_vram_map{};
-
-    // Iterate over all patch functions to set up a mapping of their vram address.
-    for (size_t patch_section_index = 0; patch_section_index < num_patch_code_sections; patch_section_index++) {
-        const SectionTableEntry* cur_section = &patch_code_sections[patch_section_index];
-
-        for (size_t func_index = 0; func_index < cur_section->num_funcs; func_index++) {
-            const FuncEntry* cur_func = &cur_section->funcs[func_index];
-            patch_func_vram_map.emplace(cur_section->ram_addr + cur_func->offset, cur_func->func);
+    // Build a vram -> host-function table spanning every patch section.
+    std::unordered_map<uint32_t, recomp_func_t*> vram_to_func{};
+    for (size_t section_idx = 0; section_idx < num_patch_code_sections; section_idx++) {
+        const SectionTableEntry& section = patch_code_sections[section_idx];
+        for (size_t fi = 0; fi < section.num_funcs; fi++) {
+            const FuncEntry& entry = section.funcs[fi];
+            vram_to_func.emplace(section.ram_addr + entry.offset, entry.func);
         }
     }
 
-    // Iterate over exports, using the vram mapping to create a name mapping.
-    for (const FunctionExport* cur_export = &export_list[0]; cur_export->name != nullptr; cur_export++) {
-        auto it = patch_func_vram_map.find(cur_export->ram_addr);
-        if (it == patch_func_vram_map.end()) {
+    // Resolve each exported name through that vram table.
+    for (const FunctionExport* exp = export_list; exp->name != nullptr; exp++) {
+        auto found = vram_to_func.find(exp->ram_addr);
+        if (found == vram_to_func.end()) {
             assert(false && "Failed to find exported function in patch function sections!");
         }
-        base_exports.emplace(cur_export->name, it->second);
+        base_exports.emplace(exp->name, found->second);
     }
 }
 
 recomp_func_t* recomp::overlays::get_base_export(const std::string& export_name) {
-    auto it = base_exports.find(export_name);
-    if (it == base_exports.end()) {
-        return nullptr;
-    }
-    return it->second;
+    auto found = base_exports.find(export_name);
+    return found != base_exports.end() ? found->second : nullptr;
 }
 
 recomp_func_ext_t* recomp::overlays::get_ext_base_export(const std::string& export_name) {
-    auto it = ext_base_exports.find(export_name);
-    if (it == ext_base_exports.end()) {
-        return nullptr;
-    }
-    return it->second;
+    auto found = ext_base_exports.find(export_name);
+    return found != ext_base_exports.end() ? found->second : nullptr;
 }
 
 void recomp::overlays::register_base_events(char const* const* event_names) {
@@ -421,11 +413,8 @@ void recomp::overlays::register_base_events(char const* const* event_names) {
 }
 
 size_t recomp::overlays::get_base_event_index(const std::string& event_name) {
-    auto it = base_events.find(event_name);
-    if (it == base_events.end()) {
-        return (size_t)-1;
-    }
-    return it->second;
+    auto found = base_events.find(event_name);
+    return found != base_events.end() ? found->second : (size_t)-1;
 }
 
 size_t recomp::overlays::num_base_events() {
@@ -441,12 +430,12 @@ uint32_t recomp::overlays::get_section_ram_addr(uint16_t code_section_index) {
 }
 
 std::span<const RelocEntry> recomp::overlays::get_section_relocs(uint16_t code_section_index) {
-    if (code_section_index < sections_info.num_code_sections) {
-        const auto& section = sections_info.code_sections[code_section_index];
-        return std::span{ section.relocs, section.num_relocs };
+    if (code_section_index >= sections_info.num_code_sections) {
+        assert(false);
+        return {};
     }
-    assert(false);
-    return {};
+    const SectionTableEntry& section = sections_info.code_sections[code_section_index];
+    return std::span{ section.relocs, section.num_relocs };
 }
 
 void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
@@ -1658,9 +1647,9 @@ void recomp::overlays::register_runtime_fragment(uint8_t* rdram, uint32_t id, in
 
 static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {
     FuncMapWriteLock _fml;
-    for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
-        const FuncEntry& func = section.funcs[function_index];
-        func_map[ram + func.offset] = func.func;
+    for (size_t fi = 0; fi < section.num_funcs; fi++) {
+        const FuncEntry& entry = section.funcs[fi];
+        func_map[ram + entry.offset] = entry.func;
     }
 }
 
@@ -1670,8 +1659,9 @@ static void load_patch_functions() {
         debug_printf("[Patch] No patch section was registered\n");
         return;
     }
-    for (size_t i = 0; i < num_patch_code_sections; i++) {
-        load_special_overlay(patch_code_sections[i], patch_code_sections[i].ram_addr);
+    for (size_t idx = 0; idx < num_patch_code_sections; idx++) {
+        const SectionTableEntry& section = patch_code_sections[idx];
+        load_special_overlay(section, section.ram_addr);
     }
 }
 
@@ -1964,15 +1954,15 @@ bool recomp::overlays::get_func_entry_by_section_index_function_offset(uint16_t 
         return false;
     }
 
-    SectionTableEntry* section = &sections_info.code_sections[code_section_index];
-    if (function_offset >= section->size) {
+    const SectionTableEntry& section = sections_info.code_sections[code_section_index];
+    if (function_offset >= section.size) {
         return false;
     }
-    
-    // TODO avoid a linear lookup here.
-    for (size_t func_index = 0; func_index < section->num_funcs; func_index++) {
-        if (section->funcs[func_index].offset == function_offset) {
-            func_out = section->funcs[func_index];
+
+    // TODO: replace this linear scan with a faster lookup.
+    for (size_t fi = 0; fi < section.num_funcs; fi++) {
+        if (section.funcs[fi].offset == function_offset) {
+            func_out = section.funcs[fi];
             return true;
         }
     }
@@ -2016,15 +2006,15 @@ recomp_func_t* recomp::overlays::get_func_by_section_index_function_offset(uint1
 
 // Finds a function given a section's rom address and the function's vram address.
 recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t section_rom, uint32_t function_vram) {
-    auto find_section_it = code_sections_by_rom.find(section_rom);
-    if (find_section_it == code_sections_by_rom.end()) {
+    auto found = code_sections_by_rom.find(section_rom);
+    if (found == code_sections_by_rom.end()) {
         return nullptr;
     }
 
-    SectionTableEntry* section = &sections_info.code_sections[find_section_it->second];
-    int32_t func_offset = function_vram - section->ram_addr;
-    
-    return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
+    const SectionTableEntry& section = sections_info.code_sections[found->second];
+    int32_t func_offset = function_vram - section.ram_addr;
+
+    return get_func_by_section_index_function_offset(found->second, func_offset);
 }
 
 // Tolerant-emit companion: when an indirect call lands at an address
@@ -5314,32 +5304,31 @@ extern "C" int recomp_debug_probe_pointer_site(uint32_t* out_addr) {
 }
 
 std::unordered_map<recomp_func_t*, recomp::overlays::BasePatchedFunction> recomp::overlays::get_base_patched_funcs() {
-    std::unordered_map<recomp_func_t*, BasePatchedFunction> ret{};
-
-    // Collect the set of all functions in the patches.
-    std::unordered_map<recomp_func_t*, BasePatchedFunction> all_patch_funcs{};
-    for (size_t patch_section_index = 0; patch_section_index < num_patch_code_sections; patch_section_index++) {
-        const auto& patch_section = patch_code_sections[patch_section_index];
-        for (size_t func_index = 0; func_index < patch_section.num_funcs; func_index++) {
-            all_patch_funcs.emplace(patch_section.funcs[func_index].func, BasePatchedFunction{ .patch_section = patch_section_index, .function_index = func_index });
+    // Index every patch function by its host pointer.
+    std::unordered_map<recomp_func_t*, BasePatchedFunction> patch_funcs_by_ptr{};
+    for (size_t ps = 0; ps < num_patch_code_sections; ps++) {
+        const auto& patch_section = patch_code_sections[ps];
+        for (size_t fi = 0; fi < patch_section.num_funcs; fi++) {
+            patch_funcs_by_ptr.emplace(patch_section.funcs[fi].func,
+                BasePatchedFunction{ .patch_section = ps, .function_index = fi });
         }
     }
 
-    // Check every vanilla function against the full patch function set.
-    // Any functions in both are patched.
-    for (size_t code_section_index = 0; code_section_index < sections_info.num_code_sections; code_section_index++) {
-        const auto& code_section = sections_info.code_sections[code_section_index];
-        for (size_t func_index = 0; func_index < code_section.num_funcs; func_index++) {
-            recomp_func_t* cur_func = code_section.funcs[func_index].func;
-            // If this function also exists in the patches function set then it's a vanilla function that was patched.
-            auto find_it = all_patch_funcs.find(cur_func);
-            if (find_it != all_patch_funcs.end()) {
-                ret.emplace(cur_func, find_it->second);
+    // A vanilla function whose pointer also appears among the patch
+    // functions is one that a patch overrides — gather those.
+    std::unordered_map<recomp_func_t*, BasePatchedFunction> result{};
+    for (size_t cs = 0; cs < sections_info.num_code_sections; cs++) {
+        const auto& code_section = sections_info.code_sections[cs];
+        for (size_t fi = 0; fi < code_section.num_funcs; fi++) {
+            recomp_func_t* fn = code_section.funcs[fi].func;
+            auto found = patch_funcs_by_ptr.find(fn);
+            if (found != patch_funcs_by_ptr.end()) {
+                result.emplace(fn, found->second);
             }
         }
     }
 
-    return ret;
+    return result;
 }
 
 const std::unordered_map<uint32_t, uint16_t>& recomp::overlays::get_patch_vrom_to_section_map() {
@@ -5347,24 +5336,24 @@ const std::unordered_map<uint32_t, uint16_t>& recomp::overlays::get_patch_vrom_t
 }
 
 uint32_t recomp::overlays::get_patch_section_ram_addr(uint16_t patch_code_section_index) {
-    if (patch_code_section_index < num_patch_code_sections) {
-        return patch_code_sections[patch_code_section_index].ram_addr;
+    if (patch_code_section_index >= num_patch_code_sections) {
+        assert(false);
+        return -1;
     }
-    assert(false);
-    return -1;
+    return patch_code_sections[patch_code_section_index].ram_addr;
 }
 
 uint32_t recomp::overlays::get_patch_section_rom_addr(uint16_t patch_code_section_index) {
-    if (patch_code_section_index < num_patch_code_sections) {
-        return patch_code_sections[patch_code_section_index].rom_addr;
+    if (patch_code_section_index >= num_patch_code_sections) {
+        assert(false);
+        return -1;
     }
-    assert(false);
-    return -1;
+    return patch_code_sections[patch_code_section_index].rom_addr;
 }
 
 const FuncEntry* recomp::overlays::get_patch_function_entry(uint16_t patch_code_section_index, size_t function_index) {
     if (patch_code_section_index < num_patch_code_sections) {
-        const auto& section = patch_code_sections[patch_code_section_index];
+        const SectionTableEntry& section = patch_code_sections[patch_code_section_index];
         if (function_index < section.num_funcs) {
             return &section.funcs[function_index];
         }
@@ -5379,15 +5368,15 @@ bool recomp::overlays::get_patch_func_entry_by_section_index_function_offset(uin
         return false;
     }
 
-    SectionTableEntry* section = &patch_code_sections[patch_code_section_index];
-    if (function_offset >= section->size) {
+    const SectionTableEntry& section = patch_code_sections[patch_code_section_index];
+    if (function_offset >= section.size) {
         return false;
     }
-    
-    // TODO avoid a linear lookup here.
-    for (size_t func_index = 0; func_index < section->num_funcs; func_index++) {
-        if (section->funcs[func_index].offset == function_offset) {
-            func_out = section->funcs[func_index];
+
+    // TODO: replace this linear scan with a faster lookup.
+    for (size_t fi = 0; fi < section.num_funcs; fi++) {
+        if (section.funcs[fi].offset == function_offset) {
+            func_out = section.funcs[fi];
             return true;
         }
     }
@@ -5396,12 +5385,12 @@ bool recomp::overlays::get_patch_func_entry_by_section_index_function_offset(uin
 }
 
 std::span<const RelocEntry> recomp::overlays::get_patch_section_relocs(uint16_t patch_code_section_index) {
-    if (patch_code_section_index < num_patch_code_sections) {
-        const auto& section = patch_code_sections[patch_code_section_index];
-        return std::span{ section.relocs, section.num_relocs };
+    if (patch_code_section_index >= num_patch_code_sections) {
+        assert(false);
+        return {};
     }
-    assert(false);
-    return {};
+    const SectionTableEntry& section = patch_code_sections[patch_code_section_index];
+    return std::span{ section.relocs, section.num_relocs };
 }
 
 std::span<const uint8_t> recomp::overlays::get_patch_binary() {

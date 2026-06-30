@@ -213,9 +213,9 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
-    // TODO use word copies when possible
+    // TODO: widen the copy to word units where alignment allows.
 
-    // TODO handle misaligned DMA
+    // TODO: support transfers that aren't naturally aligned.
     assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
     assert((ram_address & 0x7) == 0 && "Only PI DMA to aligned RDRAM addresses is currently supported");
 
@@ -265,20 +265,18 @@ void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr
     }
 
     uint8_t* rom_addr = rom.data() + rom_off;
-    for (size_t i = 0; i < num_bytes; i++) {
-        MEM_B(i, ram_address) = *rom_addr;
-        rom_addr++;
+    for (size_t copied = 0; copied < num_bytes; ++copied) {
+        MEM_B(copied, ram_address) = rom_addr[copied];
     }
 }
 
 void recomp::do_rom_pio(uint8_t* rdram, gpr ram_address, uint32_t physical_addr) {
     assert((physical_addr & 0x3) == 0 && "PIO not 4-byte aligned in device, currently unsupported");
     assert((ram_address & 0x3) == 0 && "PIO not 4-byte aligned in RDRAM, currently unsupported");
-    uint8_t* rom_addr = rom.data() + physical_addr - recomp::rom_base;
-    MEM_B(0, ram_address) = *rom_addr++;
-    MEM_B(1, ram_address) = *rom_addr++;
-    MEM_B(2, ram_address) = *rom_addr++;
-    MEM_B(3, ram_address) = *rom_addr++;
+    const uint8_t* src = rom.data() + (physical_addr - recomp::rom_base);
+    for (uint32_t i = 0; i < sizeof(uint32_t); ++i) {
+        MEM_B(i, ram_address) = src[i];
+    }
 }
 
 struct {
@@ -302,11 +300,11 @@ std::filesystem::path ultramodern::get_save_file_path() {
 }
 
 void set_save_file_path(const std::u8string& subfolder, const std::u8string& name) {
-    std::filesystem::path save_folder_path = config_path / save_folder;
+    std::filesystem::path dir = config_path / save_folder;
     if (!subfolder.empty()) {
-        save_folder_path = save_folder_path / subfolder;
+        dir /= subfolder;
     }
-    save_context.save_file_path = save_folder_path / (name + u8".bin");
+    save_context.save_file_path = dir / (name + u8".bin");
 }
 
 void update_save_file() {
@@ -333,23 +331,25 @@ void update_save_file() {
 extern std::atomic_bool exited;
 
 void saving_thread_func(RDRAM_ARG1) {
-    while (!exited) {
-        bool save_buffer_updated = false;
-        // Repeatedly wait for a new action to be sent.
-        constexpr int64_t wait_time_microseconds = 10000;
-        constexpr int max_actions = 128;
-        int num_actions = 0;
+    // Block this long for the next write, and fold at most this many
+    // writes into one flush so a never-ending write stream can't keep
+    // the save buffer from ever reaching disk.
+    constexpr int64_t write_wait_us = 10000;
+    constexpr int max_coalesced = 128;
 
-        // Wait up to the given timeout for a write to come in. Allow multiple writes to coalesce together into a single save.
-        // Cap the number of coalesced writes to guarantee that the save buffer eventually gets written out to the file even if the game
-        // is constantly sending writes.
-        while (save_context.write_sempahore.wait(wait_time_microseconds) && num_actions < max_actions) {
-            save_buffer_updated = true;
-            num_actions++;
+    while (!exited) {
+        bool dirty = false;
+        int folded = 0;
+
+        // Drain incoming writes, merging consecutive ones into a single
+        // file flush, up to the coalescing cap.
+        while (save_context.write_sempahore.wait(write_wait_us) && folded < max_coalesced) {
+            dirty = true;
+            folded++;
         }
 
-        // If an action came through that affected the save file, save the updated contents.
-        if (save_buffer_updated) {
+        // Only touch the file when at least one write landed this round.
+        if (dirty) {
             update_save_file();
         }
 
@@ -363,10 +363,10 @@ void save_write_ptr(const void* in, uint32_t offset, uint32_t count) {
     assert(offset + count <= save_context.save_buffer.size());
 
     {
-        std::lock_guard lock { save_context.save_buffer_mutex };
-        memcpy(&save_context.save_buffer[offset], in, count);
+        std::lock_guard lock{ save_context.save_buffer_mutex };
+        std::memcpy(save_context.save_buffer.data() + offset, in, count);
     }
-    
+
     save_context.write_sempahore.signal();
 }
 
@@ -374,9 +374,9 @@ void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t cou
     assert(offset + count <= save_context.save_buffer.size());
 
     {
-        std::lock_guard lock { save_context.save_buffer_mutex };
-        for (gpr i = 0; i < count; i++) {
-            save_context.save_buffer[offset + i] = MEM_B(i, rdram_address);
+        std::lock_guard lock{ save_context.save_buffer_mutex };
+        for (uint32_t pos = 0; pos < count; ++pos) {
+            save_context.save_buffer[offset + pos] = MEM_B(pos, rdram_address);
         }
     }
 
@@ -386,9 +386,9 @@ void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t cou
 void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t count) {
     assert(offset + count <= save_context.save_buffer.size());
 
-    std::lock_guard lock { save_context.save_buffer_mutex };
-    for (gpr i = 0; i < count; i++) {
-        MEM_B(i, rdram_address) = save_context.save_buffer[offset + i];
+    std::lock_guard lock{ save_context.save_buffer_mutex };
+    for (uint32_t pos = 0; pos < count; ++pos) {
+        MEM_B(pos, rdram_address) = save_context.save_buffer[offset + pos];
     }
 }
 
@@ -396,8 +396,9 @@ void save_clear(uint32_t start, uint32_t size, char value) {
     assert(start + size <= save_context.save_buffer.size());
 
     {
-        std::lock_guard lock { save_context.save_buffer_mutex };
-        std::fill_n(save_context.save_buffer.begin() + start, size, value);
+        std::lock_guard lock{ save_context.save_buffer_mutex };
+        auto first = save_context.save_buffer.begin() + start;
+        std::fill(first, first + size, value);
     }
 
     save_context.write_sempahore.signal();

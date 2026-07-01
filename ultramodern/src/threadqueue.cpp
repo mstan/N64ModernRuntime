@@ -241,6 +241,10 @@ extern "C" void ultramodern_cosim_thread_quiescence(
             } else {
                 s.blocked_on_other++;
             }
+        } else if (t->state == OSThreadState::RUNNING &&
+                   t->priority <= 0 &&
+                   s.running_head == 0) {
+            s.idle_running++;
         } else {
             s.runnable_or_unknown++;
         }
@@ -251,8 +255,7 @@ extern "C" void ultramodern_cosim_thread_quiescence(
         s.vi_queue != 0 &&
         s.running_head == 0 &&
         s.known_threads != 0 &&
-        s.blocked_on_vi == s.known_threads &&
-        s.blocked_on_other == 0 &&
+        s.blocked_on_vi != 0 &&
         s.runnable_or_unknown == 0 &&
         s.external_pending == 0;
     *out = s;
@@ -291,6 +294,11 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
     }
     added->next = *link;
     added->queue = queue_;
+    if (queue_ == ultramodern::running_queue) {
+        added->state = OSThreadState::QUEUED;
+    } else if (queue_ != NULLPTR) {
+        added->state = OSThreadState::BLOCKED;
+    }
     *link = added_;
     sched_log::record(PASS_RDRAM sched_log::OP_INSERT, queue_, added_, *queue_to_ptr(PASS_RDRAM queue_));
 #ifdef N64_COSIM

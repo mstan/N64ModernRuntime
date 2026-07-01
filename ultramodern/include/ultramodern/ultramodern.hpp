@@ -34,6 +34,7 @@ struct ultramodern_cosim_quiescence_state {
     uint32_t known_threads;
     uint32_t blocked_on_vi;
     uint32_t blocked_on_other;
+    uint32_t idle_running;
     uint32_t runnable_or_unknown;
     uint32_t external_pending;
     uint32_t quiescent;

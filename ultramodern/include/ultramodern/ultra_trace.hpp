@@ -141,6 +141,10 @@ void recomp_runtime_set_rdram(unsigned char* rdram);
  * or NULL if not yet set. */
 unsigned char* recomp_runtime_get_rdram(void);
 
+#ifdef N64_COSIM
+void psr_cosim_set_active_context(unsigned char* rdram, void* ctx);
+#endif
+
 /* Boot snapshot — a parallel non-evicting buffer that captures the
  * first N events from process start and then stops recording.
  * Lets a probe answer "what happened at boot?" no matter how long
@@ -167,6 +171,7 @@ int      recomp_ultra_trace_boot_get(uint32_t pos,
 #define LIBRECOMP_ULTRA_TRACE(ctx)                                     \
     do {                                                               \
         ::recomp_runtime_set_rdram((unsigned char*)(rdram));           \
+        IF_N64_COSIM_ACTIVE_CONTEXT(rdram, ctx);                       \
         ::recomp_ultra_trace_record(                                   \
             __func__,                                                  \
             (uint32_t)(ctx)->r31,                                      \
@@ -175,6 +180,14 @@ int      recomp_ultra_trace_boot_get(uint32_t pos,
             (uint32_t)(ctx)->r6,                                       \
             (uint32_t)(ctx)->r7);                                      \
     } while (0)
+
+#ifdef N64_COSIM
+#define IF_N64_COSIM_ACTIVE_CONTEXT(rdram_arg, ctx_arg)                \
+    ::psr_cosim_set_active_context((unsigned char*)(rdram_arg),         \
+                                   (void*)(ctx_arg))
+#else
+#define IF_N64_COSIM_ACTIVE_CONTEXT(rdram_arg, ctx_arg) do { } while (0)
+#endif
 
 #endif /* __cplusplus */
 

@@ -204,6 +204,43 @@ extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 ret
 
 uint64_t total_vis = 0;
 
+#ifdef N64_COSIM
+extern "C" void psr_cosim_on_quiescent_vi(
+    uint8_t* rdram,
+    const ultramodern_cosim_quiescence_state* state);
+
+static uint32_t cosim_vi_queue_locked() {
+    ViState* cur = events_context.vi.get_cur_state();
+    ViState* next = events_context.vi.get_next_state();
+    if (cur->mq != NULLPTR) {
+        return static_cast<uint32_t>(cur->mq);
+    }
+    return static_cast<uint32_t>(next->mq);
+}
+
+extern "C" void ultramodern_cosim_get_quiescence(
+    ultramodern_cosim_quiescence_state* out)
+{
+    if (out == nullptr) {
+        return;
+    }
+    uint32_t vi_queue = 0;
+    {
+        std::lock_guard lock{ events_context.message_mutex };
+        vi_queue = cosim_vi_queue_locked();
+    }
+    ultramodern_cosim_thread_quiescence(vi_queue, out);
+}
+
+extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram) {
+    ultramodern_cosim_quiescence_state state{};
+    ultramodern_cosim_get_quiescence(&state);
+    if (state.quiescent) {
+        psr_cosim_on_quiescent_vi(rdram, &state);
+    }
+}
+#endif
+
 
 extern std::atomic_bool exited;
 extern moodycamel::LightweightSemaphore graphics_shutdown_ready;

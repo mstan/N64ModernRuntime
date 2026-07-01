@@ -12,6 +12,10 @@ extern "C" uint32_t ultramodern_running_queue_head(void) {
     return static_cast<uint32_t>(running_queue_impl);
 }
 
+#ifdef N64_COSIM
+extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram);
+#endif
+
 namespace sched_log {
     enum Op : uint32_t {
         OP_INSERT = 1,
@@ -194,6 +198,49 @@ extern "C" void ultramodern_sched_thread_states_copy(
     if (n_written) *n_written = w;
 }
 
+#ifdef N64_COSIM
+extern "C" void ultramodern_cosim_thread_quiescence(
+    uint32_t vi_queue,
+    ultramodern_cosim_quiescence_state* out)
+{
+    if (out == nullptr) {
+        return;
+    }
+
+    ultramodern_cosim_quiescence_state s{};
+    s.vi_queue = vi_queue;
+    s.running_head = static_cast<uint32_t>(running_queue_impl);
+
+    for (size_t i = 0; i < sched_log::MAX_TID; i++) {
+        const sched_log::ThreadState& ts = sched_log::thread_states[i];
+        if (!ts.valid) {
+            continue;
+        }
+        s.known_threads++;
+        if (ts.last_op == sched_log::OP_INSERT) {
+            if (vi_queue != 0 && ts.last_queue == vi_queue) {
+                s.blocked_on_vi++;
+            } else {
+                s.blocked_on_other++;
+            }
+        } else {
+            s.runnable_or_unknown++;
+        }
+    }
+
+    s.external_pending = ultramodern::external_message_pending() ? 1u : 0u;
+    s.quiescent =
+        s.vi_queue != 0 &&
+        s.running_head == 0 &&
+        s.known_threads != 0 &&
+        s.blocked_on_vi == s.known_threads &&
+        s.blocked_on_other == 0 &&
+        s.runnable_or_unknown == 0 &&
+        s.external_pending == 0;
+    *out = s;
+}
+#endif
+
 static PTR(OSThread)* queue_to_ptr(RDRAM_ARG PTR(PTR(OSThread)) queue) {
     if (queue == ultramodern::running_queue) {
         return &running_queue_impl;
@@ -228,6 +275,11 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
     added->queue = queue_;
     *link = added_;
     sched_log::record(PASS_RDRAM sched_log::OP_INSERT, queue_, added_, *queue_to_ptr(PASS_RDRAM queue_));
+#ifdef N64_COSIM
+    if (queue_ != ultramodern::running_queue && queue_ != NULLPTR) {
+        ultramodern_cosim_check_vi_quiescence(rdram);
+    }
+#endif
 
     // Trace the queue contents after the insertion.
     debug_printf("  Contains:");

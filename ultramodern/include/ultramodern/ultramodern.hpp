@@ -27,6 +27,22 @@ struct UltraThreadContext {
     moodycamel::LightweightSemaphore initialized;
 };
 
+#ifdef N64_COSIM
+struct ultramodern_cosim_quiescence_state {
+    uint32_t vi_queue;
+    uint32_t running_head;
+    uint32_t known_threads;
+    uint32_t blocked_on_vi;
+    uint32_t blocked_on_other;
+    uint32_t runnable_or_unknown;
+    uint32_t external_pending;
+    uint32_t quiescent;
+};
+
+extern "C" void ultramodern_cosim_get_quiescence(ultramodern_cosim_quiescence_state* out);
+extern "C" void ultramodern_cosim_thread_quiescence(uint32_t vi_queue, ultramodern_cosim_quiescence_state* out);
+#endif
+
 namespace ultramodern {
 
 constexpr uint32_t save_size = 1024 * 1024 / 8; // Maximum save size, 1Mbit for flash

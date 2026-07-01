@@ -200,6 +200,7 @@ extern "C" void ultramodern_sched_thread_states_copy(
 
 #ifdef N64_COSIM
 extern "C" void ultramodern_cosim_thread_quiescence(
+    uint8_t* rdram,
     uint32_t vi_queue,
     ultramodern_cosim_quiescence_state* out)
 {
@@ -210,15 +211,32 @@ extern "C" void ultramodern_cosim_thread_quiescence(
     ultramodern_cosim_quiescence_state s{};
     s.vi_queue = vi_queue;
     s.running_head = static_cast<uint32_t>(running_queue_impl);
+    if (rdram == nullptr) {
+        *out = s;
+        return;
+    }
 
     for (size_t i = 0; i < sched_log::MAX_TID; i++) {
         const sched_log::ThreadState& ts = sched_log::thread_states[i];
         if (!ts.valid) {
             continue;
         }
+        if (ts.thread == NULLPTR) {
+            continue;
+        }
+        if (ts.thread < 0x80000000u || ts.thread >= 0x80800000u) {
+            continue;
+        }
+        PTR(OSThread) thread = static_cast<PTR(OSThread)>(ts.thread);
+        OSThread* t = TO_PTR(OSThread, thread);
+        if (t->context == nullptr || t->state == OSThreadState::STOPPED) {
+            continue;
+        }
         s.known_threads++;
-        if (ts.last_op == sched_log::OP_INSERT) {
-            if (vi_queue != 0 && ts.last_queue == vi_queue) {
+        if (t->state == OSThreadState::BLOCKED) {
+            const uint32_t blocked_queue = static_cast<uint32_t>(t->queue);
+            if (vi_queue != 0 &&
+                (blocked_queue == vi_queue || ts.last_mq == vi_queue)) {
                 s.blocked_on_vi++;
             } else {
                 s.blocked_on_other++;

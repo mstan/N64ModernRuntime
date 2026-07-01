@@ -40,7 +40,8 @@ struct ultramodern_cosim_quiescence_state {
 };
 
 extern "C" void ultramodern_cosim_get_quiescence(ultramodern_cosim_quiescence_state* out);
-extern "C" void ultramodern_cosim_thread_quiescence(uint32_t vi_queue, ultramodern_cosim_quiescence_state* out);
+extern "C" void ultramodern_cosim_thread_quiescence(uint8_t* rdram, uint32_t vi_queue, ultramodern_cosim_quiescence_state* out);
+extern "C" uint32_t ultramodern_cosim_request_vi(uint32_t count);
 #endif
 
 namespace ultramodern {

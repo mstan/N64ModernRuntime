@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <utility>
 #include <mutex>
+#include <condition_variable>
 #include <queue>
 #include <cstring>
 
@@ -205,9 +206,18 @@ extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 ret
 uint64_t total_vis = 0;
 
 #ifdef N64_COSIM
-extern "C" void psr_cosim_on_quiescent_vi(
+void set_dummy_vi(bool odd);
+extern std::atomic_bool exited;
+
+extern "C" int psr_cosim_on_quiescent_vi(
     uint8_t* rdram,
     const ultramodern_cosim_quiescence_state* state);
+
+static int cosim_remaining_retraces = 1;
+static bool cosim_dummy_odd = false;
+static std::mutex cosim_vi_token_mutex;
+static std::condition_variable cosim_vi_token_cv;
+static uint32_t cosim_vi_tokens = 0;
 
 static uint32_t cosim_vi_queue_locked() {
     ViState* cur = events_context.vi.get_cur_state();
@@ -229,14 +239,94 @@ extern "C" void ultramodern_cosim_get_quiescence(
         std::lock_guard lock{ events_context.message_mutex };
         vi_queue = cosim_vi_queue_locked();
     }
-    ultramodern_cosim_thread_quiescence(vi_queue, out);
+    ultramodern_cosim_thread_quiescence(events_context.rdram, vi_queue, out);
+}
+
+static void ultramodern_cosim_clear_vi_tokens() {
+    std::lock_guard lock{ cosim_vi_token_mutex };
+    cosim_vi_tokens = 0;
+}
+
+extern "C" uint32_t ultramodern_cosim_request_vi(uint32_t count) {
+    if (count == 0 || !ultramodern::is_game_started()) {
+        return 0;
+    }
+    {
+        std::lock_guard lock{ cosim_vi_token_mutex };
+        const uint32_t room = UINT32_MAX - cosim_vi_tokens;
+        const uint32_t accepted = count > room ? room : count;
+        cosim_vi_tokens += accepted;
+        count = accepted;
+    }
+    cosim_vi_token_cv.notify_all();
+    return count;
+}
+
+static bool ultramodern_cosim_wait_vi_token() {
+    using namespace std::chrono_literals;
+    std::unique_lock lock{ cosim_vi_token_mutex };
+    while (!exited.load(std::memory_order_relaxed) && cosim_vi_tokens == 0) {
+        cosim_vi_token_cv.wait_for(lock, 1ms);
+    }
+    if (exited.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    cosim_vi_tokens--;
+    return true;
+}
+
+static void ultramodern_cosim_advance_vi(uint8_t* rdram) {
+    total_vis++;
+
+    ViState* next_state = events_context.vi.get_next_state();
+    if (next_state->mode == nullptr) {
+        set_dummy_vi(cosim_dummy_odd);
+        cosim_dummy_odd = !cosim_dummy_odd;
+    }
+
+    events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+    events_context.vi.update_vi();
+
+    {
+        std::lock_guard lock{ events_context.message_mutex };
+        ViState* cur_state = events_context.vi.get_cur_state();
+        cosim_remaining_retraces--;
+        if (cosim_remaining_retraces <= 0) {
+            if (cur_state->mq != NULLPTR) {
+                s32 sent = ultramodern::post_rcp_event(
+                    PASS_RDRAM cur_state->mq,
+                    cur_state->msg,
+                    /*coalescible=*/true);
+                recomp_ultra_trace_record("~vi_retrace", 0,
+                    (uint32_t)cur_state->mq, (uint32_t)cur_state->msg, (uint32_t)sent, 0);
+            }
+            cosim_remaining_retraces = cur_state->retrace_count > 0
+                ? cur_state->retrace_count
+                : 1;
+        }
+        if (events_context.ai.mq != NULLPTR) {
+            s32 sent = ultramodern::post_rcp_event(
+                PASS_RDRAM events_context.ai.mq,
+                events_context.ai.msg,
+                /*coalescible=*/false);
+            recomp_ultra_trace_record("~ai_event", 0,
+                (uint32_t)events_context.ai.mq, (uint32_t)events_context.ai.msg, (uint32_t)sent, 0);
+        }
+    }
+
+    if (events_callbacks.vi_callback != nullptr) {
+        events_callbacks.vi_callback();
+    }
 }
 
 extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram) {
     ultramodern_cosim_quiescence_state state{};
     ultramodern_cosim_get_quiescence(&state);
     if (state.quiescent) {
-        psr_cosim_on_quiescent_vi(rdram, &state);
+        ultramodern_cosim_clear_vi_tokens();
+        if (psr_cosim_on_quiescent_vi(rdram, &state)) {
+            ultramodern_cosim_advance_vi(rdram);
+        }
     }
 }
 #endif
@@ -257,6 +347,14 @@ void vi_thread_func() {
     int remaining_retraces = 1;
 
     while (!exited) {
+#ifdef N64_COSIM
+        if (ultramodern::is_game_started()) {
+            if (ultramodern_cosim_wait_vi_token()) {
+                ultramodern_cosim_advance_vi(events_context.rdram);
+            }
+            continue;
+        }
+#endif
         // Derive the absolute time of the next VI from the running VI count instead of
         // adding a fixed step each interrupt, which keeps long-term drift bounded.
         auto next = ultramodern::get_start() + (total_vis * 1000000us) / (60 * ultramodern::get_speed_multiplier());

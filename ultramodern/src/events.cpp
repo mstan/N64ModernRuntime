@@ -290,15 +290,41 @@ static std::atomic<uint64_t> cosim_scheduled_sp{0};
 static std::atomic<uint64_t> cosim_scheduled_dp{0};
 static std::atomic<uint64_t> cosim_scheduled_vi{0};
 static std::atomic<uint64_t> cosim_scheduled_ai{0};
+static std::atomic<uint64_t> cosim_scheduled_sp_gfx{0};
+static std::atomic<uint64_t> cosim_scheduled_sp_audio{0};
+static std::atomic<uint64_t> cosim_scheduled_sp_other{0};
 static std::atomic<uint64_t> cosim_delivered_sp{0};
 static std::atomic<uint64_t> cosim_delivered_dp{0};
 static std::atomic<uint64_t> cosim_delivered_vi{0};
 static std::atomic<uint64_t> cosim_delivered_ai{0};
+static std::atomic<uint64_t> cosim_delivered_sp_gfx{0};
+static std::atomic<uint64_t> cosim_delivered_sp_audio{0};
+static std::atomic<uint64_t> cosim_delivered_sp_other{0};
 
-static void cosim_count_scheduled(CosimRcpEventKind kind) {
+static void cosim_count_sp_task_type(
+    uint32_t task_type,
+    std::atomic<uint64_t>& gfx,
+    std::atomic<uint64_t>& audio,
+    std::atomic<uint64_t>& other)
+{
+    if (task_type == M_GFXTASK) {
+        gfx.fetch_add(1, std::memory_order_relaxed);
+    } else if (task_type == M_AUDTASK) {
+        audio.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        other.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void cosim_count_scheduled(CosimRcpEventKind kind, uint32_t task_type = 0) {
     switch (kind) {
         case CosimRcpEventKind::SpComplete:
             cosim_scheduled_sp.fetch_add(1, std::memory_order_relaxed);
+            cosim_count_sp_task_type(
+                task_type,
+                cosim_scheduled_sp_gfx,
+                cosim_scheduled_sp_audio,
+                cosim_scheduled_sp_other);
             break;
         case CosimRcpEventKind::DpComplete:
             cosim_scheduled_dp.fetch_add(1, std::memory_order_relaxed);
@@ -312,10 +338,15 @@ static void cosim_count_scheduled(CosimRcpEventKind kind) {
     }
 }
 
-static void cosim_count_delivered(CosimRcpEventKind kind) {
-    switch (kind) {
+static void cosim_count_delivered(const CosimRcpEvent& ev) {
+    switch (ev.kind) {
         case CosimRcpEventKind::SpComplete:
             cosim_delivered_sp.fetch_add(1, std::memory_order_relaxed);
+            cosim_count_sp_task_type(
+                ev.task_type,
+                cosim_delivered_sp_gfx,
+                cosim_delivered_sp_audio,
+                cosim_delivered_sp_other);
             break;
         case CosimRcpEventKind::DpComplete:
             cosim_delivered_dp.fetch_add(1, std::memory_order_relaxed);
@@ -399,7 +430,7 @@ static void cosim_schedule_rcp_event(
         std::lock_guard lock{ cosim_rcp_mutex };
         cosim_rcp_events.push_back(CosimRcpEvent{ due, seq, gfx_seq, task_type, NULLPTR, 0, kind });
     }
-    cosim_count_scheduled(kind);
+    cosim_count_scheduled(kind, task_type);
     recomp_ultra_trace_record(
         kind == CosimRcpEventKind::SpComplete ? "~cosim_sp_due" : "~cosim_dp_due",
         0,
@@ -509,10 +540,16 @@ extern "C" void ultramodern_cosim_reset_rcp_events(void) {
     cosim_scheduled_dp.store(0, std::memory_order_relaxed);
     cosim_scheduled_vi.store(0, std::memory_order_relaxed);
     cosim_scheduled_ai.store(0, std::memory_order_relaxed);
+    cosim_scheduled_sp_gfx.store(0, std::memory_order_relaxed);
+    cosim_scheduled_sp_audio.store(0, std::memory_order_relaxed);
+    cosim_scheduled_sp_other.store(0, std::memory_order_relaxed);
     cosim_delivered_sp.store(0, std::memory_order_relaxed);
     cosim_delivered_dp.store(0, std::memory_order_relaxed);
     cosim_delivered_vi.store(0, std::memory_order_relaxed);
     cosim_delivered_ai.store(0, std::memory_order_relaxed);
+    cosim_delivered_sp_gfx.store(0, std::memory_order_relaxed);
+    cosim_delivered_sp_audio.store(0, std::memory_order_relaxed);
+    cosim_delivered_sp_other.store(0, std::memory_order_relaxed);
 }
 
 extern "C" uint32_t ultramodern_cosim_rcp_event_pending(void) {
@@ -581,7 +618,7 @@ extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram) {
             recomp_ultra_trace_record("~ai_event", 0,
                 (uint32_t)ev.mq, (uint32_t)ev.msg, (uint32_t)sent, 0);
         }
-        cosim_count_delivered(ev.kind);
+        cosim_count_delivered(ev);
         delivered++;
     }
 }
@@ -597,10 +634,16 @@ extern "C" void ultramodern_cosim_get_rcp_event_stats(ultramodern_cosim_rcp_even
     out->scheduled_dp = cosim_scheduled_dp.load(std::memory_order_relaxed);
     out->scheduled_vi = cosim_scheduled_vi.load(std::memory_order_relaxed);
     out->scheduled_ai = cosim_scheduled_ai.load(std::memory_order_relaxed);
+    out->scheduled_sp_gfx = cosim_scheduled_sp_gfx.load(std::memory_order_relaxed);
+    out->scheduled_sp_audio = cosim_scheduled_sp_audio.load(std::memory_order_relaxed);
+    out->scheduled_sp_other = cosim_scheduled_sp_other.load(std::memory_order_relaxed);
     out->delivered_sp = cosim_delivered_sp.load(std::memory_order_relaxed);
     out->delivered_dp = cosim_delivered_dp.load(std::memory_order_relaxed);
     out->delivered_vi = cosim_delivered_vi.load(std::memory_order_relaxed);
     out->delivered_ai = cosim_delivered_ai.load(std::memory_order_relaxed);
+    out->delivered_sp_gfx = cosim_delivered_sp_gfx.load(std::memory_order_relaxed);
+    out->delivered_sp_audio = cosim_delivered_sp_audio.load(std::memory_order_relaxed);
+    out->delivered_sp_other = cosim_delivered_sp_other.load(std::memory_order_relaxed);
     out->vi_advancing = cosim_vi_advancing.load(std::memory_order_acquire);
 
     std::lock_guard lock{ cosim_rcp_mutex };
@@ -613,6 +656,13 @@ extern "C" void ultramodern_cosim_get_rcp_event_stats(ultramodern_cosim_rcp_even
         switch (ev.kind) {
             case CosimRcpEventKind::SpComplete:
                 out->pending_sp++;
+                if (ev.task_type == M_GFXTASK) {
+                    out->pending_sp_gfx++;
+                } else if (ev.task_type == M_AUDTASK) {
+                    out->pending_sp_audio++;
+                } else {
+                    out->pending_sp_other++;
+                }
                 break;
             case CosimRcpEventKind::DpComplete:
                 out->pending_dp++;

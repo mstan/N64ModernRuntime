@@ -75,6 +75,8 @@ extern "C" uint64_t ultramodern_cosim_get_cpu_retired(void);
 extern "C" uint64_t ultramodern_cosim_get_cpu_model_events(void);
 extern "C" void ultramodern_cosim_reset_rcp_events(void);
 extern "C" uint32_t ultramodern_cosim_rcp_event_pending(void);
+extern "C" uint32_t ultramodern_cosim_rcp_event_due(void);
+extern "C" uint32_t ultramodern_cosim_checkpoint_external_pending(void);
 extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram);
 extern "C" uint32_t ultramodern_cosim_advance_to_next_rcp_event(uint8_t* rdram);
 extern "C" void ultramodern_cosim_get_rcp_event_stats(ultramodern_cosim_rcp_event_stats* out);

@@ -335,6 +335,15 @@ extern "C" uint64_t ultramodern_external_requeues(void) {
     return g_external_requeues.load(std::memory_order_relaxed);
 }
 
+#ifdef N64_COSIM
+extern "C" uint32_t ultramodern_cosim_checkpoint_external_pending(void) {
+    if (g_external_pending.load(std::memory_order_relaxed) != 0) {
+        return 1;
+    }
+    return ultramodern_cosim_rcp_event_due();
+}
+#endif
+
 void ultramodern::wait_for_external_message(RDRAM_ARG1) {
     QueuedMessage to_send;
 #ifdef N64_COSIM

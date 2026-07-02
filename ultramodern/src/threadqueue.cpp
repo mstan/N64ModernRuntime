@@ -290,7 +290,7 @@ extern "C" void ultramodern_cosim_thread_quiescence(
         }
     }
 
-    s.external_pending = ultramodern::external_message_pending() ? 1u : 0u;
+    s.external_pending = ultramodern_cosim_checkpoint_external_pending();
     s.scheduler_active = cosim_scheduler_active.load(std::memory_order_acquire);
     s.quiescent =
         s.vi_queue != 0 &&
@@ -302,6 +302,7 @@ extern "C" void ultramodern_cosim_thread_quiescence(
         s.scheduler_active == 0;
     *out = s;
 }
+
 #endif
 
 static PTR(OSThread)* queue_to_ptr(RDRAM_ARG PTR(PTR(OSThread)) queue) {

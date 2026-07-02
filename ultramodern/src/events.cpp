@@ -482,6 +482,20 @@ static bool cosim_next_rcp_due(uint64_t& out) {
     return true;
 }
 
+static bool cosim_next_vi_due(uint64_t& out) {
+    if (cosim_vi_control_enabled.load(std::memory_order_acquire) == 0 ||
+        !ultramodern::is_game_started()) {
+        return false;
+    }
+
+    std::lock_guard lock{ cosim_vi_token_mutex };
+    if (cosim_vi_tokens == 0) {
+        return false;
+    }
+    out = cosim_vi_needs_rebase ? kCosimCounterPerVi : cosim_next_vi_cycle;
+    return true;
+}
+
 extern "C" void ultramodern_cosim_reset_rcp_events(void) {
     {
         std::lock_guard lock{ cosim_rcp_mutex };
@@ -507,6 +521,44 @@ extern "C" uint32_t ultramodern_cosim_rcp_event_pending(void) {
     }
     std::lock_guard lock{ cosim_rcp_mutex };
     return cosim_rcp_events.empty() ? 0u : 1u;
+}
+
+static bool cosim_vi_due_now() {
+    if (cosim_vi_control_enabled.load(std::memory_order_acquire) == 0 ||
+        !ultramodern::is_game_started()) {
+        return false;
+    }
+
+    std::lock_guard lock{ cosim_vi_token_mutex };
+    if (cosim_vi_tokens == 0) {
+        return false;
+    }
+    const uint64_t due = cosim_vi_needs_rebase ? kCosimCounterPerVi : cosim_next_vi_cycle;
+    return ultramodern_cosim_get_time_ticks() >= due;
+}
+
+extern "C" uint32_t ultramodern_cosim_rcp_event_due(void) {
+    if (cosim_vi_advancing.load(std::memory_order_acquire) != 0) {
+        return 1;
+    }
+    if (cosim_vi_due_now()) {
+        return 1;
+    }
+
+    const uint64_t now = ultramodern_cosim_get_time_ticks();
+    std::lock_guard lock{ cosim_rcp_mutex };
+    for (const CosimRcpEvent& ev : cosim_rcp_events) {
+        if (ev.due_cycle > now) {
+            continue;
+        }
+        if (ev.kind == CosimRcpEventKind::DpComplete &&
+            ev.gfx_seq != 0 &&
+            cosim_gfx_rendered_seq.load(std::memory_order_acquire) < ev.gfx_seq) {
+            continue;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram) {
@@ -576,19 +628,30 @@ extern "C" void ultramodern_cosim_get_rcp_event_stats(ultramodern_cosim_rcp_even
 }
 
 extern "C" uint32_t ultramodern_cosim_advance_to_next_rcp_event(uint8_t* rdram) {
-    uint32_t delivered = ultramodern_cosim_deliver_due_rcp_events(rdram);
+    uint32_t delivered = ultramodern_cosim_advance_due_vi(rdram, 0);
+    delivered += ultramodern_cosim_deliver_due_rcp_events(rdram);
     if (delivered != 0) {
         return delivered;
     }
 
-    uint64_t due = 0;
-    if (!cosim_next_rcp_due(due)) {
+    uint64_t rcp_due = 0;
+    const bool has_rcp_due = cosim_next_rcp_due(rcp_due);
+    uint64_t vi_due = 0;
+    const bool has_vi_due = cosim_next_vi_due(vi_due);
+    if (!has_rcp_due && !has_vi_due) {
         return 0;
     }
 
     const uint64_t now = ultramodern_cosim_get_time_ticks();
-    if (due > now) {
-        ultramodern_cosim_advance_time_ticks(due - now);
+    if (has_vi_due && (!has_rcp_due || vi_due <= rcp_due)) {
+        if (vi_due > now) {
+            ultramodern_cosim_advance_time_ticks(vi_due - now);
+        }
+        return ultramodern_cosim_advance_due_vi(rdram, 0);
+    }
+
+    if (rcp_due > now) {
+        ultramodern_cosim_advance_time_ticks(rcp_due - now);
     }
     return ultramodern_cosim_deliver_due_rcp_events(rdram);
 }

@@ -26,6 +26,8 @@ constexpr uint64_t counter_per_vi = (uint64_t)counter_per_ms * 1000u / 60u;
 constexpr uint64_t kCosimTimeReadCost = 64;
 extern uint64_t total_vis;
 static std::atomic<uint64_t> cosim_time_ticks{0};
+static std::atomic<uint64_t> cosim_cpu_retired{0};
+static std::atomic<uint64_t> cosim_cpu_model_events{0};
 #endif
 
 struct OSTimer {
@@ -92,6 +94,8 @@ static uint64_t cosim_sync_time_floor() {
 
 extern "C" void ultramodern_cosim_reset_time(void) {
     cosim_time_ticks.store(0, std::memory_order_relaxed);
+    cosim_cpu_retired.store(0, std::memory_order_relaxed);
+    cosim_cpu_model_events.store(0, std::memory_order_relaxed);
     ostime_offset = 0;
 }
 
@@ -105,6 +109,24 @@ extern "C" void ultramodern_cosim_advance_time_ticks(uint64_t ticks) {
     }
     cosim_sync_time_floor();
     cosim_time_ticks.fetch_add(ticks, std::memory_order_relaxed);
+}
+
+extern "C" void ultramodern_cosim_advance_cpu_cycles(uint64_t retired, uint64_t cycles) {
+    if (retired != 0) {
+        cosim_cpu_retired.fetch_add(retired, std::memory_order_relaxed);
+    }
+    if (retired != 0 || cycles != 0) {
+        cosim_cpu_model_events.fetch_add(1, std::memory_order_relaxed);
+    }
+    ultramodern_cosim_advance_time_ticks(cycles);
+}
+
+extern "C" uint64_t ultramodern_cosim_get_cpu_retired(void) {
+    return cosim_cpu_retired.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ultramodern_cosim_get_cpu_model_events(void) {
+    return cosim_cpu_model_events.load(std::memory_order_relaxed);
 }
 #endif
 

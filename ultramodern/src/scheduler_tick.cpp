@@ -68,6 +68,12 @@ constexpr OSPri kHardwarePollPriority = 80;
 constexpr uint32_t kLoopCheckpointCapacity = 256;
 #ifdef N64_COSIM
 constexpr uint64_t kCosimSchedulerTickCost = 64;
+constexpr uint64_t kCosimTraceEntryRetired = 4;
+constexpr uint64_t kCosimTraceEntryCost = 4;
+constexpr uint64_t kCosimTraceReturnRetired = 2;
+constexpr uint64_t kCosimTraceReturnCost = 2;
+constexpr uint64_t kCosimLoopBackedgeRetired = 2;
+constexpr uint64_t kCosimLoopBackedgeCost = 2;
 #endif
 
 struct LoopCheckpointSlot {
@@ -269,8 +275,27 @@ extern "C" void ultramodern_scheduler_tick(void) {
 
 extern "C" void ultramodern_scheduler_tick_vram(uint32_t pc) {
     record_loop_checkpoint(pc);
+#ifdef N64_COSIM
+    ultramodern_cosim_advance_cpu_cycles(kCosimLoopBackedgeRetired, kCosimLoopBackedgeCost);
+#endif
     scheduler_tick_impl();
 }
+
+#ifdef N64_COSIM
+extern "C" void ultramodern_cosim_trace_entry(void) {
+    ultramodern_cosim_advance_cpu_cycles(kCosimTraceEntryRetired, kCosimTraceEntryCost);
+    scheduler_tick_impl();
+}
+
+extern "C" void ultramodern_cosim_trace_return(void) {
+    ultramodern_cosim_advance_cpu_cycles(kCosimTraceReturnRetired, kCosimTraceReturnCost);
+}
+
+extern "C" void ultramodern_cosim_trace_loop(void) {
+    ultramodern_cosim_advance_cpu_cycles(kCosimLoopBackedgeRetired, kCosimLoopBackedgeCost);
+    scheduler_tick_impl();
+}
+#endif
 
 extern "C" uint32_t ultramodern_loop_checkpoint_capacity(void) {
     return kLoopCheckpointCapacity;

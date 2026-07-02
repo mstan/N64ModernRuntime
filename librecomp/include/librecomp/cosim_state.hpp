@@ -25,13 +25,14 @@ struct SubHashes {
     uint64_t rdram;    // the full guest RDRAM (real 8 MB, not the 1 GB window)
 };
 
-// One checkpoint row (COSIM.md §6 protocol; §5 reserves the modeled-cycle axis).
+// One checkpoint row (COSIM.md §6 protocol; §5 is the modeled-cycle axis).
 struct Checkpoint {
-    uint64_t cp;     // checkpoint index
-    uint64_t vis;    // total_vis (VI count) at this quiescent boundary
-    uint64_t cycle;  // modeled guest-cycle clock — RESERVED, 0 until T5
+    uint64_t cp;           // checkpoint index
+    uint64_t vis;          // total_vis (VI count) at this quiescent boundary
+    uint64_t cycle;        // modeled guest-cycle clock
+    uint64_t cpu_retired;  // approximate retired CPU-instruction counter
     SubHashes sub;
-    uint64_t chain;  // cumulative order-sensitive chain hash through this cp
+    uint64_t chain;        // cumulative order-sensitive chain hash through this cp
 };
 
 // Hash the both-sides state surface.

@@ -41,6 +41,27 @@ struct ultramodern_cosim_quiescence_state {
     uint32_t quiescent;
 };
 
+struct ultramodern_cosim_rcp_event_stats {
+    uint64_t now_cycle;
+    uint64_t next_due_cycle;
+    uint64_t next_seq;
+    uint64_t pending_total;
+    uint64_t pending_sp;
+    uint64_t pending_dp;
+    uint64_t pending_vi;
+    uint64_t pending_ai;
+    uint64_t scheduled_sp;
+    uint64_t scheduled_dp;
+    uint64_t scheduled_vi;
+    uint64_t scheduled_ai;
+    uint64_t delivered_sp;
+    uint64_t delivered_dp;
+    uint64_t delivered_vi;
+    uint64_t delivered_ai;
+    uint32_t has_next_due;
+    uint32_t vi_advancing;
+};
+
 extern "C" void ultramodern_cosim_get_quiescence(ultramodern_cosim_quiescence_state* out);
 extern "C" void ultramodern_cosim_thread_quiescence(uint8_t* rdram, uint32_t vi_queue, ultramodern_cosim_quiescence_state* out);
 extern "C" uint32_t ultramodern_cosim_request_vi(uint32_t count);
@@ -55,6 +76,7 @@ extern "C" void ultramodern_cosim_reset_rcp_events(void);
 extern "C" uint32_t ultramodern_cosim_rcp_event_pending(void);
 extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram);
 extern "C" uint32_t ultramodern_cosim_advance_to_next_rcp_event(uint8_t* rdram);
+extern "C" void ultramodern_cosim_get_rcp_event_stats(ultramodern_cosim_rcp_event_stats* out);
 extern "C" void ultramodern_cosim_trace_entry(void);
 extern "C" void ultramodern_cosim_trace_return(void);
 extern "C" void ultramodern_cosim_trace_loop(void);

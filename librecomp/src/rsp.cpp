@@ -55,10 +55,16 @@ struct RspDmaTraceEvent {
     uint32_t byte_count;
     uint32_t nonzero_bytes;
     int32_t first_nonzero;
-    uint8_t first16[16];
+    // 80 bytes covers the full 0x50-byte naudio ENVMIX state save —
+    // slice-boundary volume steps (the battle/announcer click) need
+    // whole-state WR->RD continuity checks, and 16 bytes only saw the
+    // head. Field name kept for source compat with existing consumers.
+    uint8_t first16[80];
 };
 
-constexpr uint32_t kRspDmaTraceCap = 4096;
+// 262144 events x 112 B = 28 MiB ≈ 6-9 s of battle-audio DMAs (~40k/s)
+// — enough for several announcer prompts per capture window.
+constexpr uint32_t kRspDmaTraceCap = 262144;
 RspDmaTraceEvent g_rsp_dma_trace[kRspDmaTraceCap]{};
 std::atomic<uint64_t> g_rsp_dma_trace_seq{0};
 

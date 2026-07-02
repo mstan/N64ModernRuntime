@@ -66,6 +66,7 @@ extern "C" void ultramodern_cosim_get_quiescence(ultramodern_cosim_quiescence_st
 extern "C" void ultramodern_cosim_thread_quiescence(uint8_t* rdram, uint32_t vi_queue, ultramodern_cosim_quiescence_state* out);
 extern "C" uint32_t ultramodern_cosim_request_vi(uint32_t count);
 extern "C" void ultramodern_cosim_reset_vi_counter(void);
+extern "C" uint32_t ultramodern_cosim_advance_due_vi(uint8_t* rdram, uint32_t allow_time_advance);
 extern "C" void ultramodern_cosim_reset_time(void);
 extern "C" uint64_t ultramodern_cosim_get_time_ticks(void);
 extern "C" void ultramodern_cosim_advance_time_ticks(uint64_t ticks);

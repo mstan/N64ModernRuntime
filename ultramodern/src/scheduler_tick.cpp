@@ -20,6 +20,7 @@ extern "C" uint32_t recomp_rsp_consume_preempt_skip_budget(void);
 #ifdef N64_COSIM
 extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram);
 extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram);
+extern "C" uint32_t ultramodern_cosim_advance_due_vi(uint8_t* rdram, uint32_t allow_time_advance);
 #endif
 
 namespace {
@@ -146,10 +147,14 @@ void scheduler_tick_impl() {
     uint32_t cosim_delivered = 0;
 #ifdef N64_COSIM
     if (g_rdram != nullptr) {
-        cosim_delivered = ultramodern_cosim_deliver_due_rcp_events(g_rdram);
+        cosim_delivered += ultramodern_cosim_advance_due_vi(g_rdram, 0);
+        cosim_delivered += ultramodern_cosim_deliver_due_rcp_events(g_rdram);
         ultramodern_cosim_quiescence_state q{};
         ultramodern_cosim_get_quiescence(&q);
         if (q.quiescent) {
+            if (ultramodern_cosim_advance_due_vi(g_rdram, 1) != 0) {
+                return;
+            }
             ultramodern_cosim_check_vi_quiescence(g_rdram);
             return;
         }

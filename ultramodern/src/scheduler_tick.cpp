@@ -68,7 +68,6 @@ constexpr uint32_t kSpStatusSignalMask = 0x00007F80u;
 constexpr OSPri kHardwarePollPriority = 80;
 constexpr uint32_t kLoopCheckpointCapacity = 256;
 #ifdef N64_COSIM
-constexpr uint64_t kCosimSchedulerTickCost = 64;
 constexpr uint64_t kCosimTraceEntryRetired = 4;
 constexpr uint64_t kCosimTraceEntryCost = 4;
 constexpr uint64_t kCosimTraceReturnRetired = 2;
@@ -158,9 +157,6 @@ void scheduler_tick_impl() {
             ultramodern_cosim_check_vi_quiescence(g_rdram);
             return;
         }
-    }
-    if (ultramodern_cosim_rcp_event_pending() != 0) {
-        ultramodern_cosim_advance_time_ticks(kCosimSchedulerTickCost);
     }
     if (g_rdram != nullptr) {
         cosim_delivered += ultramodern_cosim_deliver_due_rcp_events(g_rdram);

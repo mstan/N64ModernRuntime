@@ -112,6 +112,9 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
 
 void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     ultramodern::scheduler_trace_mark(PASS_RDRAM 120, NULLPTR, ultramodern::this_thread());
+#ifdef N64_COSIM
+    ultramodern_cosim_scheduler_handoff_end();
+#endif
     thread_context->running.wait();
     ultramodern::scheduler_trace_mark(PASS_RDRAM 121, NULLPTR, ultramodern::this_thread());
     // Once woken, the running OSThread may no longer own the context we blocked on: a
@@ -120,7 +123,12 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
         osDestroyThread(PASS_RDRAM NULLPTR);
     }
-    TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::RUNNING;
+    {
+#ifdef N64_COSIM
+        ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
+        TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::RUNNING;
+    }
     // Stamp the "last context switch into a game thread" timestamp.
     // The scheduler_tick monitor compares now() against this to decide
     // whether the currently-running game thread is hogging the CPU.
@@ -223,7 +231,12 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
     }
     else {
         // Invoked from outside the game (the initial start): wake the thread directly.
-        t->state = OSThreadState::QUEUED;
+        {
+#ifdef N64_COSIM
+            ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
+            t->state = OSThreadState::QUEUED;
+        }
         resume_thread(PASS_RDRAM t);
         //throw ultramodern::thread_terminated{};
     }
@@ -233,12 +246,17 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
     debug_printf("[os] Create Thread %d\n", id);
     OSThread *t = TO_PTR(OSThread, t_);
 
-    t->next = NULLPTR;
-    t->queue = NULLPTR;
-    t->priority = pri;
-    t->id = id;
-    t->state = OSThreadState::STOPPED;
-    t->sp = sp - 0x10; // Set up the first stack frame
+    {
+#ifdef N64_COSIM
+        ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
+        t->next = NULLPTR;
+        t->queue = NULLPTR;
+        t->priority = pri;
+        t->id = id;
+        t->state = OSThreadState::STOPPED;
+        t->sp = sp - 0x10; // Set up the first stack frame
+    }
 
     // Launch the host thread; it parks itself immediately (see run_game_thread) and waits
     // to be started. The context is passed in as an argument so a later clear of t->context
@@ -294,13 +312,18 @@ extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
     OSThread* t = TO_PTR(OSThread, t_);
 
     if (t->priority != pri) {
-        t->priority = pri;
+        {
+#ifdef N64_COSIM
+            ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
+            t->priority = pri;
 
-        // A thread that is queued somewhere must be re-inserted so the queue order tracks
-        // its new priority. The running thread isn't in a queue, so it's skipped.
-        if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
-            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
-            ultramodern::thread_queue_insert(PASS_RDRAM t->queue, t_);
+            // A thread that is queued somewhere must be re-inserted so the queue order tracks
+            // its new priority. The running thread isn't in a queue, so it's skipped.
+            if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
+                ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+                ultramodern::thread_queue_insert(PASS_RDRAM t->queue, t_);
+            }
         }
 
         ultramodern::check_running_queue(PASS_RDRAM1);

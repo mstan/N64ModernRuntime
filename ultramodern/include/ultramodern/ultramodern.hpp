@@ -37,15 +37,39 @@ struct ultramodern_cosim_quiescence_state {
     uint32_t idle_running;
     uint32_t runnable_or_unknown;
     uint32_t external_pending;
+    uint32_t scheduler_active;
     uint32_t quiescent;
 };
 
 extern "C" void ultramodern_cosim_get_quiescence(ultramodern_cosim_quiescence_state* out);
 extern "C" void ultramodern_cosim_thread_quiescence(uint8_t* rdram, uint32_t vi_queue, ultramodern_cosim_quiescence_state* out);
 extern "C" uint32_t ultramodern_cosim_request_vi(uint32_t count);
+extern "C" void ultramodern_cosim_reset_vi_counter(void);
+extern "C" void ultramodern_cosim_reset_time(void);
+extern "C" uint64_t ultramodern_cosim_get_time_ticks(void);
+extern "C" void ultramodern_cosim_advance_time_ticks(uint64_t ticks);
+extern "C" void ultramodern_cosim_reset_rcp_events(void);
+extern "C" uint32_t ultramodern_cosim_rcp_event_pending(void);
+extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram);
+extern "C" uint32_t ultramodern_cosim_advance_to_next_rcp_event(uint8_t* rdram);
+extern "C" void ultramodern_cosim_scheduler_mutation_begin(void);
+extern "C" void ultramodern_cosim_scheduler_mutation_end(void);
+extern "C" void ultramodern_cosim_scheduler_handoff_begin(void);
+extern "C" void ultramodern_cosim_scheduler_handoff_end(void);
+extern "C" uint64_t ultramodern_cosim_scheduler_epoch(void);
 #endif
 
 namespace ultramodern {
+
+#ifdef N64_COSIM
+struct CosimSchedulerMutation {
+    CosimSchedulerMutation() { ultramodern_cosim_scheduler_mutation_begin(); }
+    ~CosimSchedulerMutation() { ultramodern_cosim_scheduler_mutation_end(); }
+
+    CosimSchedulerMutation(const CosimSchedulerMutation&) = delete;
+    CosimSchedulerMutation& operator=(const CosimSchedulerMutation&) = delete;
+};
+#endif
 
 constexpr uint32_t save_size = 1024 * 1024 / 8; // Maximum save size, 1Mbit for flash
 

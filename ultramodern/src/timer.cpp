@@ -1,6 +1,7 @@
 #include <thread>
 #include <variant>
 #include <set>
+#include <atomic>
 #include "blockingconcurrentqueue.h"
 
 #include "ultramodern/ultra64.h"
@@ -20,6 +21,12 @@ static int64_t ostime_offset = 0;
 constexpr uint32_t speed_multiplier = 1;
 // N64 CPU counter ticks per millisecond
 constexpr uint32_t counter_per_ms = 46'875 * speed_multiplier;
+#ifdef N64_COSIM
+constexpr uint64_t counter_per_vi = (uint64_t)counter_per_ms * 1000u / 60u;
+constexpr uint64_t kCosimTimeReadCost = 64;
+extern uint64_t total_vis;
+static std::atomic<uint64_t> cosim_time_ticks{0};
+#endif
 
 struct OSTimer {
     PTR(OSTimer) unused1;
@@ -65,8 +72,41 @@ std::chrono::high_resolution_clock::time_point ticks_to_timepoint(uint64_t ticks
 }
 
 uint64_t time_now() {
+#ifdef N64_COSIM
+    return ultramodern_cosim_get_time_ticks();
+#else
     return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+#endif
 }
+
+#ifdef N64_COSIM
+static uint64_t cosim_sync_time_floor() {
+    const uint64_t vi_floor = total_vis * counter_per_vi;
+    uint64_t cur = cosim_time_ticks.load(std::memory_order_relaxed);
+    while (cur < vi_floor &&
+           !cosim_time_ticks.compare_exchange_weak(
+               cur, vi_floor, std::memory_order_relaxed)) {
+    }
+    return cur < vi_floor ? vi_floor : cur;
+}
+
+extern "C" void ultramodern_cosim_reset_time(void) {
+    cosim_time_ticks.store(0, std::memory_order_relaxed);
+    ostime_offset = 0;
+}
+
+extern "C" uint64_t ultramodern_cosim_get_time_ticks(void) {
+    return cosim_sync_time_floor();
+}
+
+extern "C" void ultramodern_cosim_advance_time_ticks(uint64_t ticks) {
+    if (ticks == 0) {
+        return;
+    }
+    cosim_sync_time_floor();
+    cosim_time_ticks.fetch_add(ticks, std::memory_order_relaxed);
+}
+#endif
 
 void timer_thread(RDRAM_ARG1) {
     ultramodern::set_native_thread_name("Timer Thread");
@@ -159,6 +199,9 @@ std::chrono::high_resolution_clock::duration ultramodern::time_since_start() {
 }
 
 extern "C" u32 osGetCount() {
+#ifdef N64_COSIM
+    ultramodern_cosim_advance_time_ticks(kCosimTimeReadCost);
+#endif
     // osGetCount is allowed to wrap, so truncating the 64-bit tick count is fine.
     return (uint32_t)time_now();
 }
@@ -168,6 +211,9 @@ extern "C" void osSetCount(u32 count) {
 }
 
 extern "C" OSTime osGetTime() {
+#ifdef N64_COSIM
+    ultramodern_cosim_advance_time_ticks(kCosimTimeReadCost);
+#endif
     return time_now() - ostime_offset;
 }
 

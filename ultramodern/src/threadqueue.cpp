@@ -14,6 +14,46 @@ extern "C" uint32_t ultramodern_running_queue_head(void) {
 
 #ifdef N64_COSIM
 extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram);
+
+static std::atomic<uint64_t> cosim_scheduler_epoch{0};
+static std::atomic<uint32_t> cosim_scheduler_active{0};
+static thread_local uint32_t cosim_scheduler_depth = 0;
+static thread_local bool cosim_scheduler_handoff_open = false;
+
+extern "C" void ultramodern_cosim_scheduler_mutation_begin(void) {
+    if (cosim_scheduler_depth++ == 0) {
+        cosim_scheduler_active.fetch_add(1, std::memory_order_acq_rel);
+        cosim_scheduler_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+extern "C" void ultramodern_cosim_scheduler_mutation_end(void) {
+    assert(cosim_scheduler_depth != 0);
+    if (--cosim_scheduler_depth == 0) {
+        cosim_scheduler_epoch.fetch_add(1, std::memory_order_acq_rel);
+        cosim_scheduler_active.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
+extern "C" void ultramodern_cosim_scheduler_handoff_begin(void) {
+    if (!cosim_scheduler_handoff_open) {
+        cosim_scheduler_handoff_open = true;
+        ultramodern_cosim_scheduler_mutation_begin();
+    }
+}
+
+extern "C" void ultramodern_cosim_scheduler_handoff_end(void) {
+    if (cosim_scheduler_handoff_open) {
+        cosim_scheduler_handoff_open = false;
+        ultramodern_cosim_scheduler_mutation_end();
+    }
+}
+
+extern "C" uint64_t ultramodern_cosim_scheduler_epoch(void) {
+    const uint64_t epoch = cosim_scheduler_epoch.load(std::memory_order_acquire);
+    const uint32_t active = cosim_scheduler_active.load(std::memory_order_acquire);
+    return (epoch << 1) | (active != 0 ? 1u : 0u);
+}
 #endif
 
 namespace sched_log {
@@ -251,13 +291,15 @@ extern "C" void ultramodern_cosim_thread_quiescence(
     }
 
     s.external_pending = ultramodern::external_message_pending() ? 1u : 0u;
+    s.scheduler_active = cosim_scheduler_active.load(std::memory_order_acquire);
     s.quiescent =
         s.vi_queue != 0 &&
         s.running_head == 0 &&
         s.known_threads != 0 &&
         s.blocked_on_vi != 0 &&
         s.runnable_or_unknown == 0 &&
-        s.external_pending == 0;
+        s.external_pending == 0 &&
+        s.scheduler_active == 0;
     *out = s;
 }
 #endif
@@ -283,6 +325,9 @@ void ultramodern::scheduler_trace_mark(RDRAM_ARG uint32_t op,
 }
 
 void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) added_) {
+#ifdef N64_COSIM
+    ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
     // The queue is an intrusive singly-linked list kept in descending priority
     // order. Advance to the first link whose thread does not outrank the new one
     // and splice the new thread in ahead of it.
@@ -318,6 +363,9 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
 }
 
 PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_) {
+#ifdef N64_COSIM
+    ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
     // The highest-priority thread is at the head; detach and return it.
     PTR(OSThread)* head = queue_to_ptr(PASS_RDRAM queue_);
     PTR(OSThread) popped = *head;
@@ -329,6 +377,9 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
 }
 
 bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
+#ifdef N64_COSIM
+    ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
     debug_printf("[Thread Queue] remove thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
 
     // Scan the list for the target and unlink it if found.

@@ -214,6 +214,18 @@ void ultramodern::scheduler_trace_mark(RDRAM_ARG uint32_t op,
     sched_log::record(PASS_RDRAM op, queue_, thread_, queue_head_or_zero(PASS_RDRAM queue_));
 }
 
+// A guest OSThread pointer is valid only if it is a 4-byte-aligned KSEG0 RDRAM
+// address. A game that frees an OSThread while it is still linked in a runtime
+// queue (e.g. Pokemon Snap's per-game-object process threads, destroyed en masse
+// on scene teardown) leaves a garbage `next` in the chain; walking it unvalidated
+// dereferences freed/reused memory and faults. Validate before every deref so the
+// scheduler degrades gracefully instead of crashing. Strict improvement — the only
+// behavior it changes is on an already-corrupt queue, where the alternative is a hard crash.
+static inline bool valid_thread_ptr(PTR(OSThread) p) {
+    uint32_t v = static_cast<uint32_t>(p);
+    return v >= 0x80000000u && v < 0x80800000u && (v & 3u) == 0u;
+}
+
 void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) added_) {
     // The queue is an intrusive singly-linked list kept in descending priority
     // order. Advance to the first link whose thread does not outrank the new one
@@ -221,8 +233,14 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
     PTR(OSThread)* link = queue_to_ptr(PASS_RDRAM queue_);
     OSThread* added = TO_PTR(OSThread, added_);
     debug_printf("[Thread Queue] thread %d -> queue 0x%08X\n", added->id, (uintptr_t)queue_);
-    while (*link && TO_PTR(OSThread, *link)->priority > added->priority) {
+    uint32_t guard = 0;
+    while (*link && valid_thread_ptr(*link) && ++guard <= 0x40000u && TO_PTR(OSThread, *link)->priority > added->priority) {
         link = &TO_PTR(OSThread, *link)->next;
+    }
+    // If we stopped on a corrupt link (not NULL, not a valid pointer), sever the
+    // bad tail here so we splice ahead of it rather than dereferencing garbage.
+    if (*link != NULLPTR && !valid_thread_ptr(*link)) {
+        *link = NULLPTR;
     }
     added->next = *link;
     added->queue = queue_;
@@ -243,24 +261,16 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
     // The highest-priority thread is at the head; detach and return it.
     PTR(OSThread)* head = queue_to_ptr(PASS_RDRAM queue_);
     PTR(OSThread) popped = *head;
+    // Guard against a corrupt head (freed/reused OSThread) — treat as empty.
+    if (!valid_thread_ptr(popped)) {
+        *head = NULLPTR;
+        return NULLPTR;
+    }
     *head = TO_PTR(OSThread, popped)->next;
     TO_PTR(OSThread, popped)->queue = NULLPTR;
     sched_log::record(PASS_RDRAM sched_log::OP_POP, queue_, popped, *head);
     debug_printf("[Thread Queue] popped thread %d from queue 0x%08X\n", TO_PTR(OSThread, popped)->id, (uintptr_t)queue_);
     return popped;
-}
-
-// A guest OSThread pointer is valid only if it is NULL or a 4-byte-aligned KSEG0
-// RDRAM address. A game that frees an OSThread while it is still linked in a
-// runtime queue (e.g. Pokemon Snap's per-game-object process threads, destroyed
-// en masse on scene teardown) leaves a garbage `next` in the chain; walking it
-// unvalidated dereferences freed/reused memory and faults. Validate before every
-// deref so the HLE degrades gracefully (severs the corrupt tail) instead of
-// crashing. This is a strict improvement for all games — the only behavior it
-// changes is on an already-corrupt queue, where the alternative is a hard crash.
-static inline bool valid_thread_ptr(PTR(OSThread) p) {
-    uint32_t v = static_cast<uint32_t>(p);
-    return v >= 0x80000000u && v < 0x80800000u && (v & 3u) == 0u;
 }
 
 bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {

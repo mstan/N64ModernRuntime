@@ -56,6 +56,17 @@ static inline void publish_ai_len(uint8_t* rdram) {
     MEM_W(0, AI_LEN_REG_ADDR) = (int32_t)ultramodern::get_remaining_audio_bytes();
 }
 
+// Exported so high-frequency wrappers (osRecvMesg) can keep the raw
+// register fresh: games that read HW_REG(AI_LEN_REG) directly (Stadium's
+// audio frame builder) otherwise see a value frozen at the LAST osAi*
+// call — one full frame stale — where hardware drains it continuously.
+// With the virtual AI DAC in ultramodern this refresh is cheap
+// (steady-clock read + subtract) and makes the register hardware-fresh
+// as of the message receipt that wakes the audio thread.
+extern "C" void recomp_publish_ai_len(uint8_t* rdram) {
+    publish_ai_len(rdram);
+}
+
 extern "C" void osAiSetFrequency_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
     uint32_t freq = ctx->r4;

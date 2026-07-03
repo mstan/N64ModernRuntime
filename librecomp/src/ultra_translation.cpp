@@ -80,10 +80,15 @@ extern "C" void osCreateMesgQueue_recomp(uint8_t* rdram, recomp_context* ctx) {
 // `.done` is still blocked; one with a `.done` but no subsequent os call has run
 // off into call-free guest code (spin loop). pc=caller ra, a0=mq, a1=result,
 // a2=flags.
+extern "C" void recomp_publish_ai_len(uint8_t* rdram);
+
 extern "C" void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     LIBRECOMP_ULTRA_TRACE(ctx);
     uint32_t ra = (uint32_t)ctx->r31, mq = (uint32_t)ctx->r4, flags = (uint32_t)ctx->r6;
     ctx->r2 = osRecvMesg(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
+    // Keep the raw AI_LEN register hardware-fresh for audio threads that
+    // read it right after waking (see recomp_publish_ai_len in ai.cpp).
+    recomp_publish_ai_len(rdram);
     recomp_ultra_trace_record("~osRecvMesg.done", ra, mq, (uint32_t)ctx->r2, flags, 0);
 }
 

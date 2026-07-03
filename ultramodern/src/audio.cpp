@@ -100,6 +100,54 @@ void ultramodern::set_audio_frequency(uint32_t freq) {
     sample_rate = freq;
 }
 
+// ── Virtual AI DAC (hardware-shaped AI_LEN) ─────────────────────────
+// The hardware AI_LEN register drains sample-by-sample at the DAC rate
+// between buffer submissions. Deriving the reported value from the host
+// buffer level instead quantizes it in audio-callback chunks (~10-21 ms
+// stair-steps) and adds host scheduling noise. Games that pace their
+// audio-frame SIZES from this register (Stadium: samplesLeft >= 0x1A9
+// picks a 368- vs 552-sample task) turn that noise into an unstable
+// task cadence — and game code whose own producer/consumer margins are
+// tuned to the hardware limit cycle (Stadium's CPU-streamed announcer/
+// crowd rings in n_mainbus, ~2 frames deep) splices stale samples under
+// the jitter: the battle static.
+//
+// Model the register directly instead: submissions add their byte count
+// at latch time; a steady clock drains at exactly the DAC byte rate. A
+// very slow trim (bounded at ±0.05%, inaudible) servos the virtual rate
+// against the real host buffer level so the two clocks cannot drift
+// apart over long sessions. N64MR_AI_VIRTUAL=0 restores the host-level
+// readback for A/B.
+namespace {
+struct VirtualAiDac {
+    std::mutex mtx;
+    double remaining_bytes = 0.0;
+    double rate_scale = 1.0;
+    bool ever_submitted = false;
+    std::chrono::steady_clock::time_point last =
+        std::chrono::steady_clock::now();
+
+    void drain_locked(uint32_t rate) {
+        auto now = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(now - last).count();
+        last = now;
+        if (dt < 0.0) dt = 0.0;
+        if (dt > 0.5) dt = 0.5;   // host stall: don't teleport
+        remaining_bytes -= dt * (double)rate * 4.0 * rate_scale;
+        if (remaining_bytes < 0.0) remaining_bytes = 0.0;
+    }
+};
+VirtualAiDac g_vai;
+
+bool ai_virtual_enabled() {
+    static const bool v = [] {
+        const char* e = getenv("N64MR_AI_VIRTUAL");
+        return !(e && *e == '0' && e[1] == '\0');   // default ON
+    }();
+    return v;
+}
+}  // namespace
+
 // ── Deferred AI buffer consumption (hardware AI timing) ─────────────
 // On real hardware osAiSetNextBuffer only latches address+length; the
 // AI DMA reads the bytes gradually over the FOLLOWING ~17 ms. Games
@@ -168,6 +216,15 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
     // Ensure that the byte count is an integer multiple of samples.
     assert((byte_count & 1) == 0);
 
+    // Hardware latches (addr, len) into the AI at submission time — that
+    // is when AI_LEN jumps up, regardless of when we copy the payload.
+    if (ai_virtual_enabled() && byte_count > 0) {
+        std::lock_guard<std::mutex> lk(g_vai.mtx);
+        g_vai.drain_locked(sample_rate);
+        g_vai.remaining_bytes += (double)byte_count;
+        g_vai.ever_submitted = true;
+    }
+
     if (ai_instant_copy()) {
         ai_play_buffer(rdram, (uint32_t)audio_data_, byte_count);
         return;
@@ -196,6 +253,32 @@ uint32_t ultramodern::get_remaining_audio_bytes() {
     uint32_t buffered_byte_count = (audio_callbacks.get_frames_remaining != nullptr)
         ? audio_callbacks.get_frames_remaining() * 2 * sizeof(int16_t)
         : 100;
+
+    if (ai_virtual_enabled()) {
+        std::lock_guard<std::mutex> lk(g_vai.mtx);
+        if (g_vai.ever_submitted) {
+            // Host reporting empty means either fast-forward (the runner
+            // deliberately reports 0 to unthrottle the game) or a genuinely
+            // dry pipeline (boot, scene stall): mirror it so those modes
+            // keep working.
+            if (buffered_byte_count == 0) {
+                g_vai.remaining_bytes = 0.0;
+                return 0;
+            }
+            // Slow trim: hold the host level near its current cushion by
+            // biasing the virtual drain rate a hair. err > 0 (host holding
+            // more than ~15 ms) => drain slightly faster so the game
+            // produces less, and vice versa.
+            double err_bytes = (double)buffered_byte_count -
+                               0.015 * (double)sample_rate * 4.0;
+            double trim = err_bytes * 1e-8;
+            if (trim > 5e-4) trim = 5e-4;
+            if (trim < -5e-4) trim = -5e-4;
+            g_vai.rate_scale = 1.0 + trim;
+            g_vai.drain_locked(sample_rate);
+            return (uint32_t)g_vai.remaining_bytes & ~1u;
+        }
+    }
 
     // Take off the lead cushion (buffer_offset_frames worth of one VI's samples,
     // converted to bytes), clamping at zero so the count never underflows.

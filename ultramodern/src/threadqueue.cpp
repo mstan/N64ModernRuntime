@@ -250,18 +250,47 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
     return popped;
 }
 
+// A guest OSThread pointer is valid only if it is NULL or a 4-byte-aligned KSEG0
+// RDRAM address. A game that frees an OSThread while it is still linked in a
+// runtime queue (e.g. Pokemon Snap's per-game-object process threads, destroyed
+// en masse on scene teardown) leaves a garbage `next` in the chain; walking it
+// unvalidated dereferences freed/reused memory and faults. Validate before every
+// deref so the HLE degrades gracefully (severs the corrupt tail) instead of
+// crashing. This is a strict improvement for all games — the only behavior it
+// changes is on an already-corrupt queue, where the alternative is a hard crash.
+static inline bool valid_thread_ptr(PTR(OSThread) p) {
+    uint32_t v = static_cast<uint32_t>(p);
+    return v >= 0x80000000u && v < 0x80800000u && (v & 3u) == 0u;
+}
+
 bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
-    debug_printf("[Thread Queue] remove thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
+    // Guard against a garbage queue pointer (queue_to_ptr would build a wild host
+    // pointer that faults on the first deref). The running queue is a sentinel
+    // backed by a host static, so it is always valid.
+    if (queue_ != ultramodern::running_queue && !valid_thread_ptr(queue_)) {
+        sched_log::record(PASS_RDRAM sched_log::OP_REMOVE_MISS, queue_, t_, NULLPTR);
+        return false;
+    }
 
     // Scan the list for the target and unlink it if found.
     PTR(OSThread)* link = queue_to_ptr(PASS_RDRAM queue_);
+    uint32_t guard = 0;
     while (*link != NULLPTR) {
-        if (*link == t_) {
-            *link = TO_PTR(OSThread, *link)->next;
+        PTR(OSThread) cur = *link;
+        if (!valid_thread_ptr(cur) || ++guard > 0x40000u) {
+            // Corrupt/oversized chain (a freed/reused OSThread). Sever here so a
+            // later walk of this queue can't re-fault, and report not-found.
+            *link = NULLPTR;
+            sched_log::record(PASS_RDRAM sched_log::OP_REMOVE_MISS, queue_, t_, NULLPTR);
+            return false;
+        }
+        if (cur == t_) {
+            *link = TO_PTR(OSThread, cur)->next;
+            TO_PTR(OSThread, cur)->queue = NULLPTR;  // clear on removal, matching thread_queue_pop
             sched_log::record(PASS_RDRAM sched_log::OP_REMOVE, queue_, t_, *queue_to_ptr(PASS_RDRAM queue_));
             return true;
         }
-        link = &TO_PTR(OSThread, *link)->next;
+        link = &TO_PTR(OSThread, cur)->next;
     }
 
     // Target was not present in this queue.

@@ -19,6 +19,9 @@
 #include <fstream>
 #include <array>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <mutex>
@@ -37,6 +40,76 @@
 #include <ultramodern/ultramodern.hpp>
 
 static std::vector<uint8_t> rom;
+
+// ── PI ROM-fill ring ─────────────────────────────────────────────────
+// Always-on ring of every ROM→RDRAM PI DMA (dram, rom, size, ms).
+// This is the CPU-side half of the audio stream-buffer forensics: each
+// RSP voice-input read (rspdma ring) maps back to the PI fill that
+// last wrote its RDRAM range, giving the expected ROM offset without
+// content searching — and a fill that lands on a range between two
+// reads that expected stability is the clobber, attributed by time.
+// PI ROM reads are low-rate (~10^2/s in game), so 262144 slots
+// (8 MiB) cover tens of minutes. Query via recomp_pi_fill_dump.
+namespace {
+struct PiFillEvent {
+    uint64_t seq;
+    uint64_t ms;
+    uint32_t dram;   // physical RDRAM address
+    uint32_t rom;    // physical cart address
+    uint32_t size;
+    uint32_t pad;
+};
+constexpr uint32_t kPiFillCap = 262144;
+PiFillEvent g_pi_fills[kPiFillCap]{};
+std::atomic<uint64_t> g_pi_fill_seq{0};
+const std::chrono::steady_clock::time_point g_pi_fill_t0 =
+    std::chrono::steady_clock::now();
+
+void record_pi_fill(uint32_t dram, uint32_t rom_addr, uint32_t size) {
+    uint64_t seq = g_pi_fill_seq.fetch_add(1, std::memory_order_relaxed);
+    PiFillEvent& ev = g_pi_fills[seq % kPiFillCap];
+    ev.seq = seq;
+    ev.ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_pi_fill_t0).count());
+    ev.dram = dram;
+    ev.rom = rom_addr;
+    ev.size = size;
+    ev.pad = 0;
+}
+}
+
+// Streaming whole-ring dump, oldest first. Same tolerance model as
+// recomp_rsp_dma_dump: the write index is snapshotted up front.
+// Returns events written, or -1 on I/O failure.
+extern "C" int64_t recomp_pi_fill_dump(const char* path) {
+    if (path == nullptr) {
+        return -1;
+    }
+    uint64_t write_index = g_pi_fill_seq.load(std::memory_order_acquire);
+    uint64_t count = std::min<uint64_t>(write_index, kPiFillCap);
+    uint64_t start = write_index - count;
+
+    FILE* f = std::fopen(path, "wb");
+    if (f == nullptr) {
+        return -1;
+    }
+    constexpr uint32_t kChunk = 8192;
+    std::vector<PiFillEvent> chunk(kChunk);
+    uint64_t written = 0;
+    while (written < count) {
+        uint32_t n = (uint32_t)std::min<uint64_t>(kChunk, count - written);
+        for (uint32_t i = 0; i < n; i++) {
+            chunk[i] = g_pi_fills[(start + written + i) % kPiFillCap];
+        }
+        if (std::fwrite(chunk.data(), sizeof(PiFillEvent), n, f) != n) {
+            std::fclose(f);
+            return -1;
+        }
+        written += n;
+    }
+    std::fclose(f);
+    return (int64_t)written;
+}
 
 bool recomp::is_rom_loaded() {
     return !rom.empty();
@@ -479,6 +552,8 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
         if (physical_addr >= recomp::rom_base) {
             // read cart rom
             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
+            record_pi_fill((uint32_t)rdram_address & 0x1FFFFFFFu,
+                           physical_addr, size);
 
             // Register any recompiled code sections that fall within
             // this DMA range into func_map.

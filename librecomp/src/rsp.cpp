@@ -22,11 +22,13 @@
 #include <atomic>
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "rsp.hpp"
 #include "librecomp/ultra_trace.hpp"
@@ -62,16 +64,35 @@ struct RspDmaTraceEvent {
     uint8_t first16[80];
 };
 
-// 262144 events x 112 B = 28 MiB ≈ 6-9 s of battle-audio DMAs (~40k/s)
-// — enough for several announcer prompts per capture window.
-constexpr uint32_t kRspDmaTraceCap = 262144;
-RspDmaTraceEvent g_rsp_dma_trace[kRspDmaTraceCap]{};
+// Default 262144 events x 112 B = 28 MiB ≈ 6-9 s of battle-audio DMAs
+// (~40k/s). The static/click phenomenon needs the window to COVER the
+// audible event by a wide margin, so the capacity is overridable via
+// PSR_RSP_DMA_TRACE_CAP (entry count; 4194304 ≈ 448 MiB ≈ 1.5-2 min of
+// battle). Heap-allocated on first use so the memory is only committed
+// when tracing is actually on.
+constexpr uint32_t kRspDmaTraceDefaultCap = 262144;
+uint32_t g_rsp_dma_trace_cap = 0;
+RspDmaTraceEvent* g_rsp_dma_trace = nullptr;
 std::atomic<uint64_t> g_rsp_dma_trace_seq{0};
 
 bool rsp_dma_trace_enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("PSR_RSP_DMA_TRACE");
-        return env != nullptr && env[0] != '\0' && env[0] != '0';
+        bool on = env != nullptr && env[0] != '\0' && env[0] != '0';
+        if (on) {
+            uint32_t cap = kRspDmaTraceDefaultCap;
+            if (const char* cap_env = std::getenv("PSR_RSP_DMA_TRACE_CAP")) {
+                unsigned long long v = std::strtoull(cap_env, nullptr, 0);
+                // Clamp to something a 64-bit heap tolerates; 0/garbage
+                // falls back to the default.
+                if (v >= 1024 && v <= (1ull << 26)) {
+                    cap = (uint32_t)v;
+                }
+            }
+            g_rsp_dma_trace = new RspDmaTraceEvent[cap]();
+            g_rsp_dma_trace_cap = cap;
+        }
+        return on;
     }();
     return enabled;
 }
@@ -243,7 +264,7 @@ void recomp::rsp::trace_dma(bool write, uint32_t dmem_addr, uint32_t dram_addr,
     }
 
     uint64_t seq = g_rsp_dma_trace_seq.fetch_add(1, std::memory_order_relaxed);
-    RspDmaTraceEvent& ev = g_rsp_dma_trace[seq % kRspDmaTraceCap];
+    RspDmaTraceEvent& ev = g_rsp_dma_trace[seq % g_rsp_dma_trace_cap];
     ev.seq = seq;
     ev.write = write ? 1u : 0u;
     ev.dmem_addr = dmem_addr;
@@ -283,17 +304,56 @@ extern "C" void recomp_rsp_dma_recent_copy(RspDmaTraceEvent* out,
         return;
     }
 
-    uint32_t count = (uint32_t)std::min<uint64_t>(write_index, kRspDmaTraceCap);
+    uint32_t count = (uint32_t)std::min<uint64_t>(write_index, g_rsp_dma_trace_cap);
     if (count > out_cap) {
         count = out_cap;
     }
     uint64_t start = write_index - count;
     for (uint32_t i = 0; i < count; i++) {
-        out[i] = g_rsp_dma_trace[(start + i) % kRspDmaTraceCap];
+        out[i] = g_rsp_dma_trace[(start + i) % g_rsp_dma_trace_cap];
     }
     if (out_count != nullptr) {
         *out_count = count;
     }
+}
+
+// Streaming whole-ring dump: writes every event still resident in the
+// ring, oldest first, directly to `path`. Avoids the fixed-size copy
+// buffer of recomp_rsp_dma_recent_copy so the full multi-minute window
+// reaches disk. Events written while the dump runs can overwrite the
+// oldest slots; the dump snapshots the write index up front and only
+// emits slots that were complete at that point, so a torn tail is
+// bounded to events racing the snapshot (same tolerance as the copy
+// path). Returns the number of events written, or -1 on I/O failure.
+extern "C" int64_t recomp_rsp_dma_dump(const char* path) {
+    if (path == nullptr || !rsp_dma_trace_enabled()) {
+        return -1;
+    }
+    uint64_t write_index = g_rsp_dma_trace_seq.load(std::memory_order_acquire);
+    uint64_t count = std::min<uint64_t>(write_index, g_rsp_dma_trace_cap);
+    uint64_t start = write_index - count;
+
+    FILE* f = std::fopen(path, "wb");
+    if (f == nullptr) {
+        return -1;
+    }
+    constexpr uint32_t kChunk = 4096;
+    static thread_local std::vector<RspDmaTraceEvent> chunk;
+    chunk.resize(kChunk);
+    uint64_t written = 0;
+    while (written < count) {
+        uint32_t n = (uint32_t)std::min<uint64_t>(kChunk, count - written);
+        for (uint32_t i = 0; i < n; i++) {
+            chunk[i] = g_rsp_dma_trace[(start + written + i) % g_rsp_dma_trace_cap];
+        }
+        if (std::fwrite(chunk.data(), sizeof(RspDmaTraceEvent), n, f) != n) {
+            std::fclose(f);
+            return -1;
+        }
+        written += n;
+    }
+    std::fclose(f);
+    return (int64_t)written;
 }
 
 // From Ares emulator. For license details, see rsp_vu.h

@@ -23,8 +23,11 @@
 #include <unordered_map>
 #include <utility>
 #include <mutex>
+#include <condition_variable>
 #include <queue>
 #include <cstring>
+#include <cstdlib>
+#include <vector>
 
 #include "blockingconcurrentqueue.h"
 
@@ -43,6 +46,8 @@ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t& 
 
 struct SpTaskAction {
     OSTask task;
+    uint64_t cosim_gfx_seq = 0;
+    moodycamel::LightweightSemaphore* cosim_done = nullptr;
 };
 
 struct ScreenUpdateAction {
@@ -204,6 +209,619 @@ extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 ret
 
 uint64_t total_vis = 0;
 
+#ifdef N64_COSIM
+void set_dummy_vi(bool odd);
+extern std::atomic_bool exited;
+
+extern "C" int psr_cosim_on_quiescent_vi(
+    uint8_t* rdram,
+    const ultramodern_cosim_quiescence_state* state);
+
+void sp_complete(uint32_t task_type);
+void dp_complete(uint32_t task_type);
+
+static int cosim_remaining_retraces = 1;
+static bool cosim_dummy_odd = false;
+static std::mutex cosim_vi_token_mutex;
+static std::condition_variable cosim_vi_token_cv;
+static uint32_t cosim_vi_tokens = 0;
+static uint64_t cosim_next_vi_cycle = 0;
+static bool cosim_vi_needs_rebase = true;
+static std::atomic<uint32_t> cosim_vi_control_enabled{0};
+
+enum class CosimRcpEventKind : uint8_t {
+    SpComplete,
+    DpComplete,
+    ViRetrace,
+    AiEvent,
+};
+
+struct CosimRcpEvent {
+    uint64_t due_cycle;
+    uint64_t seq;
+    uint64_t gfx_seq;
+    uint32_t task_type;
+    PTR(OSMesgQueue) mq;
+    OSMesg msg;
+    CosimRcpEventKind kind;
+};
+
+constexpr uint64_t kCosimGfxSpDelay = 512;
+constexpr uint64_t kCosimGfxDpDelay = 4096;
+constexpr uint64_t kCosimRspSpDelay = 2048;
+constexpr uint64_t kCosimCounterPerMs = 46875;
+constexpr uint64_t kCosimCounterPerVi = kCosimCounterPerMs * 1000u / 60u;
+
+static uint64_t cosim_delay_from_env(const char* name, uint64_t dflt) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return dflt;
+    }
+    char* end = nullptr;
+    const uint64_t value = std::strtoull(raw, &end, 0);
+    return end != raw ? value : dflt;
+}
+
+static uint64_t cosim_gfx_sp_delay() {
+    static const uint64_t value =
+        cosim_delay_from_env("PSR_COSIM_GFX_SP_DELAY", kCosimGfxSpDelay);
+    return value;
+}
+
+static uint64_t cosim_gfx_dp_delay() {
+    static const uint64_t value =
+        cosim_delay_from_env("PSR_COSIM_GFX_DP_DELAY", kCosimGfxDpDelay);
+    return value;
+}
+
+static uint64_t cosim_rsp_sp_delay() {
+    static const uint64_t value =
+        cosim_delay_from_env("PSR_COSIM_RSP_SP_DELAY", kCosimRspSpDelay);
+    return value;
+}
+
+static std::mutex cosim_rcp_mutex;
+static std::vector<CosimRcpEvent> cosim_rcp_events;
+static std::atomic<uint64_t> cosim_rcp_next_seq{0};
+static std::atomic<uint64_t> cosim_gfx_next_seq{0};
+static std::atomic<uint64_t> cosim_gfx_rendered_seq{0};
+static std::atomic<uint32_t> cosim_vi_advancing{0};
+static std::atomic<uint64_t> cosim_scheduled_sp{0};
+static std::atomic<uint64_t> cosim_scheduled_dp{0};
+static std::atomic<uint64_t> cosim_scheduled_vi{0};
+static std::atomic<uint64_t> cosim_scheduled_ai{0};
+static std::atomic<uint64_t> cosim_scheduled_sp_gfx{0};
+static std::atomic<uint64_t> cosim_scheduled_sp_audio{0};
+static std::atomic<uint64_t> cosim_scheduled_sp_other{0};
+static std::atomic<uint64_t> cosim_delivered_sp{0};
+static std::atomic<uint64_t> cosim_delivered_dp{0};
+static std::atomic<uint64_t> cosim_delivered_vi{0};
+static std::atomic<uint64_t> cosim_delivered_ai{0};
+static std::atomic<uint64_t> cosim_delivered_sp_gfx{0};
+static std::atomic<uint64_t> cosim_delivered_sp_audio{0};
+static std::atomic<uint64_t> cosim_delivered_sp_other{0};
+
+static void cosim_count_sp_task_type(
+    uint32_t task_type,
+    std::atomic<uint64_t>& gfx,
+    std::atomic<uint64_t>& audio,
+    std::atomic<uint64_t>& other)
+{
+    if (task_type == M_GFXTASK) {
+        gfx.fetch_add(1, std::memory_order_relaxed);
+    } else if (task_type == M_AUDTASK) {
+        audio.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        other.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void cosim_count_scheduled(CosimRcpEventKind kind, uint32_t task_type = 0) {
+    switch (kind) {
+        case CosimRcpEventKind::SpComplete:
+            cosim_scheduled_sp.fetch_add(1, std::memory_order_relaxed);
+            cosim_count_sp_task_type(
+                task_type,
+                cosim_scheduled_sp_gfx,
+                cosim_scheduled_sp_audio,
+                cosim_scheduled_sp_other);
+            break;
+        case CosimRcpEventKind::DpComplete:
+            cosim_scheduled_dp.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case CosimRcpEventKind::ViRetrace:
+            cosim_scheduled_vi.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case CosimRcpEventKind::AiEvent:
+            cosim_scheduled_ai.fetch_add(1, std::memory_order_relaxed);
+            break;
+    }
+}
+
+static void cosim_count_delivered(const CosimRcpEvent& ev) {
+    switch (ev.kind) {
+        case CosimRcpEventKind::SpComplete:
+            cosim_delivered_sp.fetch_add(1, std::memory_order_relaxed);
+            cosim_count_sp_task_type(
+                ev.task_type,
+                cosim_delivered_sp_gfx,
+                cosim_delivered_sp_audio,
+                cosim_delivered_sp_other);
+            break;
+        case CosimRcpEventKind::DpComplete:
+            cosim_delivered_dp.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case CosimRcpEventKind::ViRetrace:
+            cosim_delivered_vi.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case CosimRcpEventKind::AiEvent:
+            cosim_delivered_ai.fetch_add(1, std::memory_order_relaxed);
+            break;
+    }
+}
+
+static uint32_t cosim_vi_queue_locked() {
+    ViState* cur = events_context.vi.get_cur_state();
+    ViState* next = events_context.vi.get_next_state();
+    if (cur->mq != NULLPTR) {
+        return static_cast<uint32_t>(cur->mq);
+    }
+    return static_cast<uint32_t>(next->mq);
+}
+
+extern "C" void ultramodern_cosim_get_quiescence(
+    ultramodern_cosim_quiescence_state* out)
+{
+    if (out == nullptr) {
+        return;
+    }
+    uint32_t vi_queue = 0;
+    {
+        std::lock_guard lock{ events_context.message_mutex };
+        vi_queue = cosim_vi_queue_locked();
+    }
+    ultramodern_cosim_thread_quiescence(events_context.rdram, vi_queue, out);
+}
+
+extern "C" uint32_t ultramodern_cosim_request_vi(uint32_t count) {
+    if (count == 0 || !ultramodern::is_game_started()) {
+        return 0;
+    }
+    {
+        std::lock_guard lock{ cosim_vi_token_mutex };
+        if (cosim_vi_needs_rebase) {
+            total_vis = 0;
+            cosim_remaining_retraces = 1;
+            cosim_next_vi_cycle = kCosimCounterPerVi;
+            cosim_vi_needs_rebase = false;
+        }
+        const uint32_t room = UINT32_MAX - cosim_vi_tokens;
+        const uint32_t accepted = count > room ? room : count;
+        cosim_vi_tokens += accepted;
+        count = accepted;
+    }
+    cosim_vi_token_cv.notify_all();
+    return count;
+}
+
+extern "C" void ultramodern_cosim_reset_vi_counter(void) {
+    {
+        std::lock_guard lock{ cosim_vi_token_mutex };
+        cosim_vi_tokens = 0;
+        cosim_vi_needs_rebase = true;
+    }
+    cosim_vi_control_enabled.store(1, std::memory_order_release);
+    total_vis = 0;
+    cosim_remaining_retraces = 1;
+    cosim_next_vi_cycle = kCosimCounterPerVi;
+    cosim_vi_token_cv.notify_all();
+}
+
+static void cosim_schedule_rcp_event(
+    CosimRcpEventKind kind,
+    uint32_t task_type,
+    uint64_t delay,
+    uint64_t gfx_seq = 0)
+{
+    const uint64_t now = ultramodern_cosim_get_time_ticks();
+    const uint64_t seq = cosim_rcp_next_seq.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t due = now + delay;
+    {
+        std::lock_guard lock{ cosim_rcp_mutex };
+        cosim_rcp_events.push_back(CosimRcpEvent{ due, seq, gfx_seq, task_type, NULLPTR, 0, kind });
+    }
+    cosim_count_scheduled(kind, task_type);
+    recomp_ultra_trace_record(
+        kind == CosimRcpEventKind::SpComplete ? "~cosim_sp_due" : "~cosim_dp_due",
+        0,
+        static_cast<uint32_t>(due),
+        static_cast<uint32_t>(due >> 32),
+        task_type,
+        static_cast<uint32_t>(seq));
+}
+
+static void cosim_schedule_queue_event(
+    CosimRcpEventKind kind,
+    PTR(OSMesgQueue) mq,
+    OSMesg msg,
+    uint64_t delay)
+{
+    if (mq == NULLPTR) {
+        return;
+    }
+    const uint64_t now = ultramodern_cosim_get_time_ticks();
+    const uint64_t seq = cosim_rcp_next_seq.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t due = now + delay;
+    {
+        std::lock_guard lock{ cosim_rcp_mutex };
+        cosim_rcp_events.push_back(CosimRcpEvent{ due, seq, 0, 0, mq, msg, kind });
+    }
+    cosim_count_scheduled(kind);
+    recomp_ultra_trace_record(
+        kind == CosimRcpEventKind::ViRetrace ? "~cosim_vi_due" : "~cosim_ai_due",
+        0,
+        static_cast<uint32_t>(due),
+        static_cast<uint32_t>(due >> 32),
+        static_cast<uint32_t>(mq),
+        static_cast<uint32_t>(seq));
+}
+
+static bool cosim_pop_due_rcp_event(uint64_t now, CosimRcpEvent& out) {
+    std::lock_guard lock{ cosim_rcp_mutex };
+    size_t best = cosim_rcp_events.size();
+    for (size_t i = 0; i < cosim_rcp_events.size(); i++) {
+        const CosimRcpEvent& ev = cosim_rcp_events[i];
+        if (ev.due_cycle > now) {
+            continue;
+        }
+        if (best == cosim_rcp_events.size() ||
+            ev.due_cycle < cosim_rcp_events[best].due_cycle ||
+            (ev.due_cycle == cosim_rcp_events[best].due_cycle &&
+             ev.seq < cosim_rcp_events[best].seq)) {
+            best = i;
+        }
+    }
+    if (best == cosim_rcp_events.size()) {
+        return false;
+    }
+    const CosimRcpEvent& best_ev = cosim_rcp_events[best];
+    if (best_ev.kind == CosimRcpEventKind::DpComplete &&
+        best_ev.gfx_seq != 0 &&
+        cosim_gfx_rendered_seq.load(std::memory_order_acquire) < best_ev.gfx_seq) {
+        return false;
+    }
+    out = cosim_rcp_events[best];
+    cosim_rcp_events.erase(cosim_rcp_events.begin() + static_cast<std::ptrdiff_t>(best));
+    return true;
+}
+
+static bool cosim_next_rcp_due(uint64_t& out) {
+    std::lock_guard lock{ cosim_rcp_mutex };
+    if (cosim_rcp_events.empty()) {
+        return false;
+    }
+    uint64_t best = cosim_rcp_events[0].due_cycle;
+    uint64_t best_seq = cosim_rcp_events[0].seq;
+    for (const CosimRcpEvent& ev : cosim_rcp_events) {
+        if (ev.due_cycle < best ||
+            (ev.due_cycle == best && ev.seq < best_seq)) {
+            best = ev.due_cycle;
+            best_seq = ev.seq;
+        }
+    }
+    out = best;
+    return true;
+}
+
+static bool cosim_next_vi_due(uint64_t& out) {
+    if (cosim_vi_control_enabled.load(std::memory_order_acquire) == 0 ||
+        !ultramodern::is_game_started()) {
+        return false;
+    }
+
+    std::lock_guard lock{ cosim_vi_token_mutex };
+    if (cosim_vi_tokens == 0) {
+        return false;
+    }
+    out = cosim_vi_needs_rebase ? kCosimCounterPerVi : cosim_next_vi_cycle;
+    return true;
+}
+
+extern "C" void ultramodern_cosim_reset_rcp_events(void) {
+    {
+        std::lock_guard lock{ cosim_rcp_mutex };
+        cosim_rcp_events.clear();
+    }
+    cosim_rcp_next_seq.store(0, std::memory_order_relaxed);
+    cosim_gfx_next_seq.store(0, std::memory_order_relaxed);
+    cosim_gfx_rendered_seq.store(0, std::memory_order_release);
+    cosim_vi_advancing.store(0, std::memory_order_release);
+    cosim_scheduled_sp.store(0, std::memory_order_relaxed);
+    cosim_scheduled_dp.store(0, std::memory_order_relaxed);
+    cosim_scheduled_vi.store(0, std::memory_order_relaxed);
+    cosim_scheduled_ai.store(0, std::memory_order_relaxed);
+    cosim_scheduled_sp_gfx.store(0, std::memory_order_relaxed);
+    cosim_scheduled_sp_audio.store(0, std::memory_order_relaxed);
+    cosim_scheduled_sp_other.store(0, std::memory_order_relaxed);
+    cosim_delivered_sp.store(0, std::memory_order_relaxed);
+    cosim_delivered_dp.store(0, std::memory_order_relaxed);
+    cosim_delivered_vi.store(0, std::memory_order_relaxed);
+    cosim_delivered_ai.store(0, std::memory_order_relaxed);
+    cosim_delivered_sp_gfx.store(0, std::memory_order_relaxed);
+    cosim_delivered_sp_audio.store(0, std::memory_order_relaxed);
+    cosim_delivered_sp_other.store(0, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t ultramodern_cosim_rcp_event_pending(void) {
+    if (cosim_vi_advancing.load(std::memory_order_acquire) != 0) {
+        return 1;
+    }
+    std::lock_guard lock{ cosim_rcp_mutex };
+    return cosim_rcp_events.empty() ? 0u : 1u;
+}
+
+static bool cosim_vi_due_now() {
+    if (cosim_vi_control_enabled.load(std::memory_order_acquire) == 0 ||
+        !ultramodern::is_game_started()) {
+        return false;
+    }
+
+    std::lock_guard lock{ cosim_vi_token_mutex };
+    if (cosim_vi_tokens == 0) {
+        return false;
+    }
+    const uint64_t due = cosim_vi_needs_rebase ? kCosimCounterPerVi : cosim_next_vi_cycle;
+    return ultramodern_cosim_get_time_ticks() >= due;
+}
+
+extern "C" uint32_t ultramodern_cosim_rcp_event_due(void) {
+    if (cosim_vi_advancing.load(std::memory_order_acquire) != 0) {
+        return 1;
+    }
+    if (cosim_vi_due_now()) {
+        return 1;
+    }
+
+    const uint64_t now = ultramodern_cosim_get_time_ticks();
+    std::lock_guard lock{ cosim_rcp_mutex };
+    for (const CosimRcpEvent& ev : cosim_rcp_events) {
+        if (ev.due_cycle > now) {
+            continue;
+        }
+        if (ev.kind == CosimRcpEventKind::DpComplete &&
+            ev.gfx_seq != 0 &&
+            cosim_gfx_rendered_seq.load(std::memory_order_acquire) < ev.gfx_seq) {
+            continue;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram) {
+    uint32_t delivered = 0;
+    for (;;) {
+        CosimRcpEvent ev{};
+        if (!cosim_pop_due_rcp_event(ultramodern_cosim_get_time_ticks(), ev)) {
+            return delivered;
+        }
+        if (ev.kind == CosimRcpEventKind::SpComplete) {
+            sp_complete(ev.task_type);
+        } else if (ev.kind == CosimRcpEventKind::DpComplete) {
+            dp_complete(ev.task_type);
+        } else if (ev.kind == CosimRcpEventKind::ViRetrace) {
+            s32 sent = ultramodern::post_rcp_event(PASS_RDRAM ev.mq, ev.msg, /*coalescible=*/true);
+            recomp_ultra_trace_record("~vi_retrace", 0,
+                (uint32_t)ev.mq, (uint32_t)ev.msg, (uint32_t)sent, 0);
+        } else {
+            s32 sent = ultramodern::post_rcp_event(PASS_RDRAM ev.mq, ev.msg, /*coalescible=*/false);
+            recomp_ultra_trace_record("~ai_event", 0,
+                (uint32_t)ev.mq, (uint32_t)ev.msg, (uint32_t)sent, 0);
+        }
+        cosim_count_delivered(ev);
+        delivered++;
+    }
+}
+
+extern "C" void ultramodern_cosim_get_rcp_event_stats(ultramodern_cosim_rcp_event_stats* out) {
+    if (out == nullptr) {
+        return;
+    }
+    std::memset(out, 0, sizeof(*out));
+    out->now_cycle = ultramodern_cosim_get_time_ticks();
+    out->next_seq = cosim_rcp_next_seq.load(std::memory_order_relaxed);
+    out->scheduled_sp = cosim_scheduled_sp.load(std::memory_order_relaxed);
+    out->scheduled_dp = cosim_scheduled_dp.load(std::memory_order_relaxed);
+    out->scheduled_vi = cosim_scheduled_vi.load(std::memory_order_relaxed);
+    out->scheduled_ai = cosim_scheduled_ai.load(std::memory_order_relaxed);
+    out->scheduled_sp_gfx = cosim_scheduled_sp_gfx.load(std::memory_order_relaxed);
+    out->scheduled_sp_audio = cosim_scheduled_sp_audio.load(std::memory_order_relaxed);
+    out->scheduled_sp_other = cosim_scheduled_sp_other.load(std::memory_order_relaxed);
+    out->delivered_sp = cosim_delivered_sp.load(std::memory_order_relaxed);
+    out->delivered_dp = cosim_delivered_dp.load(std::memory_order_relaxed);
+    out->delivered_vi = cosim_delivered_vi.load(std::memory_order_relaxed);
+    out->delivered_ai = cosim_delivered_ai.load(std::memory_order_relaxed);
+    out->delivered_sp_gfx = cosim_delivered_sp_gfx.load(std::memory_order_relaxed);
+    out->delivered_sp_audio = cosim_delivered_sp_audio.load(std::memory_order_relaxed);
+    out->delivered_sp_other = cosim_delivered_sp_other.load(std::memory_order_relaxed);
+    out->vi_advancing = cosim_vi_advancing.load(std::memory_order_acquire);
+
+    std::lock_guard lock{ cosim_rcp_mutex };
+    for (const CosimRcpEvent& ev : cosim_rcp_events) {
+        out->pending_total++;
+        if (!out->has_next_due || ev.due_cycle < out->next_due_cycle) {
+            out->next_due_cycle = ev.due_cycle;
+            out->has_next_due = 1;
+        }
+        switch (ev.kind) {
+            case CosimRcpEventKind::SpComplete:
+                out->pending_sp++;
+                if (ev.task_type == M_GFXTASK) {
+                    out->pending_sp_gfx++;
+                } else if (ev.task_type == M_AUDTASK) {
+                    out->pending_sp_audio++;
+                } else {
+                    out->pending_sp_other++;
+                }
+                break;
+            case CosimRcpEventKind::DpComplete:
+                out->pending_dp++;
+                break;
+            case CosimRcpEventKind::ViRetrace:
+                out->pending_vi++;
+                break;
+            case CosimRcpEventKind::AiEvent:
+                out->pending_ai++;
+                break;
+        }
+    }
+}
+
+extern "C" uint32_t ultramodern_cosim_advance_to_next_rcp_event(uint8_t* rdram) {
+    uint32_t delivered = ultramodern_cosim_advance_due_vi(rdram, 0);
+    delivered += ultramodern_cosim_deliver_due_rcp_events(rdram);
+    if (delivered != 0) {
+        return delivered;
+    }
+
+    uint64_t rcp_due = 0;
+    const bool has_rcp_due = cosim_next_rcp_due(rcp_due);
+    uint64_t vi_due = 0;
+    const bool has_vi_due = cosim_next_vi_due(vi_due);
+    if (!has_rcp_due && !has_vi_due) {
+        return 0;
+    }
+
+    const uint64_t now = ultramodern_cosim_get_time_ticks();
+    if (has_vi_due && (!has_rcp_due || vi_due <= rcp_due)) {
+        if (vi_due > now) {
+            ultramodern_cosim_advance_time_ticks(vi_due - now);
+        }
+        return ultramodern_cosim_advance_due_vi(rdram, 0);
+    }
+
+    if (rcp_due > now) {
+        ultramodern_cosim_advance_time_ticks(rcp_due - now);
+    }
+    return ultramodern_cosim_deliver_due_rcp_events(rdram);
+}
+
+static bool ultramodern_cosim_wait_vi_token() {
+    using namespace std::chrono_literals;
+    std::unique_lock lock{ cosim_vi_token_mutex };
+    while (!exited.load(std::memory_order_relaxed) && cosim_vi_tokens == 0) {
+        cosim_vi_token_cv.wait_for(lock, 1ms);
+    }
+    if (exited.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    cosim_vi_tokens--;
+    return true;
+}
+
+static void ultramodern_cosim_advance_vi(uint8_t* rdram) {
+    cosim_vi_advancing.store(1, std::memory_order_release);
+    total_vis++;
+
+    ViState* next_state = events_context.vi.get_next_state();
+    if (next_state->mode == nullptr) {
+        set_dummy_vi(cosim_dummy_odd);
+        cosim_dummy_odd = !cosim_dummy_odd;
+    }
+
+    events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+    events_context.vi.update_vi();
+
+    {
+        std::lock_guard lock{ events_context.message_mutex };
+        ViState* cur_state = events_context.vi.get_cur_state();
+        cosim_remaining_retraces--;
+        if (cosim_remaining_retraces <= 0) {
+            if (cur_state->mq != NULLPTR) {
+                cosim_schedule_queue_event(
+                    CosimRcpEventKind::ViRetrace,
+                    cur_state->mq,
+                    cur_state->msg,
+                    0);
+            }
+            cosim_remaining_retraces = cur_state->retrace_count > 0
+                ? cur_state->retrace_count
+                : 1;
+        }
+        if (events_context.ai.mq != NULLPTR) {
+            cosim_schedule_queue_event(
+                CosimRcpEventKind::AiEvent,
+                events_context.ai.mq,
+                events_context.ai.msg,
+                0);
+        }
+    }
+
+    if (events_callbacks.vi_callback != nullptr) {
+        events_callbacks.vi_callback();
+    }
+    cosim_vi_advancing.store(0, std::memory_order_release);
+}
+
+extern "C" uint32_t ultramodern_cosim_advance_due_vi(uint8_t* rdram, uint32_t allow_time_advance) {
+    if (cosim_vi_control_enabled.load(std::memory_order_acquire) == 0 ||
+        !ultramodern::is_game_started()) {
+        return 0;
+    }
+
+    {
+        std::lock_guard lock{ cosim_vi_token_mutex };
+        if (cosim_vi_needs_rebase) {
+            total_vis = 0;
+            cosim_remaining_retraces = 1;
+            cosim_next_vi_cycle = kCosimCounterPerVi;
+            cosim_vi_needs_rebase = false;
+        }
+        if (cosim_vi_tokens == 0) {
+            return 0;
+        }
+    }
+
+    const uint64_t now = ultramodern_cosim_get_time_ticks();
+    uint64_t due = 0;
+    {
+        std::lock_guard lock{ cosim_vi_token_mutex };
+        due = cosim_next_vi_cycle;
+    }
+    if (now < due) {
+        if (allow_time_advance == 0) {
+            return 0;
+        }
+        ultramodern_cosim_advance_time_ticks(due - now);
+    }
+
+    {
+        std::lock_guard lock{ cosim_vi_token_mutex };
+        if (cosim_vi_tokens == 0) {
+            return 0;
+        }
+        const uint64_t cur = ultramodern_cosim_get_time_ticks();
+        if (cur < cosim_next_vi_cycle) {
+            return 0;
+        }
+        cosim_vi_tokens--;
+        cosim_next_vi_cycle += kCosimCounterPerVi;
+    }
+
+    uint8_t* target_rdram = rdram != nullptr ? rdram : events_context.rdram;
+    ultramodern_cosim_advance_vi(target_rdram);
+    return 1 + ultramodern_cosim_deliver_due_rcp_events(target_rdram);
+}
+
+extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram) {
+    ultramodern_cosim_quiescence_state state{};
+    ultramodern_cosim_get_quiescence(&state);
+    if (state.quiescent) {
+        (void)psr_cosim_on_quiescent_vi(rdram, &state);
+    }
+}
+#endif
+
 
 extern std::atomic_bool exited;
 extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
@@ -220,6 +838,12 @@ void vi_thread_func() {
     int remaining_retraces = 1;
 
     while (!exited) {
+#ifdef N64_COSIM
+        if (cosim_vi_control_enabled.load(std::memory_order_acquire) != 0) {
+            std::this_thread::sleep_for(1ms);
+            continue;
+        }
+#endif
         // Derive the absolute time of the next VI from the running VI count instead of
         // adding a fixed step each interrupt, which keeps long-term drift bounded.
         auto next = ultramodern::get_start() + (total_vis * 1000000us) / (60 * ultramodern::get_speed_multiplier());
@@ -385,6 +1009,25 @@ void dp_complete(uint32_t task_type) {
     g_dp_complete_count.fetch_add(1, std::memory_order_relaxed);
 }
 
+static bool run_rsp_task_or_warn(RDRAM_ARG const OSTask* task) {
+    if (ultramodern::rsp::run_task(PASS_RDRAM task)) {
+        return true;
+    }
+
+    // Degrade gracefully instead of killing the process when a task has no
+    // registered host microcode; the caller still signals SP completion.
+    static std::atomic<bool> s_warned[64] = {};
+    uint32_t t = task->t.type & 63u;
+    if (!s_warned[t].exchange(true)) {
+        fprintf(stderr,
+            "[ultramodern] no RSP microcode for task type %" PRIu32
+            " -- dropping task (not fatal; further drops of this type are "
+            "silent)\n", task->t.type);
+        fflush(stderr);
+    }
+    return false;
+}
+
 void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
     ultramodern::set_native_thread_name("SP Task Thread");
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
@@ -402,28 +1045,12 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
             return;
         }
 
-        if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
-            // No host microcode for this task (e.g. an audio task on a game whose
-            // aspMain hasn't been recompiled yet). Degrade gracefully instead of
-            // killing the process: warn once per task type, signal SP completion
-            // so the waiting game thread doesn't hang, and drop the task. Audio /
-            // other RSP work is silently skipped; graphics tasks return success
-            // and are unaffected. (Set PSR-side aspMain to restore real audio.)
-            static std::atomic<bool> s_warned[64] = {};
-            uint32_t t = task->t.type & 63u;
-            if (!s_warned[t].exchange(true)) {
-                fprintf(stderr,
-                    "[ultramodern] no RSP microcode for task type %" PRIu32
-                    " — dropping task (not fatal; further drops of this type are "
-                    "silent)\n", task->t.type);
-                fflush(stderr);
-            }
-            sp_complete(task->t.type);
-            continue;
-        }
+        (void)run_rsp_task_or_warn(PASS_RDRAM task);
 
-        // Tell the game that the RSP has completed
+#ifndef N64_COSIM
+        // Tell the game that the RSP has completed.
         sp_complete(task->t.type);
+#endif
     }
 }
 
@@ -498,12 +1125,14 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                     renderer_context->enable_instant_present();
                     enabled_instant_present = true;
                 }
+#ifndef N64_COSIM
                 // Report SP completion right away so the game is free to enqueue other
                 // task types. It still won't start the next graphics task until the RDP
                 // also reports done, and games normally keep the RSP inputs alive until
                 // then, so signalling early is safe in practice. If a title misbehaves,
                 // this could instead be driven from RSP yield requests.
                 sp_complete(task_action->task.t.type);
+#endif
                 ultramodern::measure_input_latency();
 
                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
@@ -529,6 +1158,21 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                     g_current_dl_entry_seq.fetch_add(1, std::memory_order_release);
                 }
                 renderer_context->send_dl(&task_action->task);
+#ifdef N64_COSIM
+                if (task_action->cosim_gfx_seq != 0) {
+                    uint64_t cur = cosim_gfx_rendered_seq.load(std::memory_order_acquire);
+                    while (cur < task_action->cosim_gfx_seq &&
+                           !cosim_gfx_rendered_seq.compare_exchange_weak(
+                               cur,
+                               task_action->cosim_gfx_seq,
+                               std::memory_order_release,
+                               std::memory_order_acquire)) {
+                    }
+                }
+                if (task_action->cosim_done != nullptr) {
+                    task_action->cosim_done->signal();
+                }
+#endif
                 {
                     using namespace std::chrono;
                     uint64_t ms = duration_cast<milliseconds>(
@@ -537,7 +1181,9 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                     g_current_dl_exit_seq.fetch_add(1, std::memory_order_release);
                 }
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+#ifndef N64_COSIM
                 dp_complete(task_action->task.t.type);
+#endif
                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
             }
             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
@@ -730,13 +1376,27 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     // Graphics tasks are routed to the action queue serviced by the gfx thread.
     if (task->t.type == M_GFXTASK) {
         g_submit_gfx.fetch_add(1, std::memory_order_relaxed);
+#ifdef N64_COSIM
+        const uint64_t gfx_seq = cosim_gfx_next_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        moodycamel::LightweightSemaphore render_done;
+        events_context.action_queue.enqueue(SpTaskAction{ *task, gfx_seq, &render_done });
+        render_done.wait();
+        cosim_schedule_rcp_event(CosimRcpEventKind::SpComplete, task->t.type, cosim_gfx_sp_delay());
+        cosim_schedule_rcp_event(CosimRcpEventKind::DpComplete, task->t.type, cosim_gfx_dp_delay(), gfx_seq);
+#else
         events_context.action_queue.enqueue(SpTaskAction{ *task });
+#endif
     }
     // Every other task type is serviced by the SP task thread.
     else {
         if (task->t.type == M_AUDTASK) g_submit_audio.fetch_add(1, std::memory_order_relaxed);
         else g_submit_other.fetch_add(1, std::memory_order_relaxed);
+#ifdef N64_COSIM
+        (void)run_rsp_task_or_warn(PASS_RDRAM task);
+        cosim_schedule_rcp_event(CosimRcpEventKind::SpComplete, task->t.type, cosim_rsp_sp_delay());
+#else
         events_context.sp_task_queue.enqueue(task);
+#endif
     }
 }
 

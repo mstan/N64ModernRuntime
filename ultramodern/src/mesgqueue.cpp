@@ -335,15 +335,52 @@ extern "C" uint64_t ultramodern_external_requeues(void) {
     return g_external_requeues.load(std::memory_order_relaxed);
 }
 
+#ifdef N64_COSIM
+extern "C" uint32_t ultramodern_cosim_checkpoint_external_pending(void) {
+    if (g_external_pending.load(std::memory_order_relaxed) != 0) {
+        return 1;
+    }
+    return ultramodern_cosim_rcp_event_due();
+}
+#endif
+
 void ultramodern::wait_for_external_message(RDRAM_ARG1) {
     QueuedMessage to_send;
+#ifdef N64_COSIM
+    while (true) {
+        if (external_messages.try_dequeue(to_send)) {
+            g_external_pending.fetch_sub(1, std::memory_order_relaxed);
+            do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
+            return;
+        }
+        if (ultramodern_cosim_advance_to_next_rcp_event(rdram) != 0) {
+            return;
+        }
+        if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{1})) {
+            g_external_pending.fetch_sub(1, std::memory_order_relaxed);
+            do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
+            return;
+        }
+    }
+#else
+    if (external_messages.try_dequeue(to_send)) {
+        g_external_pending.fetch_sub(1, std::memory_order_relaxed);
+        do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
+        return;
+    }
     external_messages.wait_dequeue(to_send);
     g_external_pending.fetch_sub(1, std::memory_order_relaxed);
     do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
+#endif
 }
 
 void ultramodern::wait_for_external_message_timed(RDRAM_ARG1, u32 millis) {
     QueuedMessage to_send;
+#ifdef N64_COSIM
+    if (ultramodern_cosim_deliver_due_rcp_events(rdram) != 0) {
+        return;
+    }
+#endif
     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
         g_external_pending.fetch_sub(1, std::memory_order_relaxed);
         do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
@@ -351,7 +388,14 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG1, u32 millis) {
 }
 
 bool ultramodern::external_message_pending() {
-    return g_external_pending.load(std::memory_order_relaxed) != 0;
+    if (g_external_pending.load(std::memory_order_relaxed) != 0) {
+        return true;
+    }
+#ifdef N64_COSIM
+    return ultramodern_cosim_rcp_event_pending() != 0;
+#else
+    return false;
+#endif
 }
 
 void ultramodern::send_external_message_after(
@@ -471,6 +515,9 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
                              uint16_t(mq->validCount), uint16_t(mq->validCount),
                              true, true);
             debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
+#ifdef N64_COSIM
+            ultramodern_cosim_scheduler_handoff_begin();
+#endif
             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
         }
@@ -513,6 +560,9 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
                              uint16_t(mq->validCount), uint16_t(mq->validCount),
                              true, true);
             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
+#ifdef N64_COSIM
+            ultramodern_cosim_scheduler_handoff_begin();
+#endif
             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
         }

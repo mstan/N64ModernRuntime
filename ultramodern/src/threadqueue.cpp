@@ -12,6 +12,50 @@ extern "C" uint32_t ultramodern_running_queue_head(void) {
     return static_cast<uint32_t>(running_queue_impl);
 }
 
+#ifdef N64_COSIM
+extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram);
+
+static std::atomic<uint64_t> cosim_scheduler_epoch{0};
+static std::atomic<uint32_t> cosim_scheduler_active{0};
+static thread_local uint32_t cosim_scheduler_depth = 0;
+static thread_local bool cosim_scheduler_handoff_open = false;
+
+extern "C" void ultramodern_cosim_scheduler_mutation_begin(void) {
+    if (cosim_scheduler_depth++ == 0) {
+        cosim_scheduler_active.fetch_add(1, std::memory_order_acq_rel);
+        cosim_scheduler_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+extern "C" void ultramodern_cosim_scheduler_mutation_end(void) {
+    assert(cosim_scheduler_depth != 0);
+    if (--cosim_scheduler_depth == 0) {
+        cosim_scheduler_epoch.fetch_add(1, std::memory_order_acq_rel);
+        cosim_scheduler_active.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
+extern "C" void ultramodern_cosim_scheduler_handoff_begin(void) {
+    if (!cosim_scheduler_handoff_open) {
+        cosim_scheduler_handoff_open = true;
+        ultramodern_cosim_scheduler_mutation_begin();
+    }
+}
+
+extern "C" void ultramodern_cosim_scheduler_handoff_end(void) {
+    if (cosim_scheduler_handoff_open) {
+        cosim_scheduler_handoff_open = false;
+        ultramodern_cosim_scheduler_mutation_end();
+    }
+}
+
+extern "C" uint64_t ultramodern_cosim_scheduler_epoch(void) {
+    const uint64_t epoch = cosim_scheduler_epoch.load(std::memory_order_acquire);
+    const uint32_t active = cosim_scheduler_active.load(std::memory_order_acquire);
+    return (epoch << 1) | (active != 0 ? 1u : 0u);
+}
+#endif
+
 namespace sched_log {
     enum Op : uint32_t {
         OP_INSERT = 1,
@@ -194,6 +238,73 @@ extern "C" void ultramodern_sched_thread_states_copy(
     if (n_written) *n_written = w;
 }
 
+#ifdef N64_COSIM
+extern "C" void ultramodern_cosim_thread_quiescence(
+    uint8_t* rdram,
+    uint32_t vi_queue,
+    ultramodern_cosim_quiescence_state* out)
+{
+    if (out == nullptr) {
+        return;
+    }
+
+    ultramodern_cosim_quiescence_state s{};
+    s.vi_queue = vi_queue;
+    s.running_head = static_cast<uint32_t>(running_queue_impl);
+    if (rdram == nullptr) {
+        *out = s;
+        return;
+    }
+
+    for (size_t i = 0; i < sched_log::MAX_TID; i++) {
+        const sched_log::ThreadState& ts = sched_log::thread_states[i];
+        if (!ts.valid) {
+            continue;
+        }
+        if (ts.thread == NULLPTR) {
+            continue;
+        }
+        if (ts.thread < 0x80000000u || ts.thread >= 0x80800000u) {
+            continue;
+        }
+        PTR(OSThread) thread = static_cast<PTR(OSThread)>(ts.thread);
+        OSThread* t = TO_PTR(OSThread, thread);
+        if (t->context == nullptr || t->state == OSThreadState::STOPPED) {
+            continue;
+        }
+        s.known_threads++;
+        if (t->state == OSThreadState::BLOCKED) {
+            const uint32_t blocked_queue = static_cast<uint32_t>(t->queue);
+            if (vi_queue != 0 &&
+                (blocked_queue == vi_queue || ts.last_mq == vi_queue)) {
+                s.blocked_on_vi++;
+            } else {
+                s.blocked_on_other++;
+            }
+        } else if (t->state == OSThreadState::RUNNING &&
+                   t->priority <= 0 &&
+                   s.running_head == 0) {
+            s.idle_running++;
+        } else {
+            s.runnable_or_unknown++;
+        }
+    }
+
+    s.external_pending = ultramodern_cosim_checkpoint_external_pending();
+    s.scheduler_active = cosim_scheduler_active.load(std::memory_order_acquire);
+    s.quiescent =
+        s.vi_queue != 0 &&
+        s.running_head == 0 &&
+        s.known_threads != 0 &&
+        s.blocked_on_vi != 0 &&
+        s.runnable_or_unknown == 0 &&
+        s.external_pending == 0 &&
+        s.scheduler_active == 0;
+    *out = s;
+}
+
+#endif
+
 static PTR(OSThread)* queue_to_ptr(RDRAM_ARG PTR(PTR(OSThread)) queue) {
     if (queue == ultramodern::running_queue) {
         return &running_queue_impl;
@@ -227,6 +338,9 @@ static inline bool valid_thread_ptr(PTR(OSThread) p) {
 }
 
 void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) added_) {
+#ifdef N64_COSIM
+    ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
     // The queue is an intrusive singly-linked list kept in descending priority
     // order. Advance to the first link whose thread does not outrank the new one
     // and splice the new thread in ahead of it.
@@ -244,8 +358,18 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
     }
     added->next = *link;
     added->queue = queue_;
+    if (queue_ == ultramodern::running_queue) {
+        added->state = OSThreadState::QUEUED;
+    } else if (queue_ != NULLPTR) {
+        added->state = OSThreadState::BLOCKED;
+    }
     *link = added_;
     sched_log::record(PASS_RDRAM sched_log::OP_INSERT, queue_, added_, *queue_to_ptr(PASS_RDRAM queue_));
+#ifdef N64_COSIM
+    if (queue_ != ultramodern::running_queue && queue_ != NULLPTR) {
+        ultramodern_cosim_check_vi_quiescence(rdram);
+    }
+#endif
 
     // Trace the queue contents after the insertion.
     debug_printf("  Contains:");
@@ -258,6 +382,9 @@ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
 }
 
 PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_) {
+#ifdef N64_COSIM
+    ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
     // The highest-priority thread is at the head; detach and return it.
     PTR(OSThread)* head = queue_to_ptr(PASS_RDRAM queue_);
     PTR(OSThread) popped = *head;
@@ -274,6 +401,9 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
 }
 
 bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
+#ifdef N64_COSIM
+    ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
     // Guard against a garbage queue pointer (queue_to_ptr would build a wild host
     // pointer that faults on the first deref). The running queue is a sentinel
     // backed by a host static, so it is always valid.
@@ -281,6 +411,7 @@ bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(O
         sched_log::record(PASS_RDRAM sched_log::OP_REMOVE_MISS, queue_, t_, NULLPTR);
         return false;
     }
+    debug_printf("[Thread Queue] remove thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
 
     // Scan the list for the target and unlink it if found.
     PTR(OSThread)* link = queue_to_ptr(PASS_RDRAM queue_);

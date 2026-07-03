@@ -17,6 +17,11 @@
 #include "ultramodern/scheduler_tick.hpp"
 
 extern "C" uint32_t recomp_rsp_consume_preempt_skip_budget(void);
+#ifdef N64_COSIM
+extern "C" void ultramodern_cosim_check_vi_quiescence(uint8_t* rdram);
+extern "C" uint32_t ultramodern_cosim_deliver_due_rcp_events(uint8_t* rdram);
+extern "C" uint32_t ultramodern_cosim_advance_due_vi(uint8_t* rdram, uint32_t allow_time_advance);
+#endif
 
 namespace {
 
@@ -62,6 +67,14 @@ constexpr uint64_t kSpStatusAddr = 0xFFFFFFFFA4040010ull;
 constexpr uint32_t kSpStatusSignalMask = 0x00007F80u;
 constexpr OSPri kHardwarePollPriority = 80;
 constexpr uint32_t kLoopCheckpointCapacity = 256;
+#ifdef N64_COSIM
+constexpr uint64_t kCosimTraceEntryRetired = 4;
+constexpr uint64_t kCosimTraceEntryCost = 4;
+constexpr uint64_t kCosimTraceReturnRetired = 2;
+constexpr uint64_t kCosimTraceReturnCost = 2;
+constexpr uint64_t kCosimLoopBackedgeRetired = 2;
+constexpr uint64_t kCosimLoopBackedgeCost = 2;
+#endif
 
 struct LoopCheckpointSlot {
     std::atomic<uint32_t> pc{0};
@@ -130,17 +143,41 @@ void record_loop_checkpoint(uint32_t pc) {
 }
 
 void scheduler_tick_impl() {
+    uint32_t cosim_delivered = 0;
+#ifdef N64_COSIM
+    if (g_rdram != nullptr) {
+        cosim_delivered += ultramodern_cosim_advance_due_vi(g_rdram, 0);
+        cosim_delivered += ultramodern_cosim_deliver_due_rcp_events(g_rdram);
+        ultramodern_cosim_quiescence_state q{};
+        ultramodern_cosim_get_quiescence(&q);
+        if (q.quiescent) {
+            if (ultramodern_cosim_advance_due_vi(g_rdram, 1) != 0) {
+                return;
+            }
+            ultramodern_cosim_check_vi_quiescence(g_rdram);
+            return;
+        }
+    }
+    if (g_rdram != nullptr) {
+        cosim_delivered += ultramodern_cosim_deliver_due_rcp_events(g_rdram);
+        if (cosim_delivered == 0) {
+            ultramodern_cosim_check_vi_quiescence(g_rdram);
+        }
+    }
+#endif
     // Hot path: relaxed atomic loads + branches. Returns immediately
     // when no yield or externally-posted message is pending.
     if (__builtin_expect(g_should_yield.load(std::memory_order_relaxed) == 0, 1)) {
-        if (!ultramodern::external_message_pending()) {
+        if (cosim_delivered == 0 && !ultramodern::external_message_pending()) {
             return;
         }
         if (!ultramodern::is_game_thread()) return;
         if (g_rdram == nullptr) return;
         uint8_t* rdram = g_rdram;
 
-        ultramodern::wait_for_external_message_timed(rdram, 0);
+        if (ultramodern::external_message_pending()) {
+            ultramodern::wait_for_external_message_timed(rdram, 0);
+        }
         ultramodern::check_running_queue(rdram);
         return;
     }
@@ -216,9 +253,14 @@ void ultramodern::yield_to_any_queued(RDRAM_ARG1) {
     // Re-queue ourselves at the priority-ordered position then resume
     // the next thread and block on our own context. Same shape as the
     // file-static swap_to_thread in scheduling.cpp.
-    ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
-    ultramodern::scheduler_trace_mark(PASS_RDRAM 133, ultramodern::running_queue, ultramodern::this_thread());
-    TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
+    {
+#ifdef N64_COSIM
+        ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
+        ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
+        ultramodern::scheduler_trace_mark(PASS_RDRAM 133, ultramodern::running_queue, ultramodern::this_thread());
+        TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
+    }
     ultramodern::scheduler_trace_mark(PASS_RDRAM 134, ultramodern::running_queue, next_);
     ultramodern::resume_thread_and_wait(PASS_RDRAM next_thread);
     ultramodern::scheduler_trace_mark(PASS_RDRAM 135, ultramodern::running_queue, ultramodern::this_thread());
@@ -234,8 +276,27 @@ extern "C" void ultramodern_scheduler_tick(void) {
 
 extern "C" void ultramodern_scheduler_tick_vram(uint32_t pc) {
     record_loop_checkpoint(pc);
+#ifdef N64_COSIM
+    ultramodern_cosim_advance_cpu_cycles(kCosimLoopBackedgeRetired, kCosimLoopBackedgeCost);
+#endif
     scheduler_tick_impl();
 }
+
+#ifdef N64_COSIM
+extern "C" void ultramodern_cosim_trace_entry(void) {
+    ultramodern_cosim_advance_cpu_cycles(kCosimTraceEntryRetired, kCosimTraceEntryCost);
+    scheduler_tick_impl();
+}
+
+extern "C" void ultramodern_cosim_trace_return(void) {
+    ultramodern_cosim_advance_cpu_cycles(kCosimTraceReturnRetired, kCosimTraceReturnCost);
+}
+
+extern "C" void ultramodern_cosim_trace_loop(void) {
+    ultramodern_cosim_advance_cpu_cycles(kCosimLoopBackedgeRetired, kCosimLoopBackedgeCost);
+    scheduler_tick_impl();
+}
+#endif
 
 extern "C" uint32_t ultramodern_loop_checkpoint_capacity(void) {
     return kLoopCheckpointCapacity;

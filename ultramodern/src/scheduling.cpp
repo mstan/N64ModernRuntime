@@ -3,6 +3,9 @@
 void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
     debug_printf("[Scheduling] Queueing thread %d to run\n", TO_PTR(OSThread, t_)->id);
     ultramodern::scheduler_trace_mark(PASS_RDRAM 100, ultramodern::running_queue, t_);
+#ifdef N64_COSIM
+    ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
     thread_queue_insert(PASS_RDRAM running_queue, t_);
     TO_PTR(OSThread, t_)->state = OSThreadState::QUEUED;
 }
@@ -13,9 +16,14 @@ void swap_to_thread(RDRAM_ARG PTR(OSThread) to_) {
     ultramodern::scheduler_trace_mark(PASS_RDRAM 110, ultramodern::running_queue, to_);
     // Put the currently executing thread back into the running queue so it can be
     // picked up again later.
-    ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
-    ultramodern::scheduler_trace_mark(PASS_RDRAM 111, ultramodern::running_queue, ultramodern::this_thread());
-    TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
+    {
+#ifdef N64_COSIM
+        ultramodern::CosimSchedulerMutation cosim_mutation;
+#endif
+        ultramodern::thread_queue_insert(PASS_RDRAM ultramodern::running_queue, ultramodern::this_thread());
+        ultramodern::scheduler_trace_mark(PASS_RDRAM 111, ultramodern::running_queue, ultramodern::this_thread());
+        TO_PTR(OSThread, ultramodern::this_thread())->state = OSThreadState::QUEUED;
+    }
     // Wake the target thread and block here until something wakes us back up.
     ultramodern::scheduler_trace_mark(PASS_RDRAM 112, ultramodern::running_queue, to_);
     ultramodern::resume_thread_and_wait(PASS_RDRAM to);

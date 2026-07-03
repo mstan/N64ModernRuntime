@@ -2687,6 +2687,193 @@ static FILE* open_runtime_captures(const char* mode) {
     return f;
 }
 
+// ── Interp-fallback accounting (value-proposition telemetry) ──────────────
+// This is a STATIC recompiler: every interpreter carry is a static-recompile
+// miss — a failure of the value proposition. We account ALL of them so we can
+// answer "how much interp are we leaning on?", but we do it cheaply and without
+// annoying anyone:
+//   * Dedup by address so a hot dispatch loop can't spam (one map entry / addr).
+//   * FIRST-TOUCH signal: a genuinely new gap -> one JSONL record (coverage).
+//   * CHRONIC signal: an address re-seen >= K VI frames after its first sighting
+//     -> one more JSONL record. That is the deterministic version of "still
+//     happening 30s later": VI-frame axis (total_vis), never wall clock, so it
+//     stays reproducible and honours the no-wall-clock-for-observability rule.
+//   * Prod: SILENT — JSONL log file + live ring only, no console for the user.
+//   * Dev: additionally one stderr line per event (PSR_INTERP_LOUD overrides).
+// At most TWO log events per address, ever, regardless of a million loop hits.
+// Excluded from the co-sim state hash (pure host-side) so tier decisions never
+// perturb determinism — Gate 1 proves two instances stay byte-identical even
+// when they take different tier paths.
+//
+// NOTE: the interior-return self-heal (unhandled_lookup_trampoline) re-dispatches
+// into resident NATIVE code, so it is NOT a value-prop failure and does NOT feed
+// this — only genuine interpreter carries do.
+
+extern uint64_t total_vis;  // ultramodern/src/events.cpp — VI frame counter.
+
+enum InterpReason : uint32_t {
+    INTERP_REASON_REJECT = 0,  // dispatch-entry reject -> interp from the exact PC
+    INTERP_REASON_DEVICE = 1,  // frag candidate pinned to interp (device touch)
+    INTERP_REASON_FRAG   = 2,  // frag candidate validating diff (interp committed)
+    INTERP_REASON_FLOOR  = 3,  // B-interp correctness floor (indirect-only entry)
+};
+static const char* interp_reason_name(uint32_t r) {
+    switch (r) {
+        case INTERP_REASON_REJECT: return "reject";
+        case INTERP_REASON_DEVICE: return "device_pin";
+        case INTERP_REASON_FRAG:   return "frag_validate";
+        case INTERP_REASON_FLOOR:  return "floor";
+        default:                   return "unknown";
+    }
+}
+
+// Frames apart before a recurring address escalates to "chronic". ~0.5s @ 60 Hz.
+// Override at build time; a smaller value flags recurrence sooner.
+#ifndef N64_INTERP_CHRONIC_FRAMES
+#define N64_INTERP_CHRONIC_FRAMES 30u
+#endif
+
+struct InterpFallback {
+    uint32_t reason = 0;
+    bool     chronic_logged = false;
+    uint64_t first_frame = 0;
+    uint64_t last_frame = 0;
+    uint64_t distinct_frames = 0;
+    uint64_t hit_count = 0;
+};
+static std::mutex g_interp_fb_mutex;
+static std::unordered_map<uint32_t, InterpFallback> g_interp_fb;
+
+// stderr loudness policy: dev builds default ON, release (NDEBUG) default OFF;
+// PSR_INTERP_LOUD=1/0 forces either way in any build. The JSONL file + ring are
+// ALWAYS on regardless — only the console echo is gated.
+static bool interp_loud_enabled() {
+    static const bool loud = []{
+        const char* e = std::getenv("PSR_INTERP_LOUD");
+        if (e && e[0] != '\0') {
+            return !(e[0] == '0' || e[0] == 'n' || e[0] == 'N' ||
+                     e[0] == 'f' || e[0] == 'F');
+        }
+#ifdef NDEBUG
+        return false;  // release: never spam the user's console
+#else
+        return true;   // dev: nudge the developer at first touch / chronic
+#endif
+    }();
+    return loud;
+}
+
+static FILE* open_interp_log(const char* mode) {
+    std::string path = cache_subdir("coverage") + "/interp_fallbacks.jsonl";
+    return fopen(path.c_str(), mode);
+}
+
+static void interp_emit(const char* event, uint32_t addr, const InterpFallback& fb) {
+    if (FILE* f = open_interp_log("a")) {
+        fprintf(f,
+            "{\"event\":\"%s\",\"addr\":\"0x%08X\",\"reason\":\"%s\","
+            "\"first_frame\":%llu,\"last_frame\":%llu,\"distinct_frames\":%llu,"
+            "\"hits\":%llu}\n",
+            event, addr, interp_reason_name(fb.reason),
+            (unsigned long long)fb.first_frame, (unsigned long long)fb.last_frame,
+            (unsigned long long)fb.distinct_frames, (unsigned long long)fb.hit_count);
+        fclose(f);
+    }
+    if (interp_loud_enabled()) {
+        fprintf(stderr,
+            "[interp] %s 0x%08X (%s) frame=%llu distinct=%llu hits=%llu "
+            "— static-recomp miss; shard candidate\n",
+            event, addr, interp_reason_name(fb.reason),
+            (unsigned long long)fb.last_frame,
+            (unsigned long long)fb.distinct_frames,
+            (unsigned long long)fb.hit_count);
+        fflush(stderr);
+    }
+}
+
+// Route every genuine interpreter carry through here. Keeps g_tier_interp_runs
+// (so recomp_coverage_live totals are unchanged) and adds dedup'd first-touch +
+// chronic accounting. Cheap: one relaxed atomic + a short locked map op.
+static void note_interp_fallback(uint32_t addr, uint32_t reason) {
+    g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t frame = total_vis;
+    bool emit_new = false, emit_chronic = false;
+    InterpFallback snap;
+    {
+        std::lock_guard<std::mutex> lk(g_interp_fb_mutex);
+        auto it = g_interp_fb.find(addr);
+        if (it == g_interp_fb.end()) {
+            InterpFallback fb;
+            fb.reason = reason;
+            fb.first_frame = frame;
+            fb.last_frame = frame;
+            fb.distinct_frames = 1;
+            fb.hit_count = 1;
+            it = g_interp_fb.emplace(addr, fb).first;
+            emit_new = true;
+        } else {
+            InterpFallback& fb = it->second;
+            if (frame != fb.last_frame) fb.distinct_frames++;
+            fb.last_frame = frame;
+            fb.hit_count++;
+            // Chronic once: re-seen >= K frames after the first sighting means it
+            // persists across time (not a single-frame burst). A hot loop that
+            // hammers one address within a single frame keeps frame==first_frame
+            // and never trips this — exactly the intent.
+            if (!fb.chronic_logged &&
+                frame >= fb.first_frame + N64_INTERP_CHRONIC_FRAMES) {
+                fb.chronic_logged = true;
+                emit_chronic = true;
+            }
+        }
+        snap = it->second;
+    }
+    if (emit_new)     interp_emit("new", addr, snap);
+    if (emit_chronic) interp_emit("chronic", addr, snap);
+}
+
+// POD row for the debug server's `interp_stats` command — a live, consume-the-
+// ring view of the interp-fallback map, ranked by hit_count. Mirrors the other
+// *_recent_copy exports. Copies up to `cap` rows; out_count = rows written,
+// out_total_unique = total distinct addresses interpreted this session.
+struct InterpFallbackRow {
+    uint32_t addr;
+    uint32_t reason;
+    uint32_t chronic;
+    uint32_t _pad;
+    uint64_t first_frame;
+    uint64_t last_frame;
+    uint64_t distinct_frames;
+    uint64_t hit_count;
+};
+extern "C" void recomp_interp_fallbacks_copy(
+    InterpFallbackRow* out, uint32_t cap,
+    uint32_t* out_count, uint64_t* out_total_unique) {
+    std::vector<InterpFallbackRow> rows;
+    {
+        std::lock_guard<std::mutex> lk(g_interp_fb_mutex);
+        rows.reserve(g_interp_fb.size());
+        for (const auto& kv : g_interp_fb) {
+            rows.push_back(InterpFallbackRow{
+                kv.first, kv.second.reason,
+                kv.second.chronic_logged ? 1u : 0u, 0u,
+                kv.second.first_frame, kv.second.last_frame,
+                kv.second.distinct_frames, kv.second.hit_count});
+        }
+        if (out_total_unique) *out_total_unique = (uint64_t)g_interp_fb.size();
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const InterpFallbackRow& a, const InterpFallbackRow& b) {
+                  return a.hit_count > b.hit_count;
+              });
+    uint32_t n = 0;
+    if (out && cap) {
+        n = (uint32_t)std::min<size_t>(rows.size(), cap);
+        for (uint32_t i = 0; i < n; ++i) out[i] = rows[i];
+    }
+    if (out_count) *out_count = n;
+}
+
 // Live snapshot of the self-healing tier counters, for the debug server's
 // `coverage` command. Unlike the runtime_captures.json manifest (rewritten only
 // on a NEW unique miss, so stale mid-run), this reads the atomics directly — so
@@ -3698,7 +3885,7 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                         recomp_interpret_function(rdram, ctx, (uint32_t)addr);
                     g_reject_interp_depth--;
                     if (ok) {
-                        g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+                        note_interp_fallback((uint32_t)addr, INTERP_REASON_REJECT);
                         return;
                     }
                     // interp couldn't carry it (unimplemented op / garbage) —
@@ -3950,7 +4137,7 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                         ShadowDiffOutcome o = run_shadow_diff(rdram, ctx, faddr, live_fn);
                         if (o.interp_ok) {
                             frag_apply_diff_outcome(faddr, live_hash, o);
-                            g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+                            note_interp_fallback(faddr, INTERP_REASON_FRAG);
                             return;
                         }
                         // interp failed inside the diff -> fall through to the
@@ -3958,7 +4145,7 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
                     } else if (live_dt || live_bl) {
                         // Pinned to the interpreter (device touch / blacklisted).
                         if (recomp_interpret_function(rdram, ctx, faddr)) {
-                            g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+                            note_interp_fallback(faddr, INTERP_REASON_DEVICE);
                             return;
                         }
                     }
@@ -3979,7 +4166,7 @@ static void unhandled_lookup_trampoline(uint8_t* rdram, recomp_context* ctx) {
         }();
         if (interp_enabled) {
             if (recomp_interpret_function(rdram, ctx, (uint32_t)g_self_heal_addr)) {
-                g_tier_interp_runs.fetch_add(1, std::memory_order_relaxed);
+                note_interp_fallback((uint32_t)g_self_heal_addr, INTERP_REASON_FLOOR);
                 return;
             }
             fprintf(stderr,
@@ -4994,16 +5181,21 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         }
 
         if (first_sighting) {
+            // File log is ALWAYS on (silent, even in prod); the console echo is
+            // the developer-only nudge, gated by the same policy as the interp
+            // fallbacks so a shipped build never spams the user's console.
             FILE* f = open_last_error_log("a");
             if (f) {
                 fprintf(f, "\n=== get_function lookup miss: 0x%08X ===\n", addr);
                 dump_lookup_addr_classification(f, (uint32_t)addr);
                 fclose(f);
             }
-            fprintf(stderr,
-                "[Warn] get_function lookup miss: 0x%08X — captured (see runtime_captures.json), returning trampoline\n",
-                addr);
-            fflush(stderr);
+            if (interp_loud_enabled()) {
+                fprintf(stderr,
+                    "[Warn] get_function lookup miss: 0x%08X — captured (see runtime_captures.json), returning trampoline\n",
+                    addr);
+                fflush(stderr);
+            }
         }
         // Stash for the trampoline so post-call diagnostics print
         // *which* address was missing, not just "something bad happened".

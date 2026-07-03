@@ -78,6 +78,16 @@ if (WITH_DEV_DIVERGENCE)
     target_compile_definitions(librecomp PUBLIC PSR_DIVERGENCE_TOOLS)
 endif()
 
+# Dev-only tcc validation/demo harness (PSR_TCC_AB shadow-diff vs the static
+# clang build + PSR_TCC_RUN force-execute). NOT a production path: it replaces
+# static functions with tcc twins / double-runs them to compare. Compiled out by
+# default; configure with -DPSR_TCC_DEV_TOOLS=ON to validate the tcc backend.
+option(PSR_TCC_DEV_TOOLS "Build the tcc-vs-static A/B + force-run validation harness (dev only)" OFF)
+if (PSR_TCC_DEV_TOOLS)
+    target_compile_definitions(librecomp PRIVATE PSR_TCC_DEV_TOOLS=1)
+    message(STATUS "librecomp: PSR_TCC_DEV_TOOLS=ON — tcc A/B + force-run harness compiled in (dev only)")
+endif()
+
 if (WIN32)
     add_compile_definitions(NOMINMAX)
 endif()

@@ -363,7 +363,8 @@ bool recomp::rsp::run_task(uint8_t* rdram, const OSTask* task) {
     // handlers offline and identify the culprit.
     {
         // M_AUDTASK = 2 (libultra OSTask::type for aspMain).
-        if (task->t.type == 2 && task->t.ucode != 0 && task->t.data_size <= 0x10000) {
+        static const bool s_dispatch_check = std::getenv("PSR_ASPMAIN_DISPATCH_CHECK") != nullptr;
+        if (s_dispatch_check && task->t.type == 2 && task->t.ucode != 0 && task->t.data_size <= 0x10000) {
             static const uint16_t kExpectedTable[16] = {
                 0x10EC, 0x139C, 0x119C, 0x1A64, 0x11C8, 0x17EC, 0x1208, 0x0000,
                 0x0000, 0x127C, 0x1348, 0x1248, 0x1C84, 0x12D4, 0x02B0, 0x1384,

@@ -1699,11 +1699,45 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
     // re-DMA into already-registered space) but not for Stadium's
     // chunked initial section loads.
 
+    auto runtime_ranges_overlap = [](int32_t a_base, uint32_t a_size,
+                                     int32_t b_base, uint32_t b_size) {
+        const uint64_t a_lo = uint32_t(a_base);
+        const uint64_t b_lo = uint32_t(b_base);
+        return a_lo < b_lo + uint64_t(b_size) &&
+               b_lo < a_lo + uint64_t(a_size);
+    };
+
+    auto evict_overlapping_sections = [&](size_t section_index, int32_t implied_base) {
+        const SectionTableEntry& new_section = sections_info.code_sections[section_index];
+        bool evicted = true;
+        while (evicted) {
+            evicted = false;
+            for (const LoadedSection& loaded : loaded_sections) {
+                if (loaded.section_table_index == section_index) {
+                    continue;
+                }
+
+                const SectionTableEntry& old_section =
+                    sections_info.code_sections[loaded.section_table_index];
+                if (!runtime_ranges_overlap(implied_base, new_section.size,
+                                            loaded.loaded_ram_addr, old_section.size)) {
+                    continue;
+                }
+
+                unload_overlay_by_section_index(uint32_t(loaded.section_table_index));
+                evicted = true;
+                break;
+            }
+        }
+    };
+
     // Helper: register section at the runtime base implied by this
     // chunk, but only if not already loaded there. Re-registering at
     // the same base is wasted work; loading at a NEW base is a
     // re-relocation handled by unload+reload.
-    auto register_if_new = [](size_t section_index, int32_t implied_base) {
+    auto register_if_new = [&](size_t section_index, int32_t implied_base) {
+        evict_overlapping_sections(section_index, implied_base);
+
         auto find_it = std::find_if(loaded_sections.begin(), loaded_sections.end(),
             [section_index](const LoadedSection& s) { return s.section_table_index == section_index; });
         if (find_it == loaded_sections.end()) {
